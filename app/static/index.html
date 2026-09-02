@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>StockGame 股票模拟交易游戏</title>
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='6' fill='%23e64545'/><text x='16' y='23' font-size='20' font-weight='bold' text-anchor='middle' fill='white'>S</text></svg>">
+    <script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"></script>
+    <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+    <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+<!-- ═══════════ 视图一：轮次管理 ═══════════ -->
+<div id="view-rounds" class="view">
+    <header id="top-bar">
+        <div class="top-left">
+            <h1>StockGame <span class="sub">股票模拟交易游戏</span></h1>
+            <span class="mode-badge" id="agentStatusBadge">Agent: --</span>
+        </div>
+        <div class="top-right">
+            <span class="ws-status" id="wsStatus">● 连接中</span>
+            <span class="data-time" id="dataTime"></span>
+            <button class="btn-refresh" onclick="loadAll()" title="刷新">⟳</button>
+        </div>
+    </header>
+
+    <div class="rounds-layout">
+        <!-- 左：创建轮次 -->
+        <aside class="panel create-panel">
+            <h3>创建新游戏</h3>
+            <div class="form-row">
+                <label>股票代码</label>
+                <input type="text" id="createCode" placeholder="留空默认 588000.SH" list="codeList">
+                <datalist id="codeList"></datalist>
+            </div>
+            <div class="form-row">
+                <label>交易日</label>
+                <div class="combo" id="dateCombo">
+                    <input type="text" id="dateSearch" placeholder="输入日期模糊搜索，留空 = 随机选择" autocomplete="off">
+                    <div class="combo-list" id="dateDropdown"></div>
+                </div>
+            </div>
+            <div class="form-row form-row-switch">
+                <label class="switch-label" for="allowSim">
+                    <input type="checkbox" id="allowSim" onchange="loadAll()">
+                    <span>允许使用模拟数据</span>
+                </label>
+                <div class="switch-tip">关闭时仅可选择 QMT 实盘数据日期；开启后 QMT 无数据的日期可使用转换模拟数据（QMT 优先）</div>
+            </div>
+            <button class="btn-primary btn-lg" id="btnCreate" onclick="createRound()">＋ 创建游戏轮次</button>
+            <div class="panel-tip">同一 code+交易日仅允许一个未结束轮次；结束后可重新开局</div>
+        </aside>
+
+        <!-- 右：轮次列表 -->
+        <main class="panel rounds-panel">
+            <div class="panel-header">
+                <h3>游戏轮次</h3>
+                <button class="refresh-btn" onclick="loadAll()" title="刷新">⟳</button>
+            </div>
+            <div class="round-list" id="roundList"><div class="empty-state">暂无轮次，先创建一局吧</div></div>
+        </main>
+    </div>
+</div>
+
+<!-- ═══════════ 视图二：游戏 ═══════════ -->
+<div id="view-game" class="view" style="display:none;">
+    <header id="game-top-bar">
+        <button class="btn-back" onclick="backToRounds()">← 返回</button>
+        <div class="game-title">
+            <span id="gCode" class="g-code">--</span>
+            <span id="gDate" class="g-date">----</span>
+            <span id="gTime" class="g-time" title="当前行情时间（精确到秒）">--:--:--</span>
+            <span id="gSource" class="src-tag qmt">QMT</span>
+            <span id="gStatus" class="status-badge">--</span>
+        </div>
+        <div class="progress-wrap">
+            <div class="progress-bar"><div id="gProgress" class="progress-fill" style="width:0%"></div></div>
+            <span id="gProgressText" class="progress-text">0%</span>
+        </div>
+        <div class="speed-wrap">
+            <span class="speed-label">速度</span>
+            <button class="speed-btn active" data-speed="1" onclick="setSpeed(1)">1x</button>
+            <button class="speed-btn" data-speed="10" onclick="setSpeed(10)">10x</button>
+            <button class="speed-btn" data-speed="60" onclick="setSpeed(60)">60x</button>
+        </div>
+        <div class="game-actions">
+            <button class="btn-pause" id="btnPause" onclick="togglePause()">⏸ 暂停</button>
+            <button class="btn-finish" onclick="finishRound()">⏹ 提前结束</button>
+        </div>
+    </header>
+
+    <div class="game-layout">
+        <!-- 左侧：分时图 -->
+        <section class="chart-panel">
+            <div class="chart-head">
+                <div class="price-box">
+                    <span class="big-price" id="gLastPrice">--</span>
+                    <span class="chg-box">
+                        <span id="gChange" class="chg">--</span>
+                        <span id="gChangePct" class="chg">--</span>
+                    </span>
+                </div>
+                <div class="chart-meta">
+                    <span>今开 <b id="gOpen">--</b></span>
+                    <span>最高 <b id="gHigh" class="up">--</b></span>
+                    <span>最低 <b id="gLow" class="down">--</b></span>
+                    <span>昨收 <b id="gLastClose">--</b></span>
+                    <span>成交量 <b id="gVol">--</b></span>
+                    <span>成交额 <b id="gAmount">--</b></span>
+                </div>
+            </div>
+            <div id="minuteChart" class="minute-chart"></div>
+            <div class="chart-legend">
+                <span><i class="dot price-dot"></i>价格</span>
+                <span><i class="dot avg-dot"></i>均价</span>
+                <span><i class="dot pre-dot"></i>昨收</span>
+                <span class="legend-note">（1 分钟一个点，尾部点为实时跳变）</span>
+            </div>
+        </section>
+
+        <!-- 右侧：盘口 + 下单 -->
+        <aside class="trade-panel">
+            <!-- 五档盘口 -->
+            <div class="level5-box">
+                <div class="level5-title">模拟五档盘口 <span class="mock-tag">模拟</span></div>
+                <div class="level5-rows" id="level5Rows"></div>
+            </div>
+
+            <!-- 下单面板 -->
+            <div class="order-box">
+                <div class="order-tabs">
+                    <button class="order-tab buy active" id="tabBuy" onclick="switchSide('buy')">买入</button>
+                    <button class="order-tab sell" id="tabSell" onclick="switchSide('sell')">卖出</button>
+                </div>
+                <div class="order-type-row">
+                    <button class="otype-btn active" data-type="limit" onclick="switchType('limit')">限价</button>
+                    <button class="otype-btn" data-type="market" onclick="switchType('market')">市价</button>
+                </div>
+                <div class="order-field">
+                    <label>委托价格</label>
+                    <input type="number" id="orderPrice" step="0.001" min="0" oninput="recalcEstimate()">
+                    <div class="quick-btns">
+                        <button onclick="quickPrice('last')">最新</button>
+                        <button onclick="quickPrice('ask1')">对手价</button>
+                        <button onclick="quickPrice('bid1')">买一</button>
+                        <button onclick="quickPrice('ask1')">卖一</button>
+                        <button onclick="quickPrice('up')">+1档</button>
+                        <button onclick="quickPrice('down')">-1档</button>
+                    </div>
+                </div>
+                <div class="order-field">
+                    <label>委托数量</label>
+                    <input type="number" id="orderShares" step="100" min="100" oninput="recalcEstimate()">
+                    <div class="quick-btns">
+                        <button onclick="quickShares('q1')">1/4仓</button>
+                        <button onclick="quickShares('half')">半仓</button>
+                        <button onclick="quickShares('full')">全仓</button>
+                        <button onclick="quickShares('sellable')">全可卖</button>
+                        <button onclick="quickShares('step')">+100</button>
+                        <button onclick="quickShares('unstep')">-100</button>
+                    </div>
+                </div>
+                <div class="estimate-row">
+                    <span>预估金额 <b id="estAmount">--</b></span>
+                    <span>手续费 <b id="estFee">--</b></span>
+                </div>
+                <button class="order-submit buy" id="btnSubmit" onclick="submitOrder()">买入</button>
+                <div class="order-tip">快捷键：↑/↓ 调价，Enter 下单</div>
+            </div>
+        </aside>
+    </div>
+
+    <!-- 下方 tab：委托/成交/持仓/账户 -->
+    <div class="records-panel">
+        <nav class="records-tabs">
+            <button class="rec-tab active" data-tab="orders" onclick="switchRecTab('orders')">委托</button>
+            <button class="rec-tab" data-tab="trades" onclick="switchRecTab('trades')">成交</button>
+            <button class="rec-tab" data-tab="position" onclick="switchRecTab('position')">持仓</button>
+            <button class="rec-tab" data-tab="account" onclick="switchRecTab('account')">账户</button>
+        </nav>
+        <div class="records-body">
+            <table id="ordersTable" class="rec-table">
+                <thead><tr><th>时间</th><th>方向</th><th>类型</th><th>价格</th><th>数量</th><th>状态</th><th>操作</th></tr></thead>
+                <tbody></tbody>
+            </table>
+            <table id="tradesTable" class="rec-table" style="display:none">
+                <thead><tr><th>成交时间</th><th>方向</th><th>价格</th><th>数量</th><th>手续费</th></tr></thead>
+                <tbody></tbody>
+            </table>
+            <div id="positionBox" style="display:none"></div>
+            <div id="accountBox" style="display:none"></div>
+        </div>
+    </div>
+</div>
+
+<!-- ═══════════ 下单确认弹窗 ═══════════ -->
+<div class="modal-overlay" id="confirmModal" style="display:none;">
+    <div class="modal">
+        <h3 id="confirmTitle">确认下单</h3>
+        <div class="modal-body" id="confirmBody"></div>
+        <div class="modal-actions">
+            <button class="btn-cancel" onclick="closeConfirm()">取消</button>
+            <button class="btn-primary" id="btnConfirm" onclick="doSubmit()">确认下单</button>
+        </div>
+    </div>
+</div>
+
+<!-- toast 提示 -->
+<div id="toastWrap"></div>
+
+<script src="/static/game.js"></script>
+</body>
+</html>

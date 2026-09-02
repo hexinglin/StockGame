@@ -1,0 +1,20 @@
+# =============================================================================
+# StockGame 部署编排 — 仅后端服务，不含任何中间件容器
+# 中间件全部复用现有实例:
+#   PostgreSQL: 192.168.1.9:30004（容器内 host.docker.internal:30004）
+#   Redis:      192.168.1.9:30003 db=5
+# =============================================================================
+services:
+  stockgame:
+    build: .
+    container_name: stockgame
+    restart: unless-stopped
+    ports:
+      - "16000:16000"
+    environment:
+      # 容器内通过 host.docker.internal 访问宿主机中间件
+      STOCKGAME_CONFIG: /app/config.dev.yaml
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./logs:/app/logs

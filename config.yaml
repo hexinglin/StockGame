@@ -1,0 +1,39 @@
+app:
+  name: StockGame
+  debug: true
+  host: 0.0.0.0
+  port: 16000
+  log_level: INFO
+
+database:
+  type: postgresql
+  # 直连现有 PG 实例（服务器部署改用 host.docker.internal:30004）
+  path: "postgresql://autotrade:autotrade_pg_dev_2026@192.168.1.9:30004/stockgame"
+
+redis:
+  host: "192.168.1.9"          # 复用现有实例（与 AutoTrade 同一 Redis）
+  port: 30003
+  db: 5                         # 独立 5 号库
+  password: "autotrade_redis_dev_2026"
+  enabled: true
+
+data_source:
+  # 测试数据源（AutoTrade 库，仅 mock_agent 使用）
+  autotrade_dsn: "postgresql://autotrade:autotrade_pg_dev_2026@192.168.1.9:30004/autotrade"
+
+heartbeat:
+  interval_sec: 60        # agent 心跳周期
+  timeout_sec: 180        # 超过 3 个周期判离线
+  check_interval_sec: 300 # 后端 5 分钟检查一次
+  alert_cooldown_sec: 1800  # 告警防抖 30 分钟
+
+feishu:
+  # 写死，不随环境变更
+  webhook_url: "https://open.feishu.cn/open-apis/bot/v2/hook/f91e7e9b-05f8-44a3-8b02-3ffd8c488f3a"
+
+game:
+  stock_code: "588000.SH"
+  base_shares: 500000     # 底仓 50w 股
+  initial_cash: 500000    # 初始现金 50w
+  fee_rate: 0.0001        # 单面万1，无印花税，无最低5元
+  tick_sec: 3
