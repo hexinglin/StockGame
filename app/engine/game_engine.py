@@ -379,6 +379,12 @@ class GameEngine:
                            m.time_key <= r.last_time_key).first())
             if row:
                 cum_amount, cum_volume = row[0] or 0, row[1] or 0
+
+        # 账户字典补充轮次级已实现盈亏/手续费（与 game:account 推送同口径），
+        # 使 REST /account 与 socket 推送字段一致，前端统一读 a.realized_pnl/a.fee_total
+        if acct is not None:
+            acct["realized_pnl"] = round(r.realized_pnl or 0, 2)
+            acct["fee_total"] = round(r.fee_total or 0, 2)
         return {
             "id": r.id,
             "code": r.code,
@@ -928,7 +934,7 @@ class GameEngine:
         """按速度推进轮次时钟"""
         speed = ctx.round.speed or 1
         with ctx.lock:
-            # 每 0.1s 推进 speed×0.1/3 个 tick
+            # 每 0.1s 周期推进 speed×0.1 根 tick（_TICK_SEC=1.0，x60 每周期 6 根）
             ctx.fraction += speed * _CLOCK_INTERVAL / _TICK_SEC
             steps = int(ctx.fraction)
             if steps <= 0:
@@ -939,8 +945,8 @@ class GameEngine:
                     break
                 self._process_tick(ctx, ctx.ticks[ctx.index])
                 ctx.index += 1
-                if ctx.index % 10 == 0:
-                    self._save_snapshot(ctx)
+            # 周期末统一存一次快照（最新进度/账户/行情）；循环内每 10 tick 的存储为
+            # 冗余（周期末必存最新态），高速档下会翻倍 Redis 写入，故移除
             self._save_snapshot(ctx)
 
     @_ensure_ctx
@@ -986,13 +992,18 @@ class GameEngine:
                 filled_any = True
                 ctx.pending.pop(order_id, None)
 
-        # 本 tick 无成交 → 持久化轮次状态（last_price/last_time_key 等）
-        if not filled_any:
+        # 本 tick 无成交 → 周期性持久化轮次行情（last_price/last_time_key）。
+        # 高速档每 tick 都 commit 远程库开销极大（x60≈60 次/秒），改为每 10 tick 一次；
+        # 但收盘 tick 必须落库，确保随后的 _settle 读到最新 last_price 计算期末资产。
+        # 成交（_try_fill）/暂停（pause_round）/结算（_settle）路径均各自 commit，
+        # 且 Redis 快照每周期存进度，崩溃恢复优先用快照，DB 行情滞后几 tick 可接受。
+        is_last = ctx.index >= len(ctx.ticks) - 1
+        if not filled_any and (ctx.index % 10 == 0 or is_last):
             db.session.add(ctx.round)
             db.session.commit()
 
         # 最后一根 tick → 自动结算
-        if ctx.index >= len(ctx.ticks) - 1:
+        if is_last:
             self._settle(ctx.round.id, reason="收盘", auto=True)
 
     @_ensure_ctx

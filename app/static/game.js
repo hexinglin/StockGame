@@ -19,11 +19,18 @@ const state = {
     otype: "limit",         // 仅支持限价
     socket: null,
     chart: null,
+    lastTickVol: 0,         // 当笔 tick 成交量（盘口模拟用）
     
 };
 
 const FEE_RATE = 0.0001;    // 万1
 const CODE_DEFAULT = "588000.SH";
+
+// 账户卡/五档盘口为 innerHTML 全量重建，高速档每 tick 重建（x60≈60 次/秒）开销大且
+// 视觉抖动，按时间节流；x1（1 tick/秒，间隔 > 阈值）不受影响。成交/进入等关键场景
+// 传 force=true 立即渲染。行情数字与分时图仍每 tick 更新（textContent 轻量、需实时）。
+const RENDER_THROTTLE_MS = 500;
+let _lastAcctTs = 0, _lastLv5Ts = 0;
 
 // ───────────── API 封装 ─────────────
 async function api(url, method = "GET", body = null) {
@@ -363,7 +370,7 @@ async function enterGame(roundId) {
         loadOrders();
         loadTrades();
         loadAccount();
-        refreshQuoteDisplay();
+        refreshQuoteDisplay(true);   // 进入游戏首次完整渲染（含盘口），不节流
 
         // 若已结束，显示结算信息
         if (state.round.status === "finished") {
@@ -496,12 +503,12 @@ function onTrade(t) {
     if (t.round_id !== undefined && t.round_id !== state.roundId) return;
     toast(`成交 ${t.direction === "buy" ? "买入" : "卖出"} ${fmt(t.shares)}股 @${t.price}`, "success");
     loadTrades();
-    loadAccount();
+    // 账户由随后的 game:account 推送实时刷新，无需再发 HTTP 请求（去冗余）
 }
 
 function onAccount(acct) {
     if (state.round) state.round.account = acct;
-    renderAccount(acct);
+    renderAccount(acct, true);   // 成交推送：立即刷新账户，不节流
 }
 
 function onGameStatus(s) {
@@ -512,6 +519,7 @@ function onGameStatus(s) {
         if (s.status === "finished") {
             toast(`本轮已结束${s.final_assets ? "，期末资产 " + fmt(s.final_assets) : ""}`, "success");
             loadAll();
+            loadAccount();   // 节流后补偿：结束时 force 刷新账户卡，市值/盈亏定格最终价
         }
     }
     if (s.speed) {
@@ -539,10 +547,16 @@ const TRADING_MINUTES = (() => {
     return out;   // 121 + 1 + 121 = 243
 })();
 
+let _chartResizeBound = false;
 function initChart() {
     const el = document.getElementById("minuteChart");
-    state.chart = echarts.init(el);
-    window.addEventListener("resize", () => state.chart && state.chart.resize());
+    // 复用已存在实例，避免每次进入游戏重复 init（控制台警告 + 实例泄漏）
+    state.chart = echarts.getInstanceByDom(el) || echarts.init(el);
+    // resize 监听仅绑定一次，避免多次进入游戏叠加监听器
+    if (!_chartResizeBound) {
+        window.addEventListener("resize", () => state.chart && state.chart.resize());
+        _chartResizeBound = true;
+    }
 }
 
 function buildMinuteSeries(ticks) {
@@ -688,7 +702,7 @@ function updateChart() {
 }
 
 // ───────────── 行情显示 ─────────────
-function refreshQuoteDisplay() {
+function refreshQuoteDisplay(force) {
     const price = state.lastPrice;
     const lastClose = state.lastClose;
     const el = document.getElementById("gLastPrice");
@@ -722,7 +736,7 @@ function refreshQuoteDisplay() {
         lastClose && lastClose > 0 ? fmt(lastClose, 3) : "--";
     document.getElementById("gVol").textContent = fmtVol(state.cumVolume);
     document.getElementById("gAmount").textContent = fmt(state.cumAmount);
-    renderLevel5(price);
+    renderLevel5(price, force);
 }
 
 function updateProgress(pct) {
@@ -731,8 +745,12 @@ function updateProgress(pct) {
 }
 
 // ───────────── 五档盘口（模拟，基于实际行情派生） ─────────────
-function renderLevel5(price) {
+function renderLevel5(price, force) {
     if (!price) return;
+    // 高速档节流：盘口为模拟跳动数据，无需每 tick 重建（x60≈60 次/秒）
+    const now = Date.now();
+    if (!force && now - _lastLv5Ts < RENDER_THROTTLE_MS) return;
+    _lastLv5Ts = now;
     const step = 0.001;   // ETF 最小变动价位，价格连续
     // 基础量 = 最近一笔 tick 成交量，乘以随机系数模拟各档挂单量
     const baseVol = state.lastTickVol || Math.max(1000, Math.round(state.cumVolume / 200));
@@ -792,37 +810,6 @@ function quickPrice(kind) {
 function quickPriceByValue(v) {
     document.getElementById("orderPrice").value = v.toFixed(3);
     recalcEstimate();
-}
-
-function quickShares(kind) {
-    const acct = state.round && state.round.account;
-    const price = parseFloat(document.getElementById("orderPrice").value) || state.lastPrice || 0;
-    let shares = 0;
-    if (kind === "q1" || kind === "half" || kind === "full") {
-        // 按可用资金/价格 估算可买数量（买入），或按可卖持仓（卖出）
-        if (state.side === "buy" && acct) {
-            const avail = (acct.available_cash - (acct.frozen_cash || 0)) || 0;
-            const maxShares = price > 0 ? Math.floor(avail / (price * (1 + FEE_RATE)) / 100) * 100 : 0;
-            const ratio = kind === "q1" ? 0.25 : (kind === "half" ? 0.5 : 1);
-            shares = Math.floor(maxShares * ratio / 100) * 100;
-        } else if (state.side === "sell" && acct) {
-            const sellable = Math.max(0, (acct.volume || 0) - (acct.frozen_volume || 0) - (acct.today_bought || 0));
-            const ratio = kind === "q1" ? 0.25 : (kind === "half" ? 0.5 : 1);
-            shares = Math.floor(sellable * ratio / 100) * 100;
-        }
-    } else if (kind === "sellable") {
-        if (acct) shares = Math.max(0, (acct.volume || 0) - (acct.frozen_volume || 0) - (acct.today_bought || 0));
-    } else if (kind === "step") {
-        shares = (parseInt(document.getElementById("orderShares").value) || 0) + 10000;
-    } else if (kind === "unstep") {
-        shares = Math.max(0, (parseInt(document.getElementById("orderShares").value) || 10000) - 10000);
-    }
-    if (shares > 0) {
-        document.getElementById("orderShares").value = shares;
-        recalcEstimate();
-    } else {
-        toast("当前无法计算该仓位（可用资金/持仓为 0）", "warn");
-    }
 }
 
 function recalcEstimate() {
@@ -911,7 +898,7 @@ async function loadOrders() {
         const rows = resp.data || [];
         const tb = document.querySelector("#ordersTable tbody");
         if (!rows.length) {
-            tb.innerHTML = '<tr><td colspan="7" class="empty-cell">暂无委托</td></tr>';
+            tb.innerHTML = '<tr><td colspan="8" class="empty-cell">暂无委托</td></tr>';
             return;
         }
         tb.innerHTML = rows.map(o => `
@@ -920,6 +907,7 @@ async function loadOrders() {
                 <td class="${o.direction === "buy" ? "up" : "down"}">${o.direction === "buy" ? "买入" : "卖出"}</td>
                 <td>${o.order_type === "limit" ? "限价" : "市价"}</td>
                 <td>${fmt(o.price, 3)}</td>
+                <td>${o.status === "filled" ? fmt(o.filled_price, 3) : "--"}</td>
                 <td>${fmt(o.shares)}</td>
                 <td>${o.status === "pending" ? '<span class="st-pending">已报</span>'
                     : o.status === "filled" ? '<span class="st-filled">已成</span>'
@@ -968,13 +956,17 @@ async function loadAccount() {
         // 账户接口携带 last_price，作为轮次详情 last_price 为 0 时的兜底恢复
         if (!state.lastPrice && a.last_price) {
             state.lastPrice = a.last_price;
-            refreshQuoteDisplay();
+            refreshQuoteDisplay(true);
         }
-        renderAccount(a);
+        renderAccount(a, true);   // 进入/REST 加载：立即渲染，不节流
     } catch (e) { /* 忽略 */ }
 }
 
-function renderAccount(a) {
+function renderAccount(a, force) {
+    // 高速档节流：账户卡为 innerHTML 全量重建，无需每 tick 刷新（x60≈60 次/秒）
+    const now = Date.now();
+    if (!force && now - _lastAcctTs < RENDER_THROTTLE_MS) return;
+    _lastAcctTs = now;
     const box = document.getElementById("accountBox");
     const price = state.lastPrice || 0;
     const marketValue = (a.volume || 0) * price;
@@ -995,8 +987,8 @@ function renderAccount(a) {
             <div class="acct-item"><span>总资产</span><b>${fmt(total)}</b></div>
             <div class="acct-item"><span>期初资产</span><b>${fmt(initAssets)}</b></div>
             <div class="acct-item"><span>总盈亏</span><b class="${totalPnl >= 0 ? 'up' : 'down'}">${fmt(totalPnl)}</b></div>
-            <div class="acct-item"><span>已实现盈亏</span><b class="${(state.round.realized_pnl || 0) >= 0 ? 'up' : 'down'}">${fmt(state.round.realized_pnl)}</b></div>
-            <div class="acct-item"><span>累计手续费</span><b>${fmt(state.round.fee_total)}</b></div>
+            <div class="acct-item"><span>已实现盈亏</span><b class="${(a.realized_pnl || 0) >= 0 ? 'up' : 'down'}">${fmt(a.realized_pnl)}</b></div>
+            <div class="acct-item"><span>累计手续费</span><b>${fmt(a.fee_total)}</b></div>
         </div>`;
 }
 
