@@ -4,6 +4,7 @@
          一个轮次 = 一个交易日的完整游戏周期，账户按轮次独立跟踪
 """
 import functools
+import json
 import logging
 import random
 import threading
@@ -12,8 +13,11 @@ import uuid
 from contextlib import contextmanager
 from datetime import datetime
 
+from sqlalchemy import text
+
 from ..dbdata.database import db
-from ..dbdata.models import GameRound, GameOrder, GameTrade, TickData, TickDataSim
+from ..dbdata.models import (GameRound, GameOrder, GameTrade, GameDay, DayKline,
+                             TickData, TickDataSim)
 from ..messaging.cache import get_cache
 from ..utils.config import Config
 from .account import MockAccount
@@ -36,6 +40,64 @@ O_REJECTED = "rejected"
 
 _TICK_SEC = 3.0          # 每根 tick 对应 3s 行情
 _CLOCK_INTERVAL = 0.1    # 时钟推进周期（秒）
+
+# 按 tick 表现存数据聚合写入 day_kline（天维度原始行情，与 tick 表对齐）的
+# upsert 模板（表名白名单拼接）；last_close 维护链见 refresh_day 注释
+_DAY_KLINE_UPSERT_SQL = """
+INSERT INTO day_kline (code, trade_date, data_source, open, high, low, close,
+                       volume, amount, last_close, tick_count, first_time_key,
+                       last_time_key, is_complete)
+SELECT :code, :trade_date, :data_source,
+       (array_agg(open ORDER BY time_key))[1], max(high), min(low),
+       (array_agg(close ORDER BY time_key DESC))[1],
+       COALESCE(sum(volume), 0), COALESCE(sum(amount), 0),
+       :last_close,
+       count(*), min(time_key), max(time_key),
+       (max(time_key) >= :date_end)
+FROM {table}
+WHERE code = :code AND trade_date = :trade_date
+ON CONFLICT (code, trade_date, data_source) DO UPDATE SET
+  open = EXCLUDED.open, high = EXCLUDED.high, low = EXCLUDED.low,
+  close = EXCLUDED.close, volume = EXCLUDED.volume, amount = EXCLUDED.amount,
+  tick_count = EXCLUDED.tick_count,
+  first_time_key = EXCLUDED.first_time_key,
+  last_time_key = EXCLUDED.last_time_key,
+  is_complete = EXCLUDED.is_complete,
+  last_close = CASE WHEN EXCLUDED.last_close > 0 THEN EXCLUDED.last_close
+                    ELSE day_kline.last_close END,
+  updated_at = now()
+"""
+
+# game_days（游戏选择/管理层）派生同步：is_complete 随 day_kline，round_count 不覆盖
+_GAME_DAY_SYNC_SQL = """
+INSERT INTO game_days (code, trade_date, data_source, is_complete)
+SELECT code, trade_date, data_source, is_complete
+FROM day_kline
+WHERE code = :code AND trade_date = :trade_date AND data_source = :data_source
+ON CONFLICT (code, trade_date, data_source) DO UPDATE SET
+  is_complete = EXCLUDED.is_complete,
+  updated_at = now()
+"""
+
+
+def _valid_price(v) -> bool:
+    """有效价格：非空、>0 且非 NaN（NaN 为 truthy 且比较异常，需显式过滤）"""
+    return v is not None and v > 0 and v == v
+
+
+def _parse_dsn(dsn: str) -> dict:
+    """解析 postgresql://user:pass@host:port/dbname 连接串"""
+    prefix = "postgresql://"
+    if dsn.startswith(prefix):
+        dsn = dsn[len(prefix):]
+    userinfo, _, rest = dsn.partition("@")
+    user, _, password = userinfo.partition(":")
+    host, _, port_db = rest.partition(":")
+    if "/" in port_db:
+        port, _, dbname = port_db.partition("/")
+    else:
+        port, dbname = port_db, "postgres"
+    return {"user": user, "password": password, "host": host, "port": port, "dbname": dbname}
 
 
 class RoundContext:
@@ -102,7 +164,7 @@ class GameEngine:
             "stock_code": cfg.get("game.stock_code", "588000.SH"),
         }
 
-    # ── 可用交易日 ──
+    # ── 可用交易日（基于 game_days 天维度记录，不扫 tick 表）──
 
     def _tick_model(self, data_source: str):
         """按数据源返回行情模型：qmt → tick_data(实盘)，sim → tick_data_sim(转换模拟)"""
@@ -110,23 +172,19 @@ class GameEngine:
 
     @_ensure_ctx
     def _day_map(self, code: str) -> dict:
-        """标的可用交易日来源映射（仅完整交易日）
+        """标的可开局交易日来源映射（仅完整交易日）
 
-        返回 {trade_date: {"qmt": bool, "sim": bool}}；完整性判断：
-        该日最后一根行情时间 >= 15:00:00。
+        返回 {trade_date: {"qmt": bool, "sim": bool}}；数据来自 game_days
+        （游戏选择/管理层，is_complete=true 即该日末根 tick >= 15:00:00，
+        由 day_kline 在行情入库时派生同步）。
         """
         result = {}
-        for model in (TickData, TickDataSim):
-            rows = (
-                db.session.query(model.trade_date, db.func.max(model.time_key))
-                .filter(model.code == code)
-                .group_by(model.trade_date)
-                .all()
-            )
-            for trade_date, max_time in rows:
-                if max_time and max_time >= f"{trade_date} 15:00:00":
-                    key = "qmt" if model is TickData else "sim"
-                    result.setdefault(trade_date, {})[key] = True
+        rows = (db.session.query(GameDay.trade_date, GameDay.data_source)
+                .filter(GameDay.code == code, GameDay.is_complete.is_(True))
+                .all())
+        for trade_date, data_source in rows:
+            key = "qmt" if (data_source or "qmt") == "qmt" else "sim"
+            result.setdefault(trade_date, {})[key] = True
         return result
 
     @_ensure_ctx
@@ -157,6 +215,32 @@ class GameEngine:
             elif allow_sim and src.get("sim"):
                 items[date] = "sim"
         return items
+
+    @_ensure_ctx
+    def date_details(self, code: str, allow_sim: bool = False) -> list:
+        """可运行交易日 + 天维度原始行情（选择/开局界面用，QMT 优先）
+
+        可开局判定来自 game_days（选择/管理层），行情元数据
+        （tick_count/OHLC/last_close 等）从 day_kline 读取（与 tick 表对齐
+        的原始数据，入库时维护），不触碰 tick 行情表。
+        """
+        items = self._date_items(code, allow_sim)
+        if not items:
+            return []
+        klines = (DayKline.query.filter(
+                  DayKline.code == code,
+                  DayKline.trade_date.in_(list(items)),
+                  DayKline.is_complete.is_(True)).all())
+        meta = {(d.trade_date, d.data_source): d for d in klines}
+        result = []
+        for trade_date, src in items.items():
+            day = meta.get((trade_date, src)) or meta.get((trade_date, "qmt")) \
+                or meta.get((trade_date, "sim"))
+            item = day.to_dict() if day else {"trade_date": trade_date,
+                                              "data_source": src}
+            item["source"] = src
+            result.append(item)
+        return result
 
     # ── 轮次管理 ──
 
@@ -203,6 +287,8 @@ class GameEngine:
         )
         db.session.add(r)
         db.session.commit()
+        # 该日已创建轮次数 +1（game_days 选择/管理层，随创建/删除物理维护）
+        self._adjust_round_count(code, trade_date, r.data_source, 1)
         logger.info("创建轮次 id=%s code=%s date=%s source=%s",
                     r.id, code, trade_date, r.data_source)
         return r, ""
@@ -218,17 +304,21 @@ class GameEngine:
                 return False, "运行中的轮次不可删除，请先暂停或结束"
             ctx = self._rounds.pop(round_id, None)
 
-            # 手动级联删除（SQLAlchemy 不自动级联）
+            # 手动级联删除（SQLAlchemy 不自动级联）：委托/成交/轮次行全部物理删除
             GameOrder.query.filter_by(round_id=round_id).delete()
             GameTrade.query.filter_by(round_id=round_id).delete()
+            code, trade_date, data_source = r.code, r.trade_date, r.data_source or "qmt"
             db.session.delete(r)
             db.session.commit()
 
-            # 清理 Redis
+            # 清理 Redis（账户/进度/行情快照）
             cache = get_cache()
             cache.delete_account(round_id)
             cache.delete_progress(round_id)
             cache.delete_quote(str(round_id))
+
+            # 该日已创建轮次数 -1（随删除物理回落，不留计数残留）
+            self._adjust_round_count(code, trade_date, data_source, -1)
             return True, ""
 
     @_ensure_ctx
@@ -237,10 +327,7 @@ class GameEngine:
         rows = GameRound.query.order_by(GameRound.created_at.desc()).all()
         result = []
         for r in rows:
-            ctx = self._rounds.get(r.id)
-            progress = 0.0
-            if ctx and ctx.ticks:
-                progress = round(ctx.index / len(ctx.ticks) * 100, 1)
+            progress = self._progress_of(r)
             result.append({
                 "id": r.id,
                 "code": r.code,
@@ -272,8 +359,11 @@ class GameEngine:
         if ctx and ctx.acct:
             acct = ctx.acct.to_dict()
         elif r.status in (ST_RUNNING, ST_PAUSED, ST_FINISHED):
-            # finished 轮次同样可从 Redis 快照恢复结算后账户（未删除轮次）
+            # finished 轮次同样可从 Redis 快照恢复结算后账户（未删除轮次）；
+            # Redis 缺失时以 DB 账户 JSON 兜底
             acct = get_cache().load_account(round_id)
+            if not acct:
+                acct = self._account_from_json(r.account_json)
 
         # 累计成交额/量（前端分时图恢复用；重启后按已推进区间重算）
         cum_amount, cum_volume = 0.0, 0
@@ -341,17 +431,30 @@ class GameEngine:
             "time_key": t.time_key,
             "open": t.open, "high": t.high, "low": t.low, "close": t.close,
             "volume": t.volume or 0, "amount": t.amount or 0,
-            "last_close": t.last_close or 0,
         } for t in ticks]
 
-        # 进度恢复（后端重启场景）
+        # 昨收填充：来自 day_kline 天维度原始行情（入库时维护，缺失时生成侧从
+        # stock_kline 回补），统一写入每根 tick，保证推送给前端的昨收恒为
+        # 有效数值（与 REST ticks 恢复接口同口径，详见 normalize_last_close）
+        self.normalize_last_close(ctx.ticks, r.code, r.trade_date, r.data_source)
+
+        # 进度恢复（后端重启场景）：优先 Redis 快照；Redis 缺失/不可用时
+        # 以 DB last_time_key（每根 tick 落库）反推已推进位置，保证走势
+        # 进度持久化——行情数据本身永久存于 tick 表，进度不丢即可完整恢复
         cache = get_cache()
         saved_index = cache.load_progress(round_id)
+        if not (0 < saved_index < len(ctx.ticks)):
+            keys = [t["time_key"] for t in ctx.ticks]
+            saved_index = (next((i for i, k in enumerate(keys) if k > r.last_time_key),
+                                len(keys)) if r.last_time_key else 0)
         ctx.index = saved_index if 0 < saved_index < len(ctx.ticks) else 0
         ctx.fraction = 0.0
 
-        # 账户：优先恢复 Redis 快照，否则初始化
+        # 账户：优先 Redis 快照，其次 DB 账户 JSON（交易事件随行落库），
+        # 均缺失才按初始参数初始化（与委托/成交记录保持一致的兜底链）
         acct_dict = cache.load_account(round_id)
+        if not acct_dict:
+            acct_dict = self._account_from_json(r.account_json)
         if acct_dict:
             ctx.acct = MockAccount.from_dict(acct_dict)
         else:
@@ -369,6 +472,229 @@ class GameEngine:
             round_id=round_id, status=O_PENDING).all()
         ctx.pending = {o.order_id: o for o in pending_orders}
         return ctx, ""
+
+    @staticmethod
+    def _account_from_json(raw):
+        """解析 DB 账户 JSON 快照，缺失/损坏时返回 None"""
+        if not raw:
+            return None
+        try:
+            return json.loads(raw)
+        except (TypeError, ValueError):
+            logger.warning("账户 JSON 快照解析失败，忽略")
+            return None
+
+    @staticmethod
+    def _attach_account_json(round_row, ctx):
+        """账户快照随调用方事务落库（不自行 commit，仅交易事件后低频调用）
+
+        Redis 之外的 DB 兜底：Redis 丢失/重启后仍可恢复与委托/成交
+        记录一致的账户状态。round_row 须为当前 session 已 attach 的实例
+        （_try_fill 中为 detached 的 ctx.round，需先 add 再 commit）。
+        """
+        if ctx and ctx.acct and round_row is not None:
+            round_row.account_json = json.dumps(ctx.acct.to_dict())
+
+    def _progress_of(self, r: GameRound) -> float:
+        """轮次进度：内存 ctx 优先；ctx 缺失（后端重启）时按 DB
+        last_time_key 在行情表中反推已推进比例（调用方须处于 app context）"""
+        ctx = self._rounds.get(r.id)
+        if ctx and ctx.ticks:
+            return round(ctx.index / len(ctx.ticks) * 100, 1)
+        if not r.last_time_key:
+            return 0.0
+        m = self._tick_model(r.data_source or "qmt")
+        total = (db.session.query(db.func.count())
+                 .filter(m.code == r.code, m.trade_date == r.trade_date).scalar() or 0)
+        if not total:
+            return 0.0
+        done = (db.session.query(db.func.count())
+                .filter(m.code == r.code, m.trade_date == r.trade_date,
+                        m.time_key <= r.last_time_key).scalar() or 0)
+        return round(done / total * 100, 1)
+
+    def normalize_last_close(self, ticks: list, code: str, trade_date: str,
+                             data_source: str) -> list:
+        """昨收填充（调用方须处于 app context，勿套 _ensure_ctx）
+
+        昨收（上一交易日收盘）为日维度常量，由 day_kline 表在行情入库时维护
+        （与 tick 表对齐；tick 表已不再存 last_close）。此处读取当日记录值并
+        统一写入每根 tick dict，保证引擎 _load_context 与 REST ticks 恢复接口
+        同口径；当日无有效值时以前一完整交易日的 close 兜底（绝不用当日价格
+        充当基准）。
+        """
+        base_close = self.day_last_close(code, trade_date, data_source)
+        for t in ticks:
+            t["last_close"] = base_close
+        return ticks
+
+    def day_last_close(self, code: str, trade_date: str, data_source: str) -> float:
+        """当日昨收：优先 day_kline 记录 last_close（调用方须处于 app context）
+
+        无效（缺失/0/NaN）时以更早完整交易日的 close 兜底（同数据源优先，
+        其次另一数据源），语义即上一交易日收盘价；无更早完整日时返回 0
+        （前端将展示 "--"）。
+        """
+        day = self._day_row(code, trade_date, data_source)
+        if day and _valid_price(day.last_close):
+            return float(day.last_close)
+        other = "sim" if data_source == "qmt" else "qmt"
+        for src in (data_source, other):
+            prev = (DayKline.query.filter(
+                    DayKline.code == code,
+                    DayKline.data_source == src,
+                    DayKline.is_complete.is_(True),
+                    DayKline.trade_date < trade_date)
+                    .order_by(DayKline.trade_date.desc()).first())
+            if prev and _valid_price(prev.close):
+                return float(prev.close)
+        return 0.0
+
+    def _day_row(self, code: str, trade_date: str, data_source: str):
+        """查询某日 day_kline 记录（调用方须处于 app context）
+
+        先按指定数据源精确查；查不到时回退同日任意数据源（避免记录缺失时
+        昨收完全不可用）。
+        """
+        day = (DayKline.query.filter_by(code=code, trade_date=trade_date,
+                                        data_source=data_source).first())
+        if day is None:
+            day = (DayKline.query.filter_by(code=code, trade_date=trade_date)
+                   .first())
+        return day
+
+    # ── game_days 天维度记录维护 ──
+
+    def _adjust_round_count(self, code: str, trade_date: str, data_source: str,
+                            delta: int) -> None:
+        """维护 game_days.round_count（该日已创建轮次数：创建 +1 / 删除 -1，下限 0）
+
+        调用方须处于 app context；game_days 行缺失（理论不发生：轮次只能建于
+        game_days 已登记的完整交易日）时仅记录日志，不影响轮次主流程。
+        """
+        try:
+            db.session.execute(
+                text("UPDATE game_days "
+                     "SET round_count = GREATEST(round_count + :delta, 0), "
+                     "updated_at = now() "
+                     "WHERE code = :code AND trade_date = :trade_date "
+                     "AND data_source = :data_source"),
+                {"delta": delta, "code": code, "trade_date": trade_date,
+                 "data_source": data_source})
+            db.session.commit()
+        except Exception as e:
+            db.session.rollback()
+            logger.warning("维护 game_days.round_count 失败 code=%s date=%s: %s",
+                           code, trade_date, e)
+
+    def refresh_day(self, code: str, trade_date: str, data_source: str,
+                    last_close_hint: float = 0.0) -> bool:
+        """tick 入库后同步维护天维度日行情 day_kline（与 tick 表对齐）
+
+        调用方须处于 app context（行情上传/批量写入后调用，勿套 _ensure_ctx）。
+        昨收写入前确定链：hint（上传/生成方携带）> 库内有效旧值 > stock_kline
+        天维度回补（_kline_last_close）；三者均无效时拒绝写入——last_close
+        无效（空/0）的日行情视为异常数据，不入库、不派生 game_days，返回 False
+        （调用方应提示错误；已入库的 tick 行情本身不受影响）。
+        写入两步：
+        1) day_kline：按 tick 表现存数据聚合（条数/首末时间/OHLC 均对账自
+           tick），昨收取确定链结果；
+        2) game_days：游戏选择/管理层派生同步（is_complete 随 day_kline）。
+        游戏选择与开局数据读取不再扫描 tick 表（tick 表仅游戏运行时使用）。
+        """
+        if data_source not in ("qmt", "sim"):
+            return False
+        table = "tick_data" if data_source == "qmt" else "tick_data_sim"
+        hint = _valid_price(last_close_hint) and float(last_close_hint) or 0.0
+        # 昨收确定链：hint > 库内有效旧值 > stock_kline 天维度（仅生成侧）
+        lc = hint
+        if not _valid_price(lc):
+            old = self._day_row(code, trade_date, data_source)
+            if old is not None and _valid_price(old.last_close):
+                lc = float(old.last_close)
+            else:
+                lc = self._kline_last_close(code, trade_date)
+        if not _valid_price(lc):
+            logger.warning(
+                "刷新 day_kline 拒绝: %s %s %s 昨收缺失（last_close hint/库内旧值/"
+                "stock_kline 均无效），异常日行情不入库，请携带有效 last_close 后重试",
+                code, trade_date, data_source)
+            return False
+        params = {"code": code, "trade_date": trade_date,
+                  "data_source": data_source,
+                  "date_end": f"{trade_date} 15:00:00",
+                  "last_close": lc}
+        try:
+            db.session.execute(
+                text(_DAY_KLINE_UPSERT_SQL.format(table=table)), params)
+            db.session.execute(text(_GAME_DAY_SYNC_SQL), params)
+            db.session.commit()
+        except Exception as e:
+            db.session.rollback()
+            logger.warning("刷新 day_kline/game_days 失败 code=%s date=%s src=%s: %s",
+                           code, trade_date, data_source, e)
+            return False
+        return True
+
+    def refresh_all_days(self, code: str = None, trade_date: str = None) -> int:
+        """全量重建 day_kline/game_days（迁移/修复用，调用方须处于 app context）
+
+        遍历 tick_data / tick_data_sim 现存日期逐日刷新（先写 day_kline 再
+        派生 game_days），返回处理日期数。
+        """
+        pairs = set()
+        for model, src in ((TickData, "qmt"), (TickDataSim, "sim")):
+            for c, d in (db.session.query(model.code, model.trade_date)
+                         .distinct().all()):
+                pairs.add((c, d, src))
+        n = 0
+        for c, d, src in sorted(pairs):
+            if code and c != code:
+                continue
+            if trade_date and d != trade_date:
+                continue
+            if self.refresh_day(c, d, src):
+                n += 1
+        logger.info("day_kline/game_days 重建完成: %d 日", n)
+        return n
+
+    def _kline_last_close(self, code: str, trade_date: str) -> float:
+        """从 AutoTrade 库 stock_kline 天维度读取昨收（仅生成时回补）
+
+        优先级：当日 1d 行 last_close > 当日 1m 首根 last_close（口径同
+        load_minutes_from_autotrade）；查不到/连接失败返回 0，不影响主流程。
+        """
+        dsn = Config.get_instance().get("data_source.autotrade_dsn", "")
+        if not dsn:
+            return 0.0
+        try:
+            import psycopg2
+            params = _parse_dsn(dsn)
+            conn = psycopg2.connect(**params)
+            try:
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT last_close FROM stock_kline "
+                    "WHERE code=%s AND period='1d' AND last_close > 0 "
+                    "AND time_key >= %s::date AND time_key < (%s::date + interval '1 day')",
+                    (code, trade_date, trade_date))
+                row = cur.fetchone()
+                if not row or not _valid_price(row[0]):
+                    cur.execute(
+                        "SELECT last_close FROM stock_kline "
+                        "WHERE code=%s AND period='1m' AND last_close > 0 "
+                        "AND time_key >= %s::date AND time_key < (%s::date + interval '1 day') "
+                        "ORDER BY time_key LIMIT 1",
+                        (code, trade_date, trade_date))
+                    row = cur.fetchone()
+                cur.close()
+                return float(row[0]) if row and _valid_price(row[0]) else 0.0
+            finally:
+                conn.close()
+        except Exception as e:
+            logger.warning("stock_kline 昨收回补失败 code=%s date=%s: %s",
+                           code, trade_date, e)
+            return 0.0
 
     @_ensure_ctx
     def start_round(self, round_id: int) -> (bool, str):
@@ -396,6 +722,7 @@ class GameEngine:
 
             r.status = ST_RUNNING
             r.started_at = r.started_at or datetime.now()
+            self._attach_account_json(r, ctx)   # 初始/恢复后的账户随行落库
             db.session.commit()
             self._save_snapshot(ctx)
             self.emit("game:status", {"round_id": round_id, "status": ST_RUNNING},
@@ -520,6 +847,7 @@ class GameEngine:
                 frozen_amount=acct.frozen_amount(price, shares) if direction == "buy" else 0,
             )
             db.session.add(order)
+            self._attach_account_json(r, ctx)   # 冻结后的账户落库（DB 兜底）
             db.session.commit()
 
             ctx.pending[order_id] = order
@@ -552,6 +880,7 @@ class GameEngine:
                     ctx.acct.unfreeze_sell(order.shares)
 
             order.status = O_CANCELLED
+            self._attach_account_json(r, ctx)   # 解冻后的账户落库（DB 兜底）
             db.session.commit()
             if ctx:
                 ctx.pending.pop(order_id, None)
@@ -697,6 +1026,7 @@ class GameEngine:
                 order.status = O_REJECTED
                 order.reject_reason = f"市价成交价 {fill_price} 超出冻结额"
                 # 订单/轮次为跨 context 的 detached 实例，需重新 attach 才能持久化
+                self._attach_account_json(ctx.round, ctx)
                 db.session.add(order)
                 db.session.add(ctx.round)
                 db.session.commit()
@@ -733,6 +1063,7 @@ class GameEngine:
             ctx.round.realized_pnl = (ctx.round.realized_pnl or 0) + (amount - fee)
         ctx.round.fee_total = (ctx.round.fee_total or 0) + fee
         # 订单/轮次为跨 context 的 detached 实例，需重新 attach 才能持久化
+        self._attach_account_json(ctx.round, ctx)
         db.session.add(order)
         db.session.add(ctx.round)
         db.session.commit()
@@ -803,6 +1134,7 @@ class GameEngine:
                 ctx.round.final_assets = round(final, 2)
                 # 解冻后的账户快照落 Redis（重启后恢复一致）
                 self._save_snapshot(ctx)
+            self._attach_account_json(r, ctx)   # 结算后账户落库（DB 兜底）
             db.session.commit()
             self.emit("game:status", {"round_id": round_id, "status": ST_FINISHED,
                                       "reason": reason, "final_assets": final},

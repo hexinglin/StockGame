@@ -27,32 +27,52 @@ def _err(message, code=400):
 
 @game_bp.route("/dates", methods=["GET"])
 def dates():
-    """可用交易日列表（按 code 过滤，默认 588000.SH）
+    """可运行交易日列表（按 code 过滤，默认 588000.SH；选择/管理索引：game_days）
 
     参数:
       code       标的代码（缺省返回全部 code 的日期映射）
       allow_sim  1/0 是否允许转换模拟数据（QMT 无该日数据时的兜底）
       source     1/0 返回带来源标记的 [{trade_date, source}]（qmt/sim）
+      detail     1/0 附带天维度原始行情（last_close/OHLC/tick_count 等，需 source=1）
     """
     code = request.args.get("code", "") or None
     allow_sim = request.args.get("allow_sim", "0") in ("1", "true", "True")
     with_source = request.args.get("source", "0") in ("1", "true", "True")
+    with_detail = request.args.get("detail", "0") in ("1", "true", "True")
     engine = get_engine()
     if code:
-        result = (engine.date_sources(code, allow_sim) if with_source
-                  else engine.available_dates(code, allow_sim))
+        if with_source and with_detail:
+            result = engine.date_details(code, allow_sim)
+        elif with_source:
+            result = engine.date_sources(code, allow_sim)
+        else:
+            result = engine.available_dates(code, allow_sim)
     else:
-        # 全部 code 的日期（实盘 + 转换模拟的 code 并集）
-        from ..dbdata.models import TickData, TickDataSim
-        codes = set()
-        for model in (TickData, TickDataSim):
-            for (c,) in db.session.query(model.code).distinct().all():
-                codes.add(c)
+        # 全部 code 的日期（game_days 选择/管理中实盘 + 转换模拟的 code 并集）
+        from ..dbdata.models import GameDay
+        codes = [c for (c,) in db.session.query(GameDay.code).distinct().all()]
         result = {}
         for c in sorted(codes):
-            result[c] = (engine.date_sources(c, allow_sim) if with_source
-                         else engine.available_dates(c, allow_sim))
+            if with_source and with_detail:
+                result[c] = engine.date_details(c, allow_sim)
+            elif with_source:
+                result[c] = engine.date_sources(c, allow_sim)
+            else:
+                result[c] = engine.available_dates(c, allow_sim)
     return _ok(result)
+
+
+@game_bp.route("/days/refresh", methods=["POST"])
+def refresh_days():
+    """重建/刷新 day_kline（与 tick 对齐）并派生 game_days（选择/管理用）
+
+    body 可选: {code?, trade_date?}；缺省全量重建（幂等，逐日覆盖）。
+    """
+    body = request.get_json(silent=True) or {}
+    code = body.get("code") or None
+    trade_date = body.get("trade_date") or None
+    n = get_engine().refresh_all_days(code=code, trade_date=trade_date)
+    return _ok({"refreshed": n}, f"交易日记录刷新完成（{n} 日）")
 
 
 # ── 轮次 CRUD ──
@@ -199,14 +219,17 @@ def ticks(round_id):
         return _err("轮次不存在", 404)
     m = TickDataSim if (r.data_source or "qmt") == "sim" else TickData
     rows = (db.session.query(m.time_key, m.open, m.high,
-                             m.low, m.close, m.volume,
-                             m.amount, m.last_close)
+                             m.low, m.close, m.volume, m.amount)
             .filter(m.code == r.code, m.trade_date == r.trade_date)
             .order_by(m.time_key).all())
     tail = request.args.get("tail", type=int, default=0)
     data = [{"time_key": tk, "open": o, "high": h, "low": l, "close": c,
-             "volume": v or 0, "amount": a or 0, "last_close": lc or 0}
-            for tk, o, h, l, c, v, a, lc in rows]
+             "volume": v or 0, "amount": a or 0}
+            for tk, o, h, l, c, v, a in rows]
+    # 昨收填充（与引擎 _load_context 同口径）：昨收已由 day_kline 天维度
+    # 原始行情维护（入库时清洗+stock_kline 兜底），此处按记录值统一回填，
+    # 保证前端恢复与实时推送的昨收一致且恒可解析
+    get_engine().normalize_last_close(data, r.code, r.trade_date, r.data_source or "qmt")
     if tail and tail > 0:
         data = data[-tail:]
     return _ok({"trade_date": r.trade_date, "code": r.code,

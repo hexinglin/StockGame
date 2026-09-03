@@ -3,7 +3,7 @@
 """
 from datetime import datetime
 
-from sqlalchemy import Column, String, Integer, Float, DateTime
+from sqlalchemy import Column, String, Integer, Float, DateTime, Text
 from ..database import Base
 
 
@@ -27,3 +27,4 @@ class GameRound(Base):
     fee_total = Column(Float, default=0)
     last_price = Column(Float, default=0)
     last_time_key = Column(String(19), default="")
+    account_json = Column(Text, default=None)   # 账户快照 JSON（Redis 之外的 DB 兜底）

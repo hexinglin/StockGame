@@ -18,7 +18,7 @@
             <span class="mode-badge" id="agentStatusBadge">Agent: --</span>
         </div>
         <div class="top-right">
-            <span class="ws-status" id="wsStatus">● 连接中</span>
+            <span class="ws-status" id="wsStatus" title="与后端的实时推送连接状态（进入游戏后建立）">● 未连接</span>
             <span class="data-time" id="dataTime"></span>
             <button class="btn-refresh" onclick="loadAll()" title="刷新">⟳</button>
         </div>
@@ -132,32 +132,14 @@
                     <button class="order-tab buy active" id="tabBuy" onclick="switchSide('buy')">买入</button>
                     <button class="order-tab sell" id="tabSell" onclick="switchSide('sell')">卖出</button>
                 </div>
-                <div class="order-type-row">
-                    <button class="otype-btn active" data-type="limit" onclick="switchType('limit')">限价</button>
-                    <button class="otype-btn" data-type="market" onclick="switchType('market')">市价</button>
-                </div>
-                <div class="order-field">
-                    <label>委托价格</label>
-                    <input type="number" id="orderPrice" step="0.001" min="0" oninput="recalcEstimate()">
-                    <div class="quick-btns">
-                        <button onclick="quickPrice('last')">最新</button>
-                        <button onclick="quickPrice('ask1')">对手价</button>
-                        <button onclick="quickPrice('bid1')">买一</button>
-                        <button onclick="quickPrice('ask1')">卖一</button>
-                        <button onclick="quickPrice('up')">+1档</button>
-                        <button onclick="quickPrice('down')">-1档</button>
+                <div class="order-row">
+                    <div class="order-field">
+                        <label>委托价格</label>
+                        <input type="number" id="orderPrice" step="0.001" min="0" oninput="recalcEstimate()">
                     </div>
-                </div>
-                <div class="order-field">
-                    <label>委托数量</label>
-                    <input type="number" id="orderShares" step="100" min="100" oninput="recalcEstimate()">
-                    <div class="quick-btns">
-                        <button onclick="quickShares('q1')">1/4仓</button>
-                        <button onclick="quickShares('half')">半仓</button>
-                        <button onclick="quickShares('full')">全仓</button>
-                        <button onclick="quickShares('sellable')">全可卖</button>
-                        <button onclick="quickShares('step')">+100</button>
-                        <button onclick="quickShares('unstep')">-100</button>
+                    <div class="order-field">
+                        <label>委托数量</label>
+                        <input type="number" id="orderShares" step="10000" value="10000" oninput="recalcEstimate()">
                     </div>
                 </div>
                 <div class="estimate-row">

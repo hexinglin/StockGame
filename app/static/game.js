@@ -16,7 +16,7 @@ const state = {
     lastPrice: 0,           // 最新价
     dayOpen: 0, dayHigh: 0, dayLow: 0,
     side: "buy",            // buy/sell
-    otype: "limit",         // limit/market
+    otype: "limit",         // 仅支持限价
     socket: null,
     chart: null,
     pendingConfirm: null,   // 待确认订单
@@ -324,7 +324,9 @@ async function enterGame(roundId) {
     try {
         const detail = await api(`/api/v1/game/rounds/${roundId}`);
         state.round = detail.data;
-        const tk = await api(`/api/v1/game/rounds/${roundId}/ticks?tail=3000`);
+        // 全量 tick 恢复分时图（不可 tail 截断：进度过半后 tail=3000 只能覆盖
+        // 最近 2.5 小时，图会从盘中截断开始，丢失早盘走势）
+        const tk = await api(`/api/v1/game/rounds/${roundId}/ticks`);
         state.ticks = tk.data.ticks || [];
 
         document.getElementById("view-rounds").style.display = "none";
@@ -345,11 +347,17 @@ async function enterGame(roundId) {
         const upto = lastKey ? state.ticks.filter(t => t.time_key <= lastKey) : [];
         rebuildMinuteSeries(upto, true);
 
-        // 恢复下单面板状态
+        // 恢复行情显示状态：昨收/今开/今高/今低均按已推进区间重算，与实时
+        // 播放保持同一当日累计口径；进入后由行情推送增量更新
         state.lastClose = upto.length ? (upto[upto.length - 1].last_close || 0) : 0;
         state.dayOpen = upto.length ? upto[0].open : 0;
+        state.dayHigh = upto.length ? Math.max(...upto.map(t => t.high || 0)) : 0;
+        state.dayLow = upto.length ? Math.min(...upto.map(t => t.low || 0)) : 0;
         // 恢复最新价（供持仓/账户市值计算，socket 推送前避免现价显示 0）
         state.lastPrice = state.round.last_price || 0;
+        // 恢复进度条（暂停/重进时不依赖行情推送也能显示正确进度）
+        const tickTotal = state.ticks.length;
+        updateProgress(tickTotal && upto.length ? upto.length / tickTotal * 100 : 0);
 
         // 加载委托/成交/账户
         loadOrders();
@@ -370,6 +378,7 @@ function backToRounds() {
     if (state.socket) state.socket.disconnect();
     state.socket = null;
     state.roundId = null;
+    setWsStatus("● 未连接");   // 主动返回：无实时通道，非故障
     document.getElementById("view-game").style.display = "none";
     document.getElementById("view-rounds").style.display = "block";
     document.title = "StockGame 股票模拟交易游戏";
@@ -397,18 +406,34 @@ function renderGameHeader() {
 }
 
 // ───────────── Socket ─────────────
+function setWsStatus(text, cls) {
+    // 更新右上角实时推送连接状态（元素位于轮次管理页顶栏）
+    const el = document.getElementById("wsStatus");
+    if (!el) return;
+    el.textContent = text;
+    el.className = "ws-status" + (cls ? " " + cls : "");
+}
+
 function initSocket() {
     if (state.socket) { state.socket.disconnect(); }
+    if (typeof io === "undefined") {
+        // socket.io 客户端脚本（CDN）未加载：实时推送不可用，但不阻断页面其它功能
+        console.error("socket.io 客户端未加载（检查 CDN 可用性）");
+        setWsStatus("● 连接失败", "err");
+        return;
+    }
     const ws = io();
     state.socket = ws;
     ws.on("connect", () => {
-        document.getElementById("wsStatus").textContent = "● 已连接";
-        document.getElementById("wsStatus").className = "ws-status ok";
+        setWsStatus("● 已连接", "ok");
         ws.emit("join_round", { round_id: state.roundId });
     });
     ws.on("disconnect", () => {
-        document.getElementById("wsStatus").textContent = "● 已断开";
-        document.getElementById("wsStatus").className = "ws-status";
+        setWsStatus("● 已断开", "err");
+    });
+    ws.on("connect_error", () => {
+        // socket.io 会自动重连，重连成功后上方 connect 回调恢复"已连接"
+        setWsStatus("● 连接失败", "err");
     });
     ws.on("game:quote", onQuote);
     ws.on("game:order_update", onOrderUpdate);
@@ -496,7 +521,25 @@ function onGameStatus(s) {
     }
 }
 
-// ───────────── 分时图（1分钟聚合 + 尾部跳变） ─────────────
+// ───────────── 分时图（固定交易日轴 + 1分钟聚合 + 尾部跳变） ─────────────
+// 完整交易日分钟序列：09:30-11:30 + 13:00-15:00 共 241 个真实分钟 + 1 个午休占位；
+// x 轴固定（同花顺式），数据按分钟对齐，未开盘/缺分钟的时段留空不连线，
+// 午休占位点断开分时线；合并标签放在占位中点使两侧间隔对称（各 31 idx）
+const TRADING_MINUTES = (() => {
+    const out = [];
+    const p2 = n => String(n).padStart(2, "0");
+    // 上午 09:30-11:30（121 分钟）
+    for (let h = 9; h <= 11; h++)
+        for (let m = (h === 9 ? 30 : 0); m <= (h === 11 ? 30 : 59); m++)
+            out.push(p2(h) + ":" + p2(m));
+    out.push("午休");   // 午休占位（断线 + 合并标签锚点）
+    // 下午 13:00-15:00（121 分钟）
+    for (let h = 13; h <= 14; h++)
+        for (let m = 0; m <= 59; m++) out.push(p2(h) + ":" + p2(m));
+    out.push("15:00");
+    return out;   // 121 + 1 + 121 = 243
+})();
+
 function initChart() {
     const el = document.getElementById("minuteChart");
     state.chart = echarts.init(el);
@@ -537,56 +580,98 @@ function rebuildMinuteSeries(ticks, isRecover) {
 function updateChart() {
     if (!state.chart) return;
     const points = state.minutePoints.concat(state.livePoint ? [state.livePoint] : []);
-    const times = points.map(p => p.time);
-    const prices = points.map(p => p.price);
-    const vols = points.map(p => p.vol);
+    const byMin = new Map(points.map(p => [p.time, p]));
 
-    // 均价线：累计成交额/累计成交量（含当前跳变点）
+    // 固定 x 轴：完整交易日 241 分钟；未开盘/缺分钟的时段为 null（不连线）
+    const times = TRADING_MINUTES;
+    const data = times.map(m => byMin.get(m) || null);
+    const prices = data.map(p => (p ? p.price : null));
+    const vols = data.map(p => (p ? p.vol : null));
+
+    // 均价线：按交易日顺序累计成交额/量（缺分钟跳过，累计不中断）
     let ca = 0, cv = 0;
-    const avgs = points.map(p => {
-        ca += p.amount || (p.price * p.vol);
-        cv += p.vol;
-        return cv > 0 ? +(ca / cv).toFixed(4) : null;
+    const avgs = data.map(p => {
+        if (p) { ca += p.amount || (p.price * p.vol); cv += p.vol; }
+        return p && cv > 0 ? +(ca / cv).toFixed(4) : null;
     });
 
-    const lastClose = state.lastClose || prices[0] || 0;
-    const baseLine = prices.map(() => lastClose);
+    const lastClose = state.lastClose || (points.length && points[0].price) || 0;
+    const baseLine = data.map(p => (p ? lastClose : null));
     const upColor = "#e64545", downColor = "#1a9e5c";
+    const lastP = points[points.length - 1];
+    const prevP = points[points.length - 2];
 
     state.chart.setOption({
         animation: false,
+        // 布局用百分比 + bottom 定位，避免固定像素在不同分辨率下失衡
         grid: [
-            { left: 55, right: 16, top: 12, height: "62%" },
-            { left: 55, right: 16, top: "78%", height: "14%" },
+            { left: 55, right: 16, top: 12, bottom: "25%" },   // 价格图（高度随容器自适应）
+            { left: 55, right: 16, height: "17%", bottom: 5 }, // 成交量图（底部对齐）
         ],
         tooltip: {
             trigger: "axis",
             axisPointer: { type: "cross" },
             formatter: (params) => {
                 const i = params[0].dataIndex;
-                const p = points[i];
+                const p = data[i];
                 if (!p) return "";
                 return `<b>${p.time}</b><br/>价格: ${p.price}<br/>成交量: ${fmtVol(p.vol)}<br/>均价: ${avgs[i] !== null ? avgs[i] : "--"}`;
             },
         },
         xAxis: [
-            { type: "category", data: times, boundaryGap: false, axisLine: { lineStyle: { color: "#666" } }, axisLabel: { color: "#999", fontSize: 10, interval: Math.ceil(times.length / 8) } },
+            {
+                type: "category", data: times, boundaryGap: false,
+                axisLine: { lineStyle: { color: "#666" } },
+                // 固定刻度：每半小时一个；午休合并标签放在占位中点使两侧等距
+                axisLabel: {
+                    color: "#999", fontSize: 10,
+                    interval: (idx) => {
+                        const m = times[idx];
+                        if (!m) return false;
+                        if (m === "午休") return true;      // 合并标签锚点
+                        if (m === "11:30" || m === "13:00") return false;  // 已并入午休标签
+                        return m.endsWith(":00") || m.endsWith(":30");
+                    },
+                    formatter: (val, idx) => (times[idx] === "午休" ? "11:30/13:00" : val),
+                },
+            },
             { type: "category", data: times, gridIndex: 1, axisLabel: { show: false }, axisTick: { show: false }, splitLine: { show: false } },
         ],
         yAxis: [
-            { type: "value", scale: true, splitLine: { lineStyle: { color: "rgba(255,255,255,0.08)" } }, axisLabel: { color: "#999", fontSize: 10 } },
+            {
+                type: "value", scale: true,
+                splitLine: { lineStyle: { color: "rgba(255,255,255,0.08)" } },
+                // 每个价格刻度同时展示当日涨跌幅（基准=昨收，红涨绿跌；昨收无效时仅显示价格）
+                axisLabel: {
+                    color: "#999", fontSize: 10,
+                    rich: {
+                        p:    { color: "#999",   fontSize: 10, lineHeight: 13 },
+                        up:   { color: upColor,   fontSize: 10, lineHeight: 13 },
+                        down: { color: downColor, fontSize: 10, lineHeight: 13 },
+                        flat: { color: "#999",   fontSize: 10, lineHeight: 13 },
+                    },
+                    formatter: (v) => {
+                        const lc = state.lastClose;
+                        if (!(lc && lc === lc && lc > 0)) return fmt(v, 3);
+                        const pct = (v - lc) / lc * 100;
+                        const tag = pct > 0 ? "up" : pct < 0 ? "down" : "flat";
+                        const sign = pct > 0 ? "+" : "";
+                        return `{p|${fmt(v, 3)}}\n{${tag}|${sign}${pct.toFixed(2)}%}`;
+                    },
+                },
+            },
             { type: "value", gridIndex: 1, splitLine: { show: false }, axisLabel: { show: false }, max: v => Math.max(...vols, 1) },
         ],
         dataZoom: [{ type: "inside", xAxisIndex: [0, 1], start: 0, end: 100 }],
         series: [
             {
                 name: "价格", type: "line", data: prices, showSymbol: false,
-                lineStyle: { width: 1.5, color: prices.length > 1 && prices[prices.length - 1] >= prices[prices.length - 2] ? upColor : downColor },
+                lineStyle: { width: 1.5, color: lastP && prevP && lastP.price >= prevP.price ? upColor : downColor },
                 areaStyle: {
                     color: {
                         type: "linear", x: 0, y: 0, x2: 0, y2: 1,
                         colorStops: [
-                            { offset: 0, color: prices[prices.length - 1] >= lastClose ? "rgba(230,69,69,0.25)" : "rgba(26,158,92,0.25)" },
+                            { offset: 0, color: lastP && lastP.price >= lastClose ? "rgba(230,69,69,0.25)" : "rgba(26,158,92,0.25)" },
                             { offset: 1, color: "rgba(0,0,0,0)" },
                         ],
                     },
@@ -595,7 +680,10 @@ function updateChart() {
             { name: "均价", type: "line", data: avgs, showSymbol: false, lineStyle: { width: 1, color: "#f5c542" } },
             { name: "昨收", type: "line", data: baseLine, showSymbol: false, lineStyle: { width: 1, color: "#888", type: "dashed" } },
             { name: "成交量", type: "bar", data: vols, xAxisIndex: 1, yAxisIndex: 1, barWidth: "70%",
-              itemStyle: { color: (p) => (prices[p.dataIndex] >= lastClose ? "rgba(230,69,69,0.55)" : "rgba(26,158,92,0.55)") } },
+              itemStyle: { color: (p) => {
+                  const d = data[p.dataIndex];
+                  return d ? (d.price >= lastClose ? "rgba(230,69,69,0.55)" : "rgba(26,158,92,0.55)") : "rgba(0,0,0,0)";
+              } } },
         ],
     });
 }
@@ -607,20 +695,32 @@ function refreshQuoteDisplay() {
     const el = document.getElementById("gLastPrice");
     if (price) {
         el.textContent = fmt(price, 3);
-        const up = price >= lastClose;
-        el.className = "big-price " + (up ? "up" : "down");
-        const chg = price - lastClose;
-        const pct = lastClose ? (chg / lastClose * 100) : 0;
         const chgEl = document.getElementById("gChange");
         const pctEl = document.getElementById("gChangePct");
-        chgEl.textContent = (chg >= 0 ? "+" : "") + fmt(chg, 3);
-        pctEl.textContent = (pct >= 0 ? "+" : "") + pct.toFixed(2) + "%";
-        [chgEl, pctEl].forEach(e => { e.className = "chg " + (up ? "up" : "down"); });
+        // 涨跌幅基准 = 上一交易日收盘价（昨收）；无效时展示 "--"，避免误导
+        const baseOk = lastClose && lastClose === lastClose && lastClose > 0;
+        if (baseOk) {
+            const up = price >= lastClose;
+            el.className = "big-price " + (up ? "up" : "down");
+            const chg = price - lastClose;
+            const pct = chg / lastClose * 100;
+            chgEl.textContent = (chg >= 0 ? "+" : "") + fmt(chg, 3);
+            pctEl.textContent = (pct >= 0 ? "+" : "") + pct.toFixed(2) + "%";
+            chgEl.className = "chg " + (up ? "up" : "down");
+            pctEl.className = "chg " + (up ? "up" : "down");
+        } else {
+            el.className = "big-price";
+            chgEl.textContent = "--";
+            chgEl.className = "chg";
+            pctEl.textContent = "--";
+            pctEl.className = "chg";
+        }
     }
     document.getElementById("gOpen").textContent = fmt(state.dayOpen, 3);
     document.getElementById("gHigh").textContent = fmt(state.dayHigh, 3);
     document.getElementById("gLow").textContent = fmt(state.dayLow, 3);
-    document.getElementById("gLastClose").textContent = fmt(lastClose, 3);
+    document.getElementById("gLastClose").textContent =
+        lastClose && lastClose > 0 ? fmt(lastClose, 3) : "--";
     document.getElementById("gVol").textContent = fmtVol(state.cumVolume);
     document.getElementById("gAmount").textContent = fmt(state.cumAmount);
     renderLevel5(price);
@@ -665,13 +765,6 @@ function switchSide(side) {
     recalcEstimate();
 }
 
-function switchType(type) {
-    state.otype = type;
-    document.querySelectorAll(".otype-btn").forEach(b => b.classList.toggle("active", b.dataset.type === type));
-    document.getElementById("orderPrice").disabled = type === "market";
-    recalcEstimate();
-}
-
 function getStep() {
     const price = parseFloat(document.getElementById("orderPrice").value) || state.lastPrice || 1;
     return Math.max(Math.round(price * 0.001 * 1000) / 1000, 0.001);
@@ -695,7 +788,6 @@ function quickPrice(kind) {
 }
 
 function quickPriceByValue(v) {
-    if (state.otype === "market") return;
     document.getElementById("orderPrice").value = v.toFixed(3);
     recalcEstimate();
 }
@@ -719,9 +811,9 @@ function quickShares(kind) {
     } else if (kind === "sellable") {
         if (acct) shares = Math.max(0, (acct.volume || 0) - (acct.frozen_volume || 0));
     } else if (kind === "step") {
-        shares = (parseInt(document.getElementById("orderShares").value) || 0) + 100;
+        shares = (parseInt(document.getElementById("orderShares").value) || 0) + 10000;
     } else if (kind === "unstep") {
-        shares = Math.max(0, (parseInt(document.getElementById("orderShares").value) || 100) - 100);
+        shares = Math.max(0, (parseInt(document.getElementById("orderShares").value) || 10000) - 10000);
     }
     if (shares > 0) {
         document.getElementById("orderShares").value = shares;
@@ -743,7 +835,7 @@ function recalcEstimate() {
 function submitOrder() {
     const price = parseFloat(document.getElementById("orderPrice").value) || 0;
     const shares = parseInt(document.getElementById("orderShares").value) || 0;
-    if (state.otype === "limit" && price <= 0) { toast("请输入有效委托价格", "warn"); return; }
+    if (price <= 0) { toast("请输入有效委托价格", "warn"); return; }
     if (shares <= 0 || shares % 100 !== 0) { toast("委托数量必须为 100 的整数倍", "warn"); return; }
     const amount = price * shares;
     const fee = amount * FEE_RATE;
@@ -751,7 +843,6 @@ function submitOrder() {
     document.getElementById("confirmTitle").textContent = (state.side === "buy" ? "买入" : "卖出") + "确认";
     document.getElementById("confirmBody").innerHTML = `
         <div class="confirm-row"><span>方向</span><b class="${state.side}">${state.side === "buy" ? "买入" : "卖出"}</b></div>
-        <div class="confirm-row"><span>类型</span><b>${state.otype === "limit" ? "限价" : "市价"}</b></div>
         <div class="confirm-row"><span>价格</span><b>${fmt(price, 3)}</b></div>
         <div class="confirm-row"><span>数量</span><b>${fmt(shares)} 股</b></div>
         <div class="confirm-row"><span>金额</span><b>${fmt(amount)}</b></div>

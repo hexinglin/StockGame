@@ -5,7 +5,8 @@ import pytest
 
 from app.engine.account import MockAccount
 from app.dbdata.database import db
-from app.dbdata.models import GameRound, GameOrder
+from app.dbdata.models import (GameRound, GameOrder, GameTrade, GameDay,
+                               DayKline, TickData)
 
 
 # ═══════════ 账户单元测试 ═══════════
@@ -244,17 +245,101 @@ class TestConcurrency:
 
 
 class TestDelete:
-    def test_delete_cleans_redis(self, running_round, engine):
+    def test_delete_cleans_all_round_data(self, running_round, engine, app):
+        """物理删除一局：轮次/委托/成交行 + Redis 快照 + game_days 计数全清空"""
         r, ctx = running_round
         from app.messaging.cache import get_cache
         cache = get_cache()
+        # 制造局内数据：pending 委托行 + Redis 账户/进度/行情快照
+        ok, _, msg = engine.place_order(r.id, "buy", "limit", 1.0, 10000)
+        assert ok, msg
         engine.pause_round(r.id)
+
         ok, msg = engine.delete_round(r.id)
         assert ok, msg
+        # DB：轮次/委托/成交行全部物理删除
+        with app.app_context():
+            assert GameRound.query.get(r.id) is None
+            assert GameOrder.query.filter_by(round_id=r.id).count() == 0
+            assert GameTrade.query.filter_by(round_id=r.id).count() == 0
+            # game_days 选择/管理计数回落归零（该日无残留局计数）
+            gd = GameDay.query.filter_by(code=r.code, trade_date=r.trade_date,
+                                         data_source=r.data_source).first()
+            assert gd is not None and gd.round_count == 0
+        # Redis：账户/进度/行情快照均无残留
         assert cache.load_account(r.id) is None
         assert cache.load_progress(r.id) == 0
+        assert cache.load_quote(str(r.id)) is None
+        # 内存态已弹出
+        assert r.id not in engine._rounds
 
     def test_delete_running_rejected(self, running_round, engine):
         r, ctx = running_round
         ok, msg = engine.delete_round(r.id)
         assert not ok and "运行中" in msg
+
+    def test_round_count_lifecycle(self, test_data, engine, app):
+        """round_count 随创建 +1 / 结束保留 / 删除 -1，两局删净归零"""
+        code, date = test_data["code"], test_data["date"]
+
+        def count():
+            with app.app_context():
+                gd = GameDay.query.filter_by(code=code, trade_date=date,
+                                             data_source="qmt").first()
+                return gd.round_count if gd else None
+
+        assert count() == 0
+        r1, msg = engine.create_round(code=code, trade_date=date)
+        assert r1 is not None, msg
+        assert count() == 1
+        # 结束（非删除）的轮次仍计入该日局数
+        ok, msg = engine.start_round(r1.id)
+        assert ok, msg
+        ok, msg = engine.finish_round(r1.id)
+        assert ok, msg
+        assert count() == 1
+        # 同日期第二轮（首轮已结束，不再阻塞）
+        r2, msg = engine.create_round(code=code, trade_date=date)
+        assert r2 is not None, msg
+        assert count() == 2
+        engine.delete_round(r2.id)
+        assert count() == 1
+        engine.delete_round(r1.id)
+        assert count() == 0
+
+
+class TestDayKlineGuard:
+    """day_kline 昨收防线：last_close 无效（空/0）的异常日行情拒绝入库"""
+
+    def test_refresh_day_rejects_invalid_last_close(self, engine, app):
+        """hint 无效 + 库内无旧值 + stock_kline 查不到 → 拒绝写入、零派生"""
+        code, date = "TESTLC000", "2099-06-01"
+        with app.app_context():
+            assert engine.refresh_day(code, date, "qmt",
+                                      last_close_hint=0.0) is False
+            assert DayKline.query.filter_by(code=code, trade_date=date).count() == 0
+            assert GameDay.query.filter_by(code=code, trade_date=date).count() == 0
+
+    def test_refresh_day_valid_last_close_writes(self, engine, app):
+        """携带有效昨收 → 正常写入 day_kline 并派生 game_days（hint 为准）"""
+        code, date = "TESTLC000", "2099-06-02"
+        with app.app_context():
+            db.session.add(TickData(
+                code=code, trade_date=date, time_key=f"{date} 09:30:00",
+                open=1.0, high=1.0, low=1.0, close=1.0, volume=100, amount=100))
+            db.session.commit()
+            try:
+                assert engine.refresh_day(code, date, "qmt",
+                                          last_close_hint=9.99) is True
+                row = DayKline.query.filter_by(code=code, trade_date=date,
+                                               data_source="qmt").first()
+                assert row is not None
+                assert row.last_close == pytest.approx(9.99)
+                gd = GameDay.query.filter_by(code=code, trade_date=date,
+                                             data_source="qmt").first()
+                assert gd is not None
+            finally:
+                TickData.query.filter_by(code=code).delete()
+                DayKline.query.filter_by(code=code).delete()
+                GameDay.query.filter_by(code=code).delete()
+                db.session.commit()

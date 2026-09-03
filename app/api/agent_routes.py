@@ -18,14 +18,15 @@ logger = logging.getLogger(__name__)
 
 agent_bp = Blueprint("agent", __name__, url_prefix="/api/v1/agent")
 
-# SQL 兼容 upsert（PG 9.5+）
+# SQL 兼容 upsert（PG 9.5+）；昨收 last_close 不再入库 tick 表，
+# 由下方 refresh_day 同步到 day_kline（开局原始数据，game_days 随之派生）
 _UPSERT_TICK_SQL = text("""
-INSERT INTO tick_data (code, trade_date, time_key, open, high, low, close, volume, amount, last_close, created_at)
-VALUES (:code, :trade_date, :time_key, :open, :high, :low, :close, :volume, :amount, :last_close, :created_at)
+INSERT INTO tick_data (code, trade_date, time_key, open, high, low, close, volume, amount, created_at)
+VALUES (:code, :trade_date, :time_key, :open, :high, :low, :close, :volume, :amount, :created_at)
 ON CONFLICT (code, time_key) DO UPDATE SET
   trade_date = EXCLUDED.trade_date,
   open = EXCLUDED.open, high = EXCLUDED.high, low = EXCLUDED.low, close = EXCLUDED.close,
-  volume = EXCLUDED.volume, amount = EXCLUDED.amount, last_close = EXCLUDED.last_close,
+  volume = EXCLUDED.volume, amount = EXCLUDED.amount,
   created_at = EXCLUDED.created_at
 """)
 
@@ -34,7 +35,9 @@ ON CONFLICT (code, time_key) DO UPDATE SET
 def upload_tick():
     """原始行情上传 — 每个 (code, time_key) 仅一条数据（幂等 upsert）
 
-    body: {agent_name, code, time_key, open, high, low, close, volume, amount, last_close}
+    body: {agent_name, code, time_key, open, high, low, close, volume, amount,
+           last_close?}；last_close 仅作为当日昨收 hint 维护到 day_kline
+    （tick 表不存该字段）。
     """
     data = request.get_json(silent=True) or {}
     code = data.get("code", "")
@@ -58,7 +61,6 @@ def upload_tick():
                 "close": data.get("close", 0),
                 "volume": data.get("volume", 0),
                 "amount": data.get("amount", 0),
-                "last_close": data.get("last_close", 0),
                 "created_at": datetime.now(),
             },
         )
@@ -68,14 +70,26 @@ def upload_tick():
         logger.error("tick 入库失败: %s", e)
         return jsonify({"code": 500, "message": f"tick 入库失败: {e}"}), 500
 
+    # 同步维护天维度原始行情（昨收 hint 随上传携带，缺失时由引擎回补）
+    from ..engine.game_engine import get_engine
+    engine = get_engine()
+    if not engine.refresh_day(code, trade_date, "qmt",
+                              last_close_hint=data.get("last_close", 0)):
+        # 昨收缺失（hint/库内旧值/stock_kline 均无效）属异常行情：day_kline
+        # 拒绝入库（不派生 game_days）。tick 本身已入库，明确提示上传方错误。
+        return jsonify({"code": 1, "message": "tick 已入库，但昨收缺失"
+                        "（last_close 为空/0）属异常数据，day_kline 未生成，"
+                        "请携带有效 last_close 后重试"})
+
     # 更新 agent_status.last_tick_at
     _touch_agent(agent_name, tick=True)
 
-    # 更新 Redis 最新行情快照（全局 live）
+    # 更新 Redis 最新行情快照（全局 live）；昨收取 day_kline 维护值
     cache = get_cache()
     cache.save_quote("live", {
         "code": code, "time_key": time_key,
-        "close": data.get("close", 0), "last_close": data.get("last_close", 0),
+        "close": data.get("close", 0),
+        "last_close": engine.day_last_close(code, trade_date, "qmt"),
     })
 
     return jsonify({"code": 0, "message": "ok"})

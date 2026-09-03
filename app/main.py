@@ -4,10 +4,31 @@
 """
 import logging
 import os
+import threading
+
+import simple_websocket
 
 from flask import Flask, jsonify, send_from_directory
 from flask_cors import CORS
 from flask_socketio import SocketIO
+
+# ── WS 帧写串行化（Flask-SocketIO threading 模式的库级缺陷修复）──
+# threading 模式下服务端多线程并发写同一 WebSocket 连接：时钟推送线程
+# （引擎 0.1s 周期 emit）、请求线程、WS 读线程（engineio 心跳 pong/事件
+# 回包）都可能同时调用 simple_websocket.Server.send。该方法内部"编码帧 +
+# 写 socket"两步无锁，并发会交错帧字节，客户端报 "Invalid frame header"
+# 并断开连接。此处给 send 加全局锁，把全部帧写出串行化（锁粒度为微秒级，
+# 对 0.1s 级推送无感知）。必须在任何连接建立前生效，故置于模块顶层。
+_ws_send_lock = threading.Lock()
+_ws_send_orig = simple_websocket.Server.send
+
+
+def _ws_send_locked(self, data):
+    with _ws_send_lock:
+        return _ws_send_orig(self, data)
+
+
+simple_websocket.Server.send = _ws_send_locked
 
 from .utils.config import Config
 from .utils.logger import setup_logging

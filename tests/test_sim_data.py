@@ -10,7 +10,8 @@ test_sim_data.py — 转换模拟数据源测试（QMT 优先 / 模拟兜底 / �
 import pytest
 
 from app.dbdata.database import db
-from app.dbdata.models import TickDataSim, GameRound, GameOrder, GameTrade
+from app.dbdata.models import (TickDataSim, GameRound, GameOrder, GameTrade,
+                                GameDay, DayKline)
 from app.messaging.cache import get_cache
 from app.engine.game_engine import get_engine
 
@@ -34,14 +35,16 @@ def _make_sim_ticks(code, date, last_close=1.10):
             code=code, trade_date=date, time_key=t["time_key"],
             open=t["open"], high=t["high"], low=t["low"], close=t["close"],
             volume=t["volume"], amount=round(t["close"] * t["volume"], 2),
-            last_close=last_close,
         ))
     db.session.commit()
+    # 同步写入 day_kline（与 tick 对齐）并派生 game_days：sim 日可见读 game_days，
+    # 开局原始数据（昨收）读 day_kline
+    get_engine().refresh_day(code, date, "sim", last_close_hint=last_close)
     return len(ticks)
 
 
 def _cleanup_sim(app, code):
-    """清理模拟数据与该 code 轮次"""
+    """清理模拟数据与该 code 轮次（含 game_days 计数回落）"""
     with app.app_context():
         rounds = GameRound.query.filter(GameRound.code == code).all()
         for r in rounds:
@@ -52,8 +55,14 @@ def _cleanup_sim(app, code):
             get_cache().delete_quote(str(r.id))
             db.session.delete(r)
         TickDataSim.query.filter_by(code=code).delete()
+        DayKline.query.filter_by(code=code).delete()
+        GameDay.query.filter_by(code=code).delete()
         db.session.commit()
-        get_engine()._rounds.clear()
+        engine = get_engine()
+        # 轮次行随批量清理物理删除后，game_days 计数同步回落（口径同 delete_round）
+        for r in rounds:
+            engine._adjust_round_count(r.code, r.trade_date, r.data_source or "qmt", -1)
+        engine._rounds.clear()
 
 
 @pytest.fixture()

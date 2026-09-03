@@ -160,6 +160,15 @@ class RedisCache:
             logger.warning("心跳读取失败: %s", e)
         return 0
 
+    def delete_heartbeat(self, agent_name: str):
+        """删除心跳时间戳（agent 下线/测试清理用）"""
+        if not self.available:
+            return
+        try:
+            self._client.delete(f"{HEARTBEAT_LAST_PREFIX}:{agent_name}")
+        except Exception as e:
+            logger.warning("心跳删除失败: %s", e)
+
     def set_alert(self, agent_name: str, ttl: int = 1800):
         """设置告警防抖标记"""
         if not self.available:

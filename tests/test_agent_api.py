@@ -3,8 +3,43 @@ test_agent_api.py — Agent 接入接口测试（tick 幂等 / 心跳 / 状态�
 """
 import time
 
+import pytest
+
 from app.dbdata.database import db
-from app.dbdata.models import TickData, AgentStatus
+from app.dbdata.models import (TickData, AgentStatus, DayKline, GameDay)
+from app.messaging.cache import get_cache
+
+# 测试写入使用的 agent 名 / 标的（与真实数据隔离，测试后统一清理）
+_API_CODE = "API588000"
+_AGENTS = ("test_agent", "hb_test")
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _cleanup_agent_test_data(app):
+    """模块级清理：测试写入的行情/日记录/agent 状态/Redis 心跳不留库
+
+    setup 清历史遗留（防影响断言），teardown 清本次用例写入（tick 接口会
+    派生 day_kline/game_days、覆盖 live 行情快照，需一并恢复）。
+    """
+    with app.app_context():
+        TickData.query.filter_by(code=_API_CODE).delete()
+        DayKline.query.filter_by(code=_API_CODE).delete()
+        GameDay.query.filter_by(code=_API_CODE).delete()
+        for name in _AGENTS:
+            AgentStatus.query.filter_by(agent_name=name).delete()
+        db.session.commit()
+    yield
+    with app.app_context():
+        TickData.query.filter_by(code=_API_CODE).delete()
+        DayKline.query.filter_by(code=_API_CODE).delete()
+        GameDay.query.filter_by(code=_API_CODE).delete()
+        for name in _AGENTS:
+            AgentStatus.query.filter_by(agent_name=name).delete()
+        db.session.commit()
+        for name in _AGENTS:
+            get_cache().delete_heartbeat(name)
+        # tick 上传会覆盖全局实时行情快照，测试后清除（真实 agent 下次上报自动重建）
+        get_cache().delete_quote("live")
 
 
 class TestTickAPI:
@@ -53,6 +88,31 @@ class TestTickAPI:
     def test_tick_missing_fields(self, client):
         resp = client.post("/api/v1/agent/tick", json={"code": "X"})
         assert resp.status_code == 400
+
+    def test_upload_tick_missing_last_close_rejected(self, client, app):
+        """昨收缺失（hint 无效且无库内旧值/外部回补）→ tick 入库但 day_kline
+        拒绝并提示错误（异常数据不入库）"""
+        code, date = "API588000", "2099-03-01"
+        with app.app_context():
+            TickData.query.filter_by(code=code, trade_date=date).delete()
+            DayKline.query.filter_by(code=code, trade_date=date).delete()
+            GameDay.query.filter_by(code=code, trade_date=date).delete()
+            db.session.commit()
+        resp = client.post("/api/v1/agent/tick", json={
+            "agent_name": "test_agent", "code": code, "trade_date": date,
+            "time_key": f"{date} 10:00:00",
+            "open": 1.0, "high": 1.01, "low": 0.99, "close": 1.0,
+            "volume": 1000, "amount": 1000,   # 不带 last_close
+        })
+        assert resp.status_code == 200
+        body = resp.get_json()
+        assert body["code"] == 1
+        assert "昨收" in body["message"]
+        with app.app_context():
+            # tick 已入库（原始行情本身不受影响），day_kline/game_days 零写入
+            assert TickData.query.filter_by(code=code, trade_date=date).count() == 1
+            assert DayKline.query.filter_by(code=code, trade_date=date).count() == 0
+            assert GameDay.query.filter_by(code=code, trade_date=date).count() == 0
 
 
 class TestHeartbeatAPI:

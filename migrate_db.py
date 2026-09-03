@@ -7,6 +7,9 @@
 1. 以管理员身份连接现有 PG 实例的 postgres 默认库，检查 stockgame 库是否存在，
    不存在则 CREATE DATABASE stockgame;
 2. 连接 stockgame 库执行 migrations/init.sql 建表（幂等）。
+3. day_kline 昨收回补：完整交易日但 last_close 缺失/无效时，从 AutoTrade 库
+   stock_kline 天维度读取（1d 行 last_close 优先，其次当日 1m 首根）并更新
+   （仅生成侧一次回补，tick 表已不再存 last_close；game_days 不存昨收）。
 """
 import argparse
 import os
@@ -71,6 +74,64 @@ def run_sql_file(dsn: str, sql_path: str):
         conn.close()
 
 
+def backfill_day_last_close(dsn: str, auto_dsn: str) -> int:
+    """day_kline 昨收回补（幂等）：完整交易日但 last_close 缺失/无效的记录
+
+    从 AutoTrade 库 stock_kline 天维度读取昨收（口径与引擎 _kline_last_close
+    一致：当日 1d 行 last_close 优先，其次当日 1m 首根），仅更新缺失行，
+    覆盖该 (code, trade_date) 下的 qmt/sim 双数据源记录。返回更新条数。
+    """
+    if not auto_dsn:
+        print("[回补] 未配置 data_source.autotrade_dsn，跳过昨收回补")
+        return 0
+    conn = psycopg2.connect(**_parse_dsn(dsn))
+    auto = psycopg2.connect(**_parse_dsn(auto_dsn))
+    n = 0
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT code, trade_date FROM day_kline "
+            "WHERE is_complete = true AND (last_close IS NULL OR last_close <= 0) "
+            "GROUP BY code, trade_date")
+        pairs = cur.fetchall()
+        auto_cur = auto.cursor()
+        for code, trade_date in pairs:
+            # 1d 当日行 last_close 优先，其次 1m 当日首根
+            auto_cur.execute(
+                "SELECT last_close FROM stock_kline "
+                "WHERE code=%s AND period='1d' AND last_close > 0 "
+                "AND time_key >= %s::date AND time_key < (%s::date + interval '1 day')",
+                (code, trade_date, trade_date))
+            row = auto_cur.fetchone()
+            if not row or not row[0] or row[0] != row[0]:
+                auto_cur.execute(
+                    "SELECT last_close FROM stock_kline "
+                    "WHERE code=%s AND period='1m' AND last_close > 0 "
+                    "AND time_key >= %s::date AND time_key < (%s::date + interval '1 day') "
+                    "ORDER BY time_key LIMIT 1",
+                    (code, trade_date, trade_date))
+                row = auto_cur.fetchone()
+            if not row or not row[0] or row[0] != row[0]:
+                continue
+            cur.execute(
+                "UPDATE day_kline SET last_close=%s, updated_at=now() "
+                "WHERE code=%s AND trade_date=%s "
+                "AND (last_close IS NULL OR last_close <= 0)",
+                (float(row[0]), code, trade_date))
+            n += cur.rowcount
+        auto_cur.close()
+        conn.commit()
+        cur.close()
+    finally:
+        auto.close()
+        conn.close()
+    if n:
+        print(f"[回补] day_kline 昨收从 stock_kline 回补 {n} 条（{len(pairs)} 日）")
+    else:
+        print(f"[回补] 无需回补（检查 {len(pairs)} 日：stock_kline 均无可用昨收或记录已有效）")
+    return n
+
+
 def main():
     parser = argparse.ArgumentParser(description="StockGame 数据库迁移")
     parser.add_argument("--config", default="config.yaml", help="配置文件路径")
@@ -93,6 +154,9 @@ def main():
 
     sql_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "migrations", "init.sql")
     run_sql_file(dsn, sql_path)
+
+    auto_dsn = cfg.get("data_source.autotrade_dsn", "")
+    backfill_day_last_close(dsn, auto_dsn)
 
     print("数据库迁移完成!")
 

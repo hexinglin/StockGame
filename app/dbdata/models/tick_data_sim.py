@@ -23,5 +23,6 @@ class TickDataSim(Base):
     close = Column(Float)
     volume = Column(BigInteger, default=0)
     amount = Column(Float, default=0)
-    last_close = Column(Float, default=0)
+    # 昨收不在此维护：天维度原始行情（含 last_close）统一存放 day_kline 表
+    # （与 tick 表对齐），game_days 为游戏选择/管理层，开局数据从 day_kline 读取
     created_at = Column(DateTime, default=datetime.now)

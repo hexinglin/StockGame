@@ -23,7 +23,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.utils.config import Config
 from mock_agent import (get_conn, log, load_minutes_from_autotrade,
-                        gen_day_from_minutes)
+                        gen_day_from_minutes, sync_game_day)
 
 
 # ================= 默认参数区（改这里后直接运行即可） =================
@@ -38,6 +38,8 @@ def upsert_sim_ticks(dsn: str, code: str, date: str, ticks: list):
     不预清空旧数据：逐行 INSERT ... ON CONFLICT DO UPDATE，数据库按
     (code, time_key) 自动去重并保留最新写入值。重复转换同一日时，
     已存在的行被覆盖更新，无残留重复记录，中途失败也不会丢旧数据。
+    写入完成后同步写入 day_kline（与 tick 对齐）并派生 game_days
+    （昨收随生成值维护）。
     """
     conn = get_conn(dsn)
     try:
@@ -47,42 +49,55 @@ def upsert_sim_ticks(dsn: str, code: str, date: str, ticks: list):
             rows.append((
                 code, date, t["time_key"], t["open"], t["high"], t["low"],
                 t["close"], t["volume"], round(t["close"] * t["volume"], 2),
-                t.get("last_close", 0),
             ))
         cur.executemany(
             """INSERT INTO tick_data_sim (code, trade_date, time_key, open, high,
-                                          low, close, volume, amount, last_close)
-               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                                          low, close, volume, amount)
+               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
                ON CONFLICT (code, time_key) DO UPDATE SET
                  trade_date=EXCLUDED.trade_date, open=EXCLUDED.open,
                  high=EXCLUDED.high, low=EXCLUDED.low, close=EXCLUDED.close,
-                 volume=EXCLUDED.volume, amount=EXCLUDED.amount,
-                 last_close=EXCLUDED.last_close""",
+                 volume=EXCLUDED.volume, amount=EXCLUDED.amount""",
             rows,
         )
         conn.commit()
         cur.close()
         log("upsert tick_data_sim: code=%s date=%s 共 %d 条（已按 code+time_key 去重，保留最新）"
             % (code, date, len(rows)))
+        # 同步写入 day_kline（与 tick 对齐）并派生 game_days（昨收 hint 取生成时的 last_close）
+        if ticks:
+            hint = next((float(t["last_close"]) for t in ticks
+                         if t.get("last_close")), 0.0)
+            sync_game_day(dsn, code, date, "tick_data_sim", hint)
     finally:
         conn.close()
 
 
 def verify(dsn: str, code: str, date: str):
-    """入库校验：条数 / 时间范围 / OHLC 区间 / last_close"""
+    """入库校验：条数 / 时间范围 / OHLC 区间 / day_kline 对齐记录"""
     conn = get_conn(dsn)
     try:
         cur = conn.cursor()
         cur.execute(
-            "SELECT count(*), min(time_key), max(time_key), min(low), max(high), "
-            "min(last_close), max(last_close) FROM tick_data_sim "
-            "WHERE code=%s AND trade_date=%s", (code, date))
-        cnt, t0, t1, lo, hi, lc0, lc1 = cur.fetchone()
+            "SELECT count(*), min(time_key), max(time_key), min(low), max(high) "
+            "FROM tick_data_sim WHERE code=%s AND trade_date=%s", (code, date))
+        cnt, t0, t1, lo, hi = cur.fetchone()
+        cur.execute(
+            "SELECT last_close, is_complete, tick_count FROM day_kline "
+            "WHERE code=%s AND trade_date=%s AND data_source='sim'", (code, date))
+        day = cur.fetchone()
         cur.close()
         if cnt != 4820:
             log("注意: 条数 %d（非标准完整日 4820=241×20，请核对源数据是否完整）" % cnt)
-        log("校验: %s %s 共 %d 条, 时间 %s ~ %s, low=%s, high=%s, last_close=%s"
-            % (code, date, cnt, t0, t1, lo, hi, lc0))
+        if day:
+            lc, complete, dkcnt = day
+            aligned = "对齐" if dkcnt == cnt else "不对齐(%s vs %s)" % (dkcnt, cnt)
+            log("校验: %s %s 共 %d 条, 时间 %s ~ %s, low=%s, high=%s, "
+                "day_kline 昨收=%s, 完整日=%s, tick 对账=%s"
+                % (code, date, cnt, t0, t1, lo, hi, lc, complete, aligned))
+        else:
+            log("警告: %s %s 无 day_kline 日记录，请检查 sync_game_day 是否执行"
+                % (code, date))
         return cnt
     finally:
         conn.close()
