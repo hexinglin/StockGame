@@ -196,7 +196,7 @@ class TestSettlement:
         assert ok, msg
         detail = engine.get_round(r.id)
         assert detail["status"] == "finished"
-        # 已实现盈亏 = 卖(10500-1.05) - 买(10000+1.0) = 500 - 2.05
+        # 已实现盈亏 = 买入(-fee) + 卖出((1.05-1.0)*10000 - fee) = -1.0 + 500 - 1.05 = 497.95
         assert detail["realized_pnl"] == pytest.approx(500 - 2.05, abs=0.01)
         assert detail["fee_total"] == pytest.approx(2.05, abs=0.01)
         assert detail["final_assets"] > 0

@@ -38,7 +38,7 @@ O_FILLED = "filled"
 O_CANCELLED = "cancelled"
 O_REJECTED = "rejected"
 
-_TICK_SEC = 3.0          # 每根 tick 对应 3s 行情
+_TICK_SEC = 1.0          # 1x 速度每秒推送一根 tick
 _CLOCK_INTERVAL = 0.1    # 时钟推进周期（秒）
 
 # 按 tick 表现存数据聚合写入 day_kline（天维度原始行情，与 tick 表对齐）的
@@ -1055,12 +1055,13 @@ class GameEngine:
         order.fee = fee
         order.filled_at = datetime.now()
 
-        # 累计收益与手续费
-        amount = fill_price * shares
+        # 累计已实现盈亏与手续费
         if direction == "buy":
-            ctx.round.realized_pnl = (ctx.round.realized_pnl or 0) - (amount + fee)
+            # 买入：仅手续费为已实现亏损（本金转为持仓，不产生盈亏）
+            ctx.round.realized_pnl = (ctx.round.realized_pnl or 0) - fee
         else:
-            ctx.round.realized_pnl = (ctx.round.realized_pnl or 0) + (amount - fee)
+            # 卖出：(卖出价 - 持仓成本) × 数量 - 手续费
+            ctx.round.realized_pnl = (ctx.round.realized_pnl or 0) + (fill_price - acct.avg_price) * shares - fee
         ctx.round.fee_total = (ctx.round.fee_total or 0) + fee
         # 订单/轮次为跨 context 的 detached 实例，需重新 attach 才能持久化
         self._attach_account_json(ctx.round, ctx)

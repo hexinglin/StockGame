@@ -84,6 +84,7 @@
             <button class="speed-btn" data-speed="60" onclick="setSpeed(60)">60x</button>
         </div>
         <div class="game-actions">
+            <button class="btn-help" onclick="toggleHelp()" title="快捷键说明">?</button>
             <button class="btn-pause" id="btnPause" onclick="togglePause()">⏸ 暂停</button>
             <button class="btn-finish" onclick="finishRound()">⏹ 提前结束</button>
         </div>
@@ -155,13 +156,12 @@
     <!-- 下方 tab：委托/成交/持仓/账户 -->
     <div class="records-panel">
         <nav class="records-tabs">
-            <button class="rec-tab active" data-tab="orders" onclick="switchRecTab('orders')">委托</button>
+            <button class="rec-tab" data-tab="orders" onclick="switchRecTab('orders')">委托</button>
             <button class="rec-tab" data-tab="trades" onclick="switchRecTab('trades')">成交</button>
-            <button class="rec-tab" data-tab="position" onclick="switchRecTab('position')">持仓</button>
-            <button class="rec-tab" data-tab="account" onclick="switchRecTab('account')">账户</button>
+            <button class="rec-tab active" data-tab="account" onclick="switchRecTab('account')">账户</button>
         </nav>
         <div class="records-body">
-            <table id="ordersTable" class="rec-table">
+            <table id="ordersTable" class="rec-table" style="display:none">
                 <thead><tr><th>时间</th><th>方向</th><th>类型</th><th>价格</th><th>数量</th><th>状态</th><th>操作</th></tr></thead>
                 <tbody></tbody>
             </table>
@@ -169,21 +169,28 @@
                 <thead><tr><th>成交时间</th><th>方向</th><th>价格</th><th>数量</th><th>手续费</th></tr></thead>
                 <tbody></tbody>
             </table>
-            <div id="positionBox" style="display:none"></div>
-            <div id="accountBox" style="display:none"></div>
+            <div id="accountBox"></div>
         </div>
     </div>
 </div>
 
-<!-- ═══════════ 下单确认弹窗 ═══════════ -->
-<div class="modal-overlay" id="confirmModal" style="display:none;">
-    <div class="modal">
-        <h3 id="confirmTitle">确认下单</h3>
-        <div class="modal-body" id="confirmBody"></div>
-        <div class="modal-actions">
-            <button class="btn-cancel" onclick="closeConfirm()">取消</button>
-            <button class="btn-primary" id="btnConfirm" onclick="doSubmit()">确认下单</button>
-        </div>
+<!-- 快捷键帮助浮层 -->
+<div class="help-overlay" id="helpOverlay" style="display:none;" onclick="toggleHelp()">
+    <div class="help-panel" onclick="event.stopPropagation()">
+        <h3>⌨️ 快捷键</h3>
+        <table class="help-table">
+            <tr><td class="key">Space</td><td>暂停 / 继续</td></tr>
+            <tr><td class="key">B</td><td>切换买入</td></tr>
+            <tr><td class="key">S</td><td>切换卖出</td></tr>
+            <tr><td class="key">↑</td><td>委托价 +0.001</td></tr>
+            <tr><td class="key">↓</td><td>委托价 -0.001</td></tr>
+            <tr><td class="key">Enter</td><td>提交委托</td></tr>
+            <tr><td class="key">1</td><td>速度 1x</td></tr>
+            <tr><td class="key">2</td><td>速度 10x</td></tr>
+            <tr><td class="key">3</td><td>速度 60x</td></tr>
+            <tr><td class="key">?</td><td>显示 / 关闭本帮助</td></tr>
+        </table>
+        <p class="help-tip">提示：输入框聚焦时快捷键不生效</p>
     </div>
 </div>
 

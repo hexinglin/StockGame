@@ -43,6 +43,7 @@ class MockAccount:
         self.frozen_cash = 0.0
         self.volume = self.base_shares
         self.frozen_volume = 0
+        self.today_bought = 0        # T+1：当日买入不可卖
         self.avg_price = open_price or 0
         self.last_price = open_price
 
@@ -53,8 +54,8 @@ class MockAccount:
         return round(amount * self.fee_rate, 2)
 
     def available_volume(self) -> int:
-        """可卖持仓 = 持仓 - 冻结"""
-        return self.volume - self.frozen_volume
+        """可卖持仓 = 持仓 - 冻结 - 今日买入（T+1）"""
+        return max(0, self.volume - self.frozen_volume - self.today_bought)
 
     def frozen_amount(self, price: float, shares: int) -> float:
         """买入委托冻结金额 = 金额 + 手续费"""
@@ -127,6 +128,7 @@ class MockAccount:
         # 加权均价更新
         total_cost = self.avg_price * self.volume + price * shares
         self.volume += shares
+        self.today_bought += shares   # T+1：今日买入不可卖
         if self.volume > 0:
             self.avg_price = total_cost / self.volume
         return fee
@@ -150,6 +152,7 @@ class MockAccount:
             "frozen_cash": round(self.frozen_cash, 2),
             "volume": self.volume,
             "frozen_volume": self.frozen_volume,
+            "today_bought": self.today_bought,
             "avg_price": round(self.avg_price, 4) if self.avg_price else 0,
             "last_price": self.last_price,
         }
@@ -166,6 +169,7 @@ class MockAccount:
         acct.frozen_cash = float(d.get("frozen_cash", 0))
         acct.volume = int(d.get("volume", acct.base_shares))
         acct.frozen_volume = int(d.get("frozen_volume", 0))
+        acct.today_bought = int(d.get("today_bought", 0))
         acct.avg_price = float(d.get("avg_price", 0))
         acct.last_price = float(d.get("last_price", 0))
         return acct

@@ -19,7 +19,7 @@ const state = {
     otype: "limit",         // 仅支持限价
     socket: null,
     chart: null,
-    pendingConfirm: null,   // 待确认订单
+    
 };
 
 const FEE_RATE = 0.0001;    // 万1
@@ -466,6 +466,7 @@ function onQuote(q) {
     }
     state.cumAmount = q.cum_amount;
     state.cumVolume = q.cum_volume;
+    state.lastTickVol = q.volume || 0;   // 当笔 tick 成交量（供盘口模拟用）
 
     // 行情时间显示（精确到秒）
     const tStr = q.time_key.length >= 19 ? q.time_key.slice(11, 19) : q.time_key.slice(-8);
@@ -477,7 +478,6 @@ function onQuote(q) {
     updateProgress(q.progress);
     // 行情驱动持仓/账户市值刷新（刷新页面后首次推送即恢复，无需等成交事件）
     if (state.round && state.round.account) {
-        renderPosition(state.round.account);
         renderAccount(state.round.account);
     }
 }
@@ -501,7 +501,6 @@ function onTrade(t) {
 
 function onAccount(acct) {
     if (state.round) state.round.account = acct;
-    renderPosition(acct);
     renderAccount(acct);
 }
 
@@ -666,13 +665,13 @@ function updateChart() {
         series: [
             {
                 name: "价格", type: "line", data: prices, showSymbol: false,
-                lineStyle: { width: 1.5, color: lastP && prevP && lastP.price >= prevP.price ? upColor : downColor },
+                lineStyle: { width: 1.5, color: "#fff" },
                 areaStyle: {
                     color: {
                         type: "linear", x: 0, y: 0, x2: 0, y2: 1,
                         colorStops: [
-                            { offset: 0, color: lastP && lastP.price >= lastClose ? "rgba(230,69,69,0.25)" : "rgba(26,158,92,0.25)" },
-                            { offset: 1, color: "rgba(0,0,0,0)" },
+                            { offset: 0, color: "rgba(255,255,255,0.18)" },
+                            { offset: 1, color: "rgba(255,255,255,0)" },
                         ],
                     },
                 },
@@ -731,27 +730,31 @@ function updateProgress(pct) {
     document.getElementById("gProgressText").textContent = (pct || 0) + "%";
 }
 
-// ───────────── 五档盘口（模拟） ─────────────
+// ───────────── 五档盘口（模拟，基于实际行情派生） ─────────────
 function renderLevel5(price) {
     if (!price) return;
-    const step = Math.max(Math.round(price * 0.001 * 1000) / 1000, 0.001);
+    const step = 0.001;   // ETF 最小变动价位，价格连续
+    // 基础量 = 最近一笔 tick 成交量，乘以随机系数模拟各档挂单量
+    const baseVol = state.lastTickVol || Math.max(1000, Math.round(state.cumVolume / 200));
     const box = document.getElementById("level5Rows");
     let html = "";
+    // 随机决定最新价出现在买1还是卖1（模拟主动买/主动卖）
+    const atBid = Math.random() < 0.5;
+    // 卖 5→1
     for (let i = 5; i >= 1; i--) {
-        const p = price - step * i;
+        const p = atBid ? price + step * i : price + step * (i - 1);
+        const vol = Math.round(baseVol * (1.5 + Math.random() * 3) * (1 + i * 0.15));
         html += `<div class="lv-row ask" onclick="quickPriceByValue(${p})">
-            <span class="lv-name">卖${i}</span><span class="lv-price down">${fmt(p, 3)}</span><span class="lv-vol">${fmtVol(randVol())}</span></div>`;
+            <span class="lv-name">卖${i}</span><span class="lv-price down">${fmt(p, 3)}</span><span class="lv-vol">${fmtVol(vol)}</span></div>`;
     }
+    // 买 1→5
     for (let i = 1; i <= 5; i++) {
-        const p = price + step * i;
+        const p = atBid ? price - step * (i - 1) : price - step * i;
+        const vol = Math.round(baseVol * (1.5 + Math.random() * 3) * (1 + i * 0.15));
         html += `<div class="lv-row bid" onclick="quickPriceByValue(${p})">
-            <span class="lv-name">买${i}</span><span class="lv-price up">${fmt(p, 3)}</span><span class="lv-vol">${fmtVol(randVol())}</span></div>`;
+            <span class="lv-name">买${i}</span><span class="lv-price up">${fmt(p, 3)}</span><span class="lv-vol">${fmtVol(vol)}</span></div>`;
     }
     box.innerHTML = html;
-}
-
-function randVol() {
-    return Math.floor(Math.random() * 90000 + 1000);
 }
 
 // ───────────── 下单面板 ─────────────
@@ -766,8 +769,7 @@ function switchSide(side) {
 }
 
 function getStep() {
-    const price = parseFloat(document.getElementById("orderPrice").value) || state.lastPrice || 1;
-    return Math.max(Math.round(price * 0.001 * 1000) / 1000, 0.001);
+    return 0.001;   // ETF 最小变动价位
 }
 
 function quickPrice(kind) {
@@ -804,12 +806,12 @@ function quickShares(kind) {
             const ratio = kind === "q1" ? 0.25 : (kind === "half" ? 0.5 : 1);
             shares = Math.floor(maxShares * ratio / 100) * 100;
         } else if (state.side === "sell" && acct) {
-            const sellable = Math.max(0, (acct.volume || 0) - (acct.frozen_volume || 0));
+            const sellable = Math.max(0, (acct.volume || 0) - (acct.frozen_volume || 0) - (acct.today_bought || 0));
             const ratio = kind === "q1" ? 0.25 : (kind === "half" ? 0.5 : 1);
             shares = Math.floor(sellable * ratio / 100) * 100;
         }
     } else if (kind === "sellable") {
-        if (acct) shares = Math.max(0, (acct.volume || 0) - (acct.frozen_volume || 0));
+        if (acct) shares = Math.max(0, (acct.volume || 0) - (acct.frozen_volume || 0) - (acct.today_bought || 0));
     } else if (kind === "step") {
         shares = (parseInt(document.getElementById("orderShares").value) || 0) + 10000;
     } else if (kind === "unstep") {
@@ -832,54 +834,32 @@ function recalcEstimate() {
     document.getElementById("estFee").textContent = amount ? fmt(fee) : "--";
 }
 
-function submitOrder() {
+async function submitOrder() {
     const price = parseFloat(document.getElementById("orderPrice").value) || 0;
     const shares = parseInt(document.getElementById("orderShares").value) || 0;
     if (price <= 0) { toast("请输入有效委托价格", "warn"); return; }
     if (shares <= 0 || shares % 100 !== 0) { toast("委托数量必须为 100 的整数倍", "warn"); return; }
-    const amount = price * shares;
-    const fee = amount * FEE_RATE;
-    state.pendingConfirm = { price, shares, amount, fee };
-    document.getElementById("confirmTitle").textContent = (state.side === "buy" ? "买入" : "卖出") + "确认";
-    document.getElementById("confirmBody").innerHTML = `
-        <div class="confirm-row"><span>方向</span><b class="${state.side}">${state.side === "buy" ? "买入" : "卖出"}</b></div>
-        <div class="confirm-row"><span>价格</span><b>${fmt(price, 3)}</b></div>
-        <div class="confirm-row"><span>数量</span><b>${fmt(shares)} 股</b></div>
-        <div class="confirm-row"><span>金额</span><b>${fmt(amount)}</b></div>
-        <div class="confirm-row"><span>手续费</span><b>${fmt(fee)}</b></div>`;
-    document.getElementById("confirmModal").style.display = "flex";
-}
-
-function closeConfirm() {
-    document.getElementById("confirmModal").style.display = "none";
-    state.pendingConfirm = null;
-}
-
-async function doSubmit() {
-    const btn = document.getElementById("btnConfirm");
-    btn.disabled = true;
+    // 防连点
+    const sb = document.getElementById("btnSubmit");
+    sb.disabled = true;
     try {
         const body = {
             direction: state.side,
             order_type: state.otype,
-            price: state.pendingConfirm.price,
-            shares: state.pendingConfirm.shares,
+            price,
+            shares,
         };
         const resp = await api(`/api/v1/game/rounds/${state.roundId}/order`, "POST", body);
         toast(`委托成功 ${resp.data.order_id}`, "success");
-        closeConfirm();
         loadOrders();
         loadAccount();
-        // 防连点
-        const sb = document.getElementById("btnSubmit");
-        sb.disabled = true;
-        setTimeout(() => { sb.disabled = false; }, 1200);
     } catch (e) {
         toast(e.message, "error");
     } finally {
-        btn.disabled = false;
+        setTimeout(() => { sb.disabled = false; }, 800);
     }
 }
+
 
 // ───────────── 顶栏操作 ─────────────
 async function setSpeed(speed) {
@@ -922,7 +902,6 @@ function switchRecTab(tab) {
     document.querySelectorAll(".rec-tab").forEach(b => b.classList.toggle("active", b.dataset.tab === tab));
     document.getElementById("ordersTable").style.display = tab === "orders" ? "" : "none";
     document.getElementById("tradesTable").style.display = tab === "trades" ? "" : "none";
-    document.getElementById("positionBox").style.display = tab === "position" ? "" : "none";
     document.getElementById("accountBox").style.display = tab === "account" ? "" : "none";
 }
 
@@ -992,30 +971,7 @@ async function loadAccount() {
             refreshQuoteDisplay();
         }
         renderAccount(a);
-        renderPosition(a);
     } catch (e) { /* 忽略 */ }
-}
-
-function renderPosition(a) {
-    const box = document.getElementById("positionBox");
-    const price = state.lastPrice || 0;
-    const marketValue = (a.volume || 0) * price;
-    const cost = (a.volume || 0) * (a.avg_price || 0);
-    const floatPnl = price ? (price - (a.avg_price || 0)) * (a.volume || 0) : 0;
-    box.innerHTML = `
-        <table class="rec-table">
-            <thead><tr><th>标的</th><th>持仓</th><th>可卖</th><th>冻结</th><th>成本价</th><th>现价</th><th>市值</th><th>浮动盈亏</th></tr></thead>
-            <tbody><tr>
-                <td>${state.round.code}</td>
-                <td>${fmt(a.volume || 0)}</td>
-                <td>${fmt(Math.max(0, (a.volume || 0) - (a.frozen_volume || 0)))}</td>
-                <td>${fmt(a.frozen_volume || 0)}</td>
-                <td>${fmt(a.avg_price || 0, 3)}</td>
-                <td>${fmt(price, 3)}</td>
-                <td>${fmt(marketValue)}</td>
-                <td class="${floatPnl >= 0 ? "up" : "down"}">${fmt(floatPnl)}</td>
-            </tr></tbody>
-        </table>`;
 }
 
 function renderAccount(a) {
@@ -1025,31 +981,67 @@ function renderAccount(a) {
     const total = (a.available_cash || 0) + (a.frozen_cash || 0) + marketValue;
     const initAssets = state.round && state.round.initial_assets;
     const totalPnl = initAssets ? total - initAssets : 0;
+    const floatPnl = price ? (price - (a.avg_price || 0)) * (a.volume || 0) : 0;
+    const sellable = Math.max(0, (a.volume || 0) - (a.frozen_volume || 0) - (a.today_bought || 0));
     box.innerHTML = `
         <div class="acct-grid">
+            <div class="acct-item"><span>持仓量</span><b>${fmt(a.volume || 0)}</b></div>
+            <div class="acct-item"><span>可卖</span><b>${fmt(sellable)}</b></div>
+            <div class="acct-item"><span>成本价</span><b>${fmt(a.avg_price || 0, 3)}</b></div>
+            <div class="acct-item"><span>浮动盈亏</span><b class="${floatPnl >= 0 ? 'up' : 'down'}">${fmt(floatPnl)}</b></div>
             <div class="acct-item"><span>可用现金</span><b>${fmt(a.available_cash)}</b></div>
             <div class="acct-item"><span>冻结资金</span><b>${fmt(a.frozen_cash)}</b></div>
             <div class="acct-item"><span>持仓市值</span><b>${fmt(marketValue)}</b></div>
             <div class="acct-item"><span>总资产</span><b>${fmt(total)}</b></div>
             <div class="acct-item"><span>期初资产</span><b>${fmt(initAssets)}</b></div>
-            <div class="acct-item"><span>总盈亏</span><b class="${totalPnl >= 0 ? "up" : "down"}">${fmt(totalPnl)}</b></div>
-            <div class="acct-item"><span>已实现盈亏</span><b class="${(state.round.realized_pnl || 0) >= 0 ? "up" : "down"}">${fmt(state.round.realized_pnl)}</b></div>
+            <div class="acct-item"><span>总盈亏</span><b class="${totalPnl >= 0 ? 'up' : 'down'}">${fmt(totalPnl)}</b></div>
+            <div class="acct-item"><span>已实现盈亏</span><b class="${(state.round.realized_pnl || 0) >= 0 ? 'up' : 'down'}">${fmt(state.round.realized_pnl)}</b></div>
             <div class="acct-item"><span>累计手续费</span><b>${fmt(state.round.fee_total)}</b></div>
         </div>`;
+}
+
+// ───────────── 快捷键帮助浮层 ─────────────
+function toggleHelp() {
+    const el = document.getElementById("helpOverlay");
+    el.style.display = el.style.display === "none" ? "flex" : "none";
 }
 
 // ───────────── 快捷键 ─────────────
 document.addEventListener("keydown", (e) => {
     if (document.getElementById("view-game").style.display === "none") return;
-    if (document.getElementById("confirmModal").style.display !== "none") {
-        if (e.key === "Enter") doSubmit();
-        if (e.key === "Escape") closeConfirm();
-        return;
-    }
     const tag = document.activeElement && document.activeElement.tagName;
-    if (e.key === "ArrowUp" && tag !== "INPUT") { e.preventDefault(); quickPrice("up"); }
-    else if (e.key === "ArrowDown" && tag !== "INPUT") { e.preventDefault(); quickPrice("down"); }
-    else if (e.key === "Enter" && tag !== "INPUT") { e.preventDefault(); submitOrder(); }
+    const inInput = (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT");
+
+    // ? 键显示/关闭帮助（任何情况下都可用）
+    if (e.key === "?" || (e.key === "/" && e.shiftKey)) { e.preventDefault(); toggleHelp(); return; }
+    // Escape 关闭帮助浮层
+    if (e.key === "Escape") {
+        const el = document.getElementById("helpOverlay");
+        if (el.style.display !== "none") { el.style.display = "none"; return; }
+    }
+    // 输入框聚焦时不拦截其他快捷键
+    if (inInput) return;
+
+    switch (e.key) {
+        case " ":
+            e.preventDefault(); togglePause(); break;
+        case "b": case "B":
+            e.preventDefault(); switchSide("buy"); break;
+        case "s": case "S":
+            e.preventDefault(); switchSide("sell"); break;
+        case "ArrowUp":
+            e.preventDefault(); quickPrice("up"); break;
+        case "ArrowDown":
+            e.preventDefault(); quickPrice("down"); break;
+        case "Enter":
+            e.preventDefault(); submitOrder(); break;
+        case "1":
+            e.preventDefault(); setSpeed(1); break;
+        case "2":
+            e.preventDefault(); setSpeed(10); break;
+        case "3":
+            e.preventDefault(); setSpeed(60); break;
+    }
 });
 
 // ───────────── 时钟 ─────────────
