@@ -1,5 +1,5 @@
 """
-convert_kline_to_3s.py — 从 AutoTrade 库 stock_kline(1min) 转换为 3s 原始行情
+convert_kline_to_3s.py — 从 AutoTrade 库 stock_kline(1min) 转换为 3s 等间隔快照流
 
 转换结果写入 StockGame 库 tick_data_sim 表（模拟数据源，游戏在 QMT 无该日
 数据且页面允许模拟时使用）。每次只能转换一个交易日。
@@ -11,8 +11,9 @@ convert_kline_to_3s.py — 从 AutoTrade 库 stock_kline(1min) 转换为 3s 原�
      python scripts/convert_kline_to_3s.py --code 588000.SH --date 2026-08-14
 
 说明:
-  每根 1min bar 按 mock_agent 同一算法拆为 20 根 3s bar（OHLC 区间覆盖、
-  volume 总和守恒）；重复执行同一日会先清空该日旧数据再重新生成（幂等）。
+  每根 1min bar 按 mock_agent 同一算法（gen_snapshots_from_minutes）拆为
+  20 个 3s 快照点（价格路径插值、极值嵌入、volume 总和守恒、当日累计量额）；
+  重复执行同一日会先清空该日旧数据再重新生成（幂等）。
 """
 import argparse
 import datetime
@@ -23,7 +24,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.utils.config import Config
 from mock_agent import (get_conn, log, load_minutes_from_autotrade,
-                        gen_day_from_minutes, sync_game_day)
+                        gen_snapshots_from_minutes, sync_game_day)
 
 
 # ================= 默认参数区（改这里后直接运行即可） =================
@@ -32,14 +33,15 @@ DEFAULT_DATE = "2026-08-14"    # 交易日 YYYY-MM-DD（一次只能转换一日
 # ====================================================================
 
 
-def upsert_sim_ticks(dsn: str, code: str, date: str, ticks: list):
+def upsert_sim_ticks(dsn: str, code: str, date: str, ticks: list,
+                     open_hint: float = 0.0):
     """写入 tick_data_sim（幂等 upsert，依赖 uq_tick_sim_code_time 唯一约束）
 
-    不预清空旧数据：逐行 INSERT ... ON CONFLICT DO UPDATE，数据库按
-    (code, time_key) 自动去重并保留最新写入值。重复转换同一日时，
-    已存在的行被覆盖更新，无残留重复记录，中途失败也不会丢旧数据。
-    写入完成后同步写入 day_kline（与 tick 对齐）并派生 game_days
-    （昨收随生成值维护）。
+    快照口径：tick dict 的 volume/amount 为当日累计值、high/low 为滚动极值、
+    close 为最新价；逐行 INSERT ... ON CONFLICT DO UPDATE，数据库按
+    (code, time_key) 自动去重并保留最新写入值。重复转换同一日时，已存在的行
+    被覆盖更新，无残留重复记录，中途失败也不会丢旧数据。写入完成后同步写入
+    day_kline（与 tick 对齐）并派生 game_days（昨收随生成值维护，今开取 open_hint）。
     """
     conn = get_conn(dsn)
     try:
@@ -47,34 +49,40 @@ def upsert_sim_ticks(dsn: str, code: str, date: str, ticks: list):
         rows = []
         for t in ticks:
             rows.append((
-                code, date, t["time_key"], t["open"], t["high"], t["low"],
-                t["close"], t["volume"], round(t["close"] * t["volume"], 2),
+                code, date, t["time_key"],
+                t["high"], t["low"], t["close"],
+                t["volume"], t["amount"],
             ))
         cur.executemany(
-            """INSERT INTO tick_data_sim (code, trade_date, time_key, open, high,
+            """INSERT INTO tick_data_sim (code, trade_date, time_key, high,
                                           low, close, volume, amount)
-               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+               VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
                ON CONFLICT (code, time_key) DO UPDATE SET
-                 trade_date=EXCLUDED.trade_date, open=EXCLUDED.open,
+                 trade_date=EXCLUDED.trade_date,
                  high=EXCLUDED.high, low=EXCLUDED.low, close=EXCLUDED.close,
                  volume=EXCLUDED.volume, amount=EXCLUDED.amount""",
             rows,
         )
         conn.commit()
         cur.close()
-        log("upsert tick_data_sim: code=%s date=%s 共 %d 条（已按 code+time_key 去重，保留最新）"
+        log("upsert tick_data_sim: code=%s date=%s 共 %d 条快照（已按 code+time_key 去重，保留最新）"
             % (code, date, len(rows)))
         # 同步写入 day_kline（与 tick 对齐）并派生 game_days（昨收 hint 取生成时的 last_close）
         if ticks:
             hint = next((float(t["last_close"]) for t in ticks
                          if t.get("last_close")), 0.0)
-            sync_game_day(dsn, code, date, "tick_data_sim", hint)
+            sync_game_day(dsn, code, date, "tick_data_sim", hint,
+                          open_hint=open_hint)
     finally:
         conn.close()
 
 
 def verify(dsn: str, code: str, date: str):
-    """入库校验：条数 / 时间范围 / OHLC 区间 / day_kline 对齐记录"""
+    """入库校验：条数 / 时间范围 / OHLC 区间 / day_kline 对齐记录（快照口径）
+
+    标准完整日 = 241 根 1min × 20 点 = 4820 条（仅提示，不视为错误）；
+    day_kline.volume/amount 应等于 tick_data_sim 末条快照的当日累计值。
+    """
     conn = get_conn(dsn)
     try:
         cur = conn.cursor()
@@ -86,15 +94,22 @@ def verify(dsn: str, code: str, date: str):
             "SELECT last_close, is_complete, tick_count FROM day_kline "
             "WHERE code=%s AND trade_date=%s AND data_source='sim'", (code, date))
         day = cur.fetchone()
+        cur.execute(
+            "SELECT (array_agg(volume ORDER BY time_key DESC))[1],"
+            "       (array_agg(amount ORDER BY time_key DESC))[1] "
+            "FROM tick_data_sim WHERE code=%s AND trade_date=%s", (code, date))
+        last_v, last_a = cur.fetchone()
         cur.close()
-        if cnt != 4820:
-            log("注意: 条数 %d（非标准完整日 4820=241×20，请核对源数据是否完整）" % cnt)
+        if cnt != 241 * 20:
+            log("注意: 条数 %d（标准完整日 241×20=4820，请核对源数据是否完整）" % cnt)
         if day:
             lc, complete, dkcnt = day
             aligned = "对齐" if dkcnt == cnt else "不对齐(%s vs %s)" % (dkcnt, cnt)
             log("校验: %s %s 共 %d 条, 时间 %s ~ %s, low=%s, high=%s, "
-                "day_kline 昨收=%s, 完整日=%s, tick 对账=%s"
-                % (code, date, cnt, t0, t1, lo, hi, lc, complete, aligned))
+                "day_kline 昨收=%s, 完整日=%s, tick 对账=%s, "
+                "末条累计 volume=%s amount=%s"
+                % (code, date, cnt, t0, t1, lo, hi, lc, complete, aligned,
+                   last_v, last_a))
         else:
             log("警告: %s %s 无 day_kline 日记录，请检查 sync_game_day 是否执行"
                 % (code, date))
@@ -136,11 +151,12 @@ def main():
         sys.exit(1)
     log("读取到 %d 根 1min bar, last_close=%s，开始拓展..." % (len(minutes), last_close))
 
-    ticks = gen_day_from_minutes(minutes, last_close)
-    log("拓展完成: %d 根 3s tick（= %d × 20）" % (len(ticks), len(minutes)))
+    ticks = gen_snapshots_from_minutes(minutes, last_close)
+    log("拓展完成: %d 条快照（= %d × 20）" % (len(ticks), len(minutes)))
 
     # 纯 upsert 写入：DB 按 (code, time_key) 自动去重保留最新，无需先清空
-    upsert_sim_ticks(dsn, args.code, args.date, ticks)
+    upsert_sim_ticks(dsn, args.code, args.date, ticks,
+                     open_hint=minutes[0]["open"] if minutes else 0)
     verify(dsn, args.code, args.date)
     log("转换完成: %s %s 已就绪（tick_data_sim），页面开启模拟开关后可用于游戏"
         % (args.code, args.date))

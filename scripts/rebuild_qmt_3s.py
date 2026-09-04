@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
-"""rebuild_qmt_3s.py — 历史分钟级 qmt tick 重灌为 3s 粒度
+"""rebuild_qmt_3s.py — 历史分钟级 qmt tick 重灌为 3s 等间隔快照流
 
 背景: StockGame tick_data(qmt) 中 2026-01-07 ~ 2026-02-06 的历史数据为分钟级
-直灌（241 根整分/日，秒位恒 00），与引擎"每根 tick = 3s 行情"的播放模型不
+直灌（241 根整分/日，秒位恒 00），与引擎"每根 tick = 3s 快照"的播放模型不
 匹配，导致游戏内行情时间只有分钟跳动、无秒级变化。本脚本以 AutoTrade 库
-stock_kline(1m) 为源，按 mock_agent 同款算法（gen_day_from_minutes，与
-sim 源转换 convert_kline_to_3s.py 完全一致）展开为 4820 根 3s tick 重灌。
+stock_kline(1m) 为源，按 mock_agent 同款算法（gen_snapshots_from_minutes，
+与 sim 源转换 convert_kline_to_3s.py 完全一致）展开为 4820 条快照流重灌。
 
 特性:
 - 幂等可重跑：write_ticks 逐行 INSERT ... ON CONFLICT (code, time_key)
@@ -27,7 +27,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.utils.config import Config
 from mock_agent import (get_conn, log, load_minutes_from_autotrade,
-                        gen_day_from_minutes, write_ticks, verify_ticks)
+                        gen_snapshots_from_minutes, write_ticks, verify_ticks)
 
 DEFAULT_CODE = "588000.SH"
 DEFAULT_START = "2026-01-01"
@@ -113,10 +113,12 @@ def main():
         if not (lc and lc == lc and lc > 0):
             log("警告 %s: 昨收无效（库内/AutoTrade 均缺失），重灌后 day_kline 将拒绝写入"
                 % date)
-        ticks = gen_day_from_minutes(minutes, lc)
-        log("==> %s 重灌: 1m %d 根 -> 3s %d 根 (last_close=%s)"
+        ticks = gen_snapshots_from_minutes(minutes, lc)
+        log("==> %s 重灌: 1m %d 根 -> 快照 %d 条 (last_close=%s)"
             % (date, len(minutes), len(ticks), lc))
-        write_ticks(dsn, args.code, ticks)   # upsert + sync day_kline/game_days
+        write_ticks(dsn, args.code, ticks,
+                    open_hint=minutes[0]["open"] if minutes else 0)
+        # upsert + sync day_kline/game_days
         verify_ticks(dsn, args.code, date)
         total_ok += 1
     log("重灌完成: 成功 %d 日, 跳过 %d 日" % (total_ok, total_skip))

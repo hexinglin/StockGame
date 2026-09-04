@@ -1,15 +1,17 @@
 # ============================================================
 # QMT Agent - StockGame 行情采集代理
 # 功能:
-#   handlebar: 盘中每 3s 触发一次，采集最新 K 线行情 HTTP 上传
+#   subscribe_quote 事件驱动: 订阅标的每笔分笔推送即回调上传，
+#     替代原 handlebar 3s 轮询（无行情不触发，不空转）
 #   run_time 心跳任务: 每 60s POST 一次心跳，与行情上传解耦
 # 说明:
-#   非当日行情数据直接过滤，不参与上报；
-#   同一时间点重复上报由后端按 (code, time_key) 幂等去重。
+#   仅上传当日行情（非当日推送直接过滤）；
+#   同一秒内多次推送只上报一次（秒级节流），重复上报由后端按
+#   (code, time_key) 幂等去重。
 # NOTE: QMT built-in functions are provided by QMT runtime.
 #       - timetag_to_datetime()
-#       - get_bar_timetag()
 #       - ContextInfo.run_time()
+#       - ContextInfo.subscribe_quote()
 # ============================================================
 import sys
 import os
@@ -34,12 +36,13 @@ except ImportError:
 
 # ---- 配置 ----
 _stock_code = "588000.SH"
+_QUOTE_PERIOD = "tick"                  # 订阅周期：tick=分笔（快照变化即推送）
 BACKEND_URL = "http://192.168.1.5:16000"   # StockGame 后端地址（部署后按实际修改）
 AGENT_NAME = "qmt_live"
 HEARTBEAT_INTERVAL = 60                   # 心跳周期（秒）
 SYNC_TIMEOUT = 10
 
-_last_sent_time = None   # 上次成功上报的 time_key（防重复触发日志噪音）
+_last_sent_time = None   # 上次已上报的 time_key（秒级节流，防同秒重复推送）
 
 
 def _log(msg):
@@ -71,98 +74,100 @@ def _http_post(endpoint, data, timeout=SYNC_TIMEOUT):
         _log("HTTP POST %s 失败: %s" % (endpoint, e))
         return None
 
+def _quote_time_key(bar):
+    """从订阅推送行情提取秒级 time_key（'%Y-%m-%d %H:%M:%S'）
 
-def _get_pre_close(ContextInfo):
-    """昨收（上一交易日收盘）：tick 行情不含 pre_close 字段，改从日线序列推导
+    优先毫秒时间戳 time/timetag（QMT 内置 timetag_to_datetime，10 位秒级
+    戳自动补足毫秒），缺失时退回解析 stime（'20231107110321.000'）。
+    """
+    ms = bar.get("time")
+    if ms is None:
+        ms = bar.get("timetag")
+    if ms is not None:
+        try:
+            ms = int(ms)
+            if 0 < ms < 100000000000:     # 10 位秒级时间戳 → 毫秒
+                ms *= 1000
+            return timetag_to_datetime(ms, '%Y-%m-%d %H:%M:%S')
+        except Exception:
+            pass
+    stime = str(bar.get("stime") or "")
+    if len(stime) >= 14 and stime[:14].isdigit():
+        try:
+            return time.strftime('%Y-%m-%d %H:%M:%S',
+                                 time.strptime(stime[:14], '%Y%m%d%H%M%S'))
+        except Exception:
+            return None
+    return None
 
-    - 最后一根日线为当日（盘中 1d 动态生成）→ 取其 pre_close（恒为昨收）
-    - 最后一根为上一交易日（当日 1d 未生成）→ 取其 close（即昨收）
-    取不到有效值返回 0（后端 day_kline 将暂缓生成，tick 入库不受影响）。
+
+def _on_quote(ContextInfo, data):
+    """subscribe_quote 回调 — 订阅标的分笔推送即组装上传
+
+    data 结构: {code: {字段: 值}}（订阅时指定 result_type='dict'）；
+    兼容个别版本忽略 result_type 返回 DataFrame/Series 的情况。
+    分笔推送字段为 quoter 快照: time(毫秒)/stime/lastPrice/lastClose/
+    open/high/low/volume/amount（昨收字段部分版本命名 preClose）。
     """
     try:
-        result = ContextInfo.get_market_data_ex(
-            ['close', 'pre_close'], stock_code=[_stock_code],
-            count=2, period='1d')
-        df = None
-        for d in (result or {}).values():
-            if d is not None and len(d) > 0:
-                df = d
-                break
-        if df is None:
-            return 0.0
-
-        def _f(name):
-            try:
-                v = float(df.iloc[-1][name])
-            except Exception:
-                v = float('nan')
-            return v if v == v and v > 0 else 0.0
-
-        # 末根日线日期 == 今天（盘中）→ pre_close；否则（盘前/首笔）→ close
-        last_date = timetag_to_datetime(int(df.index[-1]), '%Y-%m-%d')
-        if last_date == time.strftime("%Y-%m-%d", time.localtime()):
-            return _f('pre_close') or _f('close')
-        return _f('close') or _f('pre_close')
-    except Exception as e:
-        _log("获取昨收异常: %s" % e)
-        return 0.0
-
-
-def _get_market_data(ContextInfo):
-    """通过 ContextInfo 获取当前 K 线行情"""
-    try:
-        result = ContextInfo.get_market_data_ex(
-            ['close', 'open', 'high', 'low', 'volume', 'amount', 'pre_close'],
-            stock_code=[_stock_code],
-            count=1,
-            period='tick',
-        )
-
-        bar = None
-        for df in result.values():
-            if df is not None and len(df) > 0:
-                bar = df.iloc[-1]
-                break
-
+        if not isinstance(data, dict):
+            return
+        bar = data.get(_stock_code)
         if bar is None:
-            _log("无法获取 K 线数据")
-            return None
+            return
+        if hasattr(bar, "iloc"):        # DataFrame → 末行 Series
+            bar = bar.iloc[-1]
+        if hasattr(bar, "to_dict"):     # Series → dict
+            bar = bar.to_dict()
 
-        def _v(k, dft=0):
-            try:
-                return float(bar[k]) if isinstance(bar, dict) else float(bar.loc[k])
-            except Exception:
-                return dft
+        time_key = _quote_time_key(bar)
+        if not time_key:
+            return
+        # 过滤非当日数据：跨日残留/盘前旧推送直接丢弃
+        if time_key[:10] != time.strftime("%Y-%m-%d", time.localtime()):
+            #_log("数据非当日已过滤: %s" % time_key)
+            return
+        # 秒级节流：同一秒内多次推送（同 time_key）只上报一次
+        global _last_sent_time
+        if time_key == _last_sent_time:
+            return
+        _last_sent_time = time_key
 
-        close_val = _v('close')
-        # 昨收：tick 行情无 pre_close 字段，由日线序列推导（见 _get_pre_close）
-        last_close = _get_pre_close(ContextInfo)
+        def _v(*keys, dft=0.0):
+            """按候选字段名取数值，NaN/缺字段视为缺失取 dft"""
+            for k in keys:
+                try:
+                    v = float(bar.get(k))
+                except (TypeError, ValueError):
+                    continue
+                if v == v:
+                    return v
+            return dft
 
-        # 过滤非当日数据：bar 日期不是今天（如盘前/跨日残留的旧行情）直接丢弃
-        bar_timetag = ContextInfo.get_bar_timetag(ContextInfo.barpos)
-        trade_date = timetag_to_datetime(bar_timetag, '%Y-%m-%d')
-        today = time.strftime("%Y-%m-%d", time.localtime())
-        if trade_date != today:
-            #_log("数据非当日已过滤: bar=%s today=%s" % (trade_date, today))
-            return None
+        close_val = _v("lastPrice", "close")
+        if close_val <= 0:
+            return
+        # 昨收：推送自带 lastClose/preClose 优先，缺失时按日线序列推导兜底
+        last_close = _v("lastClose", "preClose")
 
-        return {
+        payload = {
             "agent_name": AGENT_NAME,
             "code": _stock_code,
-            "time_key": timetag_to_datetime(bar_timetag, '%Y-%m-%d %H:%M:%S'),
-            "trade_date": trade_date,
-            "period": ContextInfo.period,
+            "time_key": time_key,
+            "trade_date": time_key[:10],
+            "period": _QUOTE_PERIOD,
             "open": _v("open"),
             "high": _v("high"),
             "low": _v("low"),
             "close": close_val,
             "last_close": last_close,
             "volume": _v("volume"),
-            "amount": _v("amount", 0),
+            "amount": _v("amount"),
         }
+        _logdata(payload)
+        _http_post("/api/v1/agent/tick", payload)
     except Exception as e:
-        _log("获取行情异常: %s" % e)
-    return None
+        _log("订阅回调异常: %s" % e)
 
 
 def heartbeat(ContextInfo):
@@ -174,22 +179,17 @@ def heartbeat(ContextInfo):
 
 
 def init(ContextInfo):
-    """QMT 初始化回调"""
+    """QMT 初始化回调：注册心跳定时任务 + 订阅行情（事件驱动，替代 handlebar）"""
     _log("StockGame Agent 初始化完成 code=%s period=%s backend=%s" % (
-        _stock_code, ContextInfo.period, BACKEND_URL))
+        _stock_code, _QUOTE_PERIOD, BACKEND_URL))
     # 注册定时心跳任务（run_time 机制替代独立线程）：
     # startTime 设为历史时间使定时器立即启动，之后每 60s 触发一次 heartbeat
     ContextInfo.run_time(
         "heartbeat", "%dnSecond" % HEARTBEAT_INTERVAL, "2000-01-01 00:00:00")
-
-
-def handlebar(ContextInfo):
-    """QMT handlebar 回调 — 每 3s 触发一次，上传最新行情（无交易时间过滤）"""
-    try:
-        data = _get_market_data(ContextInfo)
-        if not data:
-            return
-        _logdata(data)
-        _http_post("/api/v1/agent/tick", data)
-    except Exception as e:
-        _log("handlebar 异常: %s" % e)
+    # 订阅分笔行情：订阅标的有新分笔（快照变化）即回调 _on_quote，
+    # 替代原 handlebar 主图 3s 轮询；回调闭包携带 ContextInfo 供昨收兜底
+    sub_id = ContextInfo.subscribe_quote(
+        _stock_code, period=_QUOTE_PERIOD, result_type="dict",
+        callback=lambda data: _on_quote(ContextInfo, data))
+    _log("行情订阅完成 sub_id=%s（>0 成功；-1 失败请检查订阅权限/数量限制）"
+         % sub_id)

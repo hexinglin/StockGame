@@ -36,8 +36,12 @@ def client(app):
 
 @pytest.fixture()
 def test_data(app):
-    """生成一个完整小交易日的 3s 行情（3 根 1min bar × 20 = 60 条 tick）"""
-    from mock_agent import gen_day_from_minutes
+    """生成一个完整小交易日的快照行情（3 根 1min bar × 20 = 60 条快照）
+
+    快照口径：volume/amount 为当日累计（单调不减）、high/low 为滚动极值、
+    close 为最新价；day_kline 聚合时 volume/amount 取末条累计（非 sum）。
+    """
+    from mock_agent import gen_snapshots_from_minutes
 
     with app.app_context():
         # 清理遗留数据
@@ -50,18 +54,18 @@ def test_data(app):
             {"time_key": f"{TEST_DATE} 15:00:00", "open": 1.015, "high": 1.05,
              "low": 1.01, "close": 1.05, "volume": 200000},
         ]
-        ticks = gen_day_from_minutes(bars, last_close=1.00)
+        ticks = gen_snapshots_from_minutes(bars, last_close=1.00)
         assert len(ticks) == 60
         for t in ticks:
             db.session.add(TickData(
                 code=TEST_CODE, trade_date=TEST_DATE, time_key=t["time_key"],
-                open=t["open"], high=t["high"], low=t["low"], close=t["close"],
-                volume=t["volume"], amount=round(t["close"] * t["volume"], 2),
+                high=t["high"], low=t["low"], close=t["close"],
+                volume=t["volume"], amount=t["amount"],
             ))
         db.session.commit()
         # 同步写入 day_kline（与 tick 对齐）并派生 game_days：开局/昨收读 day_kline
         get_engine().refresh_day(TEST_CODE, TEST_DATE, "qmt",
-                                 last_close_hint=1.00)
+                                 last_close_hint=1.00, open_hint=1.00)
 
     yield {"code": TEST_CODE, "date": TEST_DATE, "last_close": 1.00}
 

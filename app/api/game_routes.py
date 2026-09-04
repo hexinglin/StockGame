@@ -212,24 +212,36 @@ def account(round_id):
 
 @game_bp.route("/rounds/<int:round_id>/ticks", methods=["GET"])
 def ticks(round_id):
-    """分时图恢复数据（该日全部 tick 的轻量字段，按轮次数据源读表）"""
+    """分时图恢复数据（该日全部快照的轻量字段，按轮次数据源读表）
+
+    快照口径：tick 表存当日累计量额（单调不减），对外转为与上一条快照的
+    差分（首条=原值）供前端分钟聚合/均价线累加；high/low 为快照滚动极值、
+    close 为最新价，原样透传（今高/今低逐点刷新、价格分钟定型）；open（今开）
+    由 day_kline 当日常量填充（缺失以首条 close 兑底，与引擎同口径）。
+    """
     from ..dbdata.models import TickData, TickDataSim
     r = GameRound.query.get(round_id)
     if not r:
         return _err("轮次不存在", 404)
     m = TickDataSim if (r.data_source or "qmt") == "sim" else TickData
-    rows = (db.session.query(m.time_key, m.open, m.high,
+    rows = (db.session.query(m.time_key, m.high,
                              m.low, m.close, m.volume, m.amount)
             .filter(m.code == r.code, m.trade_date == r.trade_date)
             .order_by(m.time_key).all())
     tail = request.args.get("tail", type=int, default=0)
-    data = [{"time_key": tk, "open": o, "high": h, "low": l, "close": c,
-             "volume": v or 0, "amount": a or 0}
-            for tk, o, h, l, c, v, a in rows]
-    # 昨收填充（与引擎 _load_context 同口径）：昨收已由 day_kline 天维度
-    # 原始行情维护（入库时清洗+stock_kline 兜底），此处按记录值统一回填，
-    # 保证前端恢复与实时推送的昨收一致且恒可解析
-    get_engine().normalize_last_close(data, r.code, r.trade_date, r.data_source or "qmt")
+    data = []
+    prev_v = prev_a = 0
+    for tk, h, l, c, v, a in rows:
+        v = v or 0
+        a = a or 0
+        data.append({"time_key": tk, "high": h, "low": l, "close": c,
+                     "volume": max(0, v - prev_v), "amount": max(0, a - prev_a)})
+        prev_v, prev_a = v, a
+    # 当日常量填充（昨收 + 今开，与引擎 _load_context 同口径）：两值由
+    # day_kline 天维度真实行情维护（入库时清洗 + stock_kline/首条 close 兑底），
+    # 此处按记录值统一回填，保证前端恢复与实时推送一致且恒可解析
+    get_engine().normalize_day_constants(
+        data, r.code, r.trade_date, r.data_source or "qmt")
     if tail and tail > 0:
         data = data[-tail:]
     return _ok({"trade_date": r.trade_date, "code": r.code,

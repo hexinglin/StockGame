@@ -83,7 +83,7 @@ class TestOrderFlow:
                                  "price": 1.0, "shares": 600000})
         assert resp.get_json()["code"] != 0
 
-        # 正常限价买单（会成交：tick.low <= 1.05）
+        # 正常限价买单（会成交：最新价 close <= 1.05 即触发）
         resp = client.post(f"/api/v1/game/rounds/{rid}/order",
                            json={"direction": "buy", "order_type": "limit",
                                  "price": 1.05, "shares": 10000})

@@ -19,8 +19,8 @@ SIM_DATE = "2099-01-06"   # 仅转换模拟数据的交易日
 
 
 def _make_sim_ticks(code, date, last_close=1.10):
-    """构造一个完整小交易日的模拟 3s 数据（3 根 1min bar × 20 = 60 条）"""
-    from mock_agent import gen_day_from_minutes
+    """构造一个完整小交易日的模拟快照流（3 根 1min bar × 20 = 60 条快照）"""
+    from mock_agent import gen_snapshots_from_minutes
     bars = [
         {"time_key": f"{date} 09:30:00", "open": 1.10, "high": 1.11,
          "low": 1.09, "close": 1.105, "volume": 120000},
@@ -29,17 +29,18 @@ def _make_sim_ticks(code, date, last_close=1.10):
         {"time_key": f"{date} 15:00:00", "open": 1.12, "high": 1.16,
          "low": 1.11, "close": 1.15, "volume": 240000},
     ]
-    ticks = gen_day_from_minutes(bars, last_close=last_close)
+    ticks = gen_snapshots_from_minutes(bars, last_close=last_close)
     for t in ticks:
         db.session.add(TickDataSim(
             code=code, trade_date=date, time_key=t["time_key"],
-            open=t["open"], high=t["high"], low=t["low"], close=t["close"],
-            volume=t["volume"], amount=round(t["close"] * t["volume"], 2),
+            high=t["high"], low=t["low"], close=t["close"],
+            volume=t["volume"], amount=t["amount"],
         ))
     db.session.commit()
     # 同步写入 day_kline（与 tick 对齐）并派生 game_days：sim 日可见读 game_days，
-    # 开局原始数据（昨收）读 day_kline
-    get_engine().refresh_day(code, date, "sim", last_close_hint=last_close)
+    # 开局原始数据（昨收/今开）读 day_kline；今开为当日常量随 hint 维护
+    get_engine().refresh_day(code, date, "sim", last_close_hint=last_close,
+                             open_hint=bars[0]["open"])
     return len(ticks)
 
 
@@ -113,7 +114,8 @@ class TestSimDateSource:
         assert len(ctx.ticks) == 60
         assert ctx.ticks[0]["last_close"] == pytest.approx(1.10)
 
-        # 模拟数据轮次同样可撮合（限价买 1.15：tick.low <= 1.15 必然成交）
+        # 模拟数据轮次同样可撮合（限价买 1.15：最新价 close <= 1.15 即触发，
+        # 首快照 close=1.10 <= 1.15 必成交）
         ok, order, msg = engine.place_order(r.id, "buy", "limit", 1.15, 10000)
         assert ok, msg
         engine._process_tick(ctx, ctx.ticks[0])

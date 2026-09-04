@@ -7,7 +7,7 @@
 const state = {
     roundId: null,          // 当前游戏轮次
     round: null,            // 轮次详情
-    ticks: [],              // 该日全部 tick（恢复用）
+    ticks: [],              // 该日全部快照（恢复用；volume/amount 为相邻快照增量）
     minutePoints: [],       // 已定格分钟点 {time, price, vol, amount}
     livePoint: null,        // 进行中分钟（跳变点）
     cumAmount: 0,           // 累计成交额（本轮）
@@ -19,7 +19,7 @@ const state = {
     otype: "limit",         // 仅支持限价
     socket: null,
     chart: null,
-    lastTickVol: 0,         // 当笔 tick 成交量（盘口模拟用）
+    lastTickVol: 0,         // 当笔快照增量成交量（盘口模拟用）
     
 };
 
@@ -492,7 +492,9 @@ function onQuote(q) {
     state.dayHigh = Math.max(state.dayHigh || q.high, q.high);
     state.dayLow = state.dayLow ? Math.min(state.dayLow, q.low) : q.low;
 
-    // 分钟聚合：分钟变化 → 定格上一分钟点
+    // 分钟聚合：分钟变化 → 定格上一分钟点。quote 的 volume/amount 为与上一
+    // 快照的增量（差分输出），同分钟累加 = 该分钟量柱（分钟量能守恒）；
+    // 跨分钟定格时 price = 该分钟最后一跳 close（分钟定型价）
     const minute = q.time_key.slice(11, 16);
     if (!state.livePoint || state.livePoint.time !== minute) {
         if (state.livePoint) {
@@ -612,11 +614,14 @@ function buildMinuteSeries(ticks) {
 }
 
 function rebuildMinuteSeries(ticks, isRecover) {
-    // 从 REST 恢复：只保留"已完整"的分钟（最后未完成的分钟作为跳变点）
+    // 从 REST 恢复：只保留"已完整"的分钟（最后未完成的分钟作为跳变点）。
+    // ticks 的 volume/amount 为相邻快照增量，逐点累加即可还原分钟量柱与
+    // 当日累计（cum），与实时路径（onQuote）同口径；high/low 为快照滚动极值，
+    // 今高/今低按已推进区间 max/min 重算（见 enterGame）
     const { points, live } = buildMinuteSeries(ticks);
     state.minutePoints = points;
     state.livePoint = live;
-    // 累计成交额/量
+    // 累计成交额/量（快照差分累加 = 当日累计）
     let ca = 0, cv = 0;
     ticks.forEach(t => { ca += t.amount || (t.close * (t.volume || 0)); cv += t.volume || 0; });
     state.cumAmount = ca;

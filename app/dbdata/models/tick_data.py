@@ -1,5 +1,11 @@
 """
-原始 3s 行情 ORM 模型 — 游戏数据源
+当日快照行情 ORM 模型 — 游戏数据源
+
+快照语义（QMT 推送为当日某时刻的股票快照，非 3s 增量 bar）:
+- close = 最新价；high/low = 截至该时刻的当日滚动最高/最低
+- volume/amount = 截至该时刻的当日累计成交量/额（单调不减）
+- 今开 open / 昨收 last_close 为当日常量：不在此表逐点维护，统一存放
+day_kline 表（与 tick 对齐的天维度真实行情），game_days 为游戏选择/管理层
 """
 from datetime import datetime
 
@@ -8,7 +14,7 @@ from ..database import Base
 
 
 class TickData(Base):
-    """原始 3s 行情（每个时间点仅一条）"""
+    """当日快照点序列（每个时间点仅一条）"""
     __tablename__ = "tick_data"
     __table_args__ = (
         UniqueConstraint('code', 'time_key', name='uq_tick_code_time'),
@@ -17,12 +23,9 @@ class TickData(Base):
     code = Column(String(20), nullable=False, index=True)
     trade_date = Column(String(10), nullable=False, index=True)
     time_key = Column(String(19), nullable=False)   # 'YYYY-MM-DD HH:MM:SS'
-    open = Column(Float)
-    high = Column(Float)
-    low = Column(Float)
-    close = Column(Float)
-    volume = Column(BigInteger, default=0)
-    amount = Column(Float, default=0)
-    # 昨收不在此维护：天维度原始行情（含 last_close）统一存放 day_kline 表
-    # （与 tick 表对齐），game_days 为游戏选择/管理层，开局数据从 day_kline 读取
+    high = Column(Float)             # 截至该时刻的当日最高（滚动）
+    low = Column(Float)              # 截至该时刻的当日最低（滚动）
+    close = Column(Float)            # 最新价
+    volume = Column(BigInteger, default=0)     # 当日累计成交量
+    amount = Column(Float, default=0)          # 当日累计成交额
     created_at = Column(DateTime, default=datetime.now)

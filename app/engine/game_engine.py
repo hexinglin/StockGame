@@ -41,24 +41,30 @@ O_REJECTED = "rejected"
 _TICK_SEC = 1.0          # 1x 速度每秒推送一根 tick
 _CLOCK_INTERVAL = 0.1    # 时钟推进周期（秒）
 
-# 按 tick 表现存数据聚合写入 day_kline（天维度原始行情，与 tick 表对齐）的
-# upsert 模板（表名白名单拼接）；last_close 维护链见 refresh_day 注释
+# 按 tick 表现存快照聚合写入 day_kline（天维度真实行情，与 tick 表对齐）的
+# upsert 模板（表名白名单拼接）。快照口径：volume/amount 为当日累计值，取末条
+# 快照（array_agg DESC [1]）而非 sum；high/low=max/min 各快照滚动极值；
+# open（今开）为当日常量：hint 有效则写 hint，否则保留库内旧值（INSERT 时以
+# 首条快照 close 兑底）。last_close 维护链见 refresh_day 注释
 _DAY_KLINE_UPSERT_SQL = """
 INSERT INTO day_kline (code, trade_date, data_source, open, high, low, close,
                        volume, amount, last_close, tick_count, first_time_key,
                        last_time_key, is_complete)
 SELECT :code, :trade_date, :data_source,
-       (array_agg(open ORDER BY time_key))[1], max(high), min(low),
+       COALESCE(NULLIF(:open_hint, 0), (array_agg(close ORDER BY time_key))[1]),
+       max(high), min(low),
        (array_agg(close ORDER BY time_key DESC))[1],
-       COALESCE(sum(volume), 0), COALESCE(sum(amount), 0),
+       (array_agg(volume ORDER BY time_key DESC))[1],
+       (array_agg(amount ORDER BY time_key DESC))[1],
        :last_close,
        count(*), min(time_key), max(time_key),
        (max(time_key) >= :date_end)
 FROM {table}
 WHERE code = :code AND trade_date = :trade_date
 ON CONFLICT (code, trade_date, data_source) DO UPDATE SET
-  open = EXCLUDED.open, high = EXCLUDED.high, low = EXCLUDED.low,
-  close = EXCLUDED.close, volume = EXCLUDED.volume, amount = EXCLUDED.amount,
+  open = CASE WHEN :open_hint > 0 THEN :open_hint ELSE day_kline.open END,
+  high = EXCLUDED.high, low = EXCLUDED.low, close = EXCLUDED.close,
+  volume = EXCLUDED.volume, amount = EXCLUDED.amount,
   tick_count = EXCLUDED.tick_count,
   first_time_key = EXCLUDED.first_time_key,
   last_time_key = EXCLUDED.last_time_key,
@@ -370,13 +376,14 @@ class GameEngine:
         if ctx and hasattr(ctx, "cum_amount"):
             cum_amount, cum_volume = ctx.cum_amount, ctx.cum_volume
         elif r.last_time_key:
+            # 快照口径：当日累计量额 = <= last_time_key 的末条快照值
+            # （volume/amount 在 tick 表为当日累计值，不可再逐点求和）
             m = self._tick_model(r.data_source)
-            row = (db.session.query(
-                    db.func.coalesce(db.func.sum(m.amount), 0),
-                    db.func.coalesce(db.func.sum(m.volume), 0))
+            row = (db.session.query(m.amount, m.volume)
                    .filter(m.code == r.code,
                            m.trade_date == r.trade_date,
-                           m.time_key <= r.last_time_key).first())
+                           m.time_key <= r.last_time_key)
+                   .order_by(m.time_key.desc()).first())
             if row:
                 cum_amount, cum_volume = row[0] or 0, row[1] or 0
 
@@ -433,16 +440,29 @@ class GameEngine:
         )
         if not ticks:
             return None, f"交易日 {r.trade_date} 无 {r.code} 行情数据"
-        ctx.ticks = [{
-            "time_key": t.time_key,
-            "open": t.open, "high": t.high, "low": t.low, "close": t.close,
-            "volume": t.volume or 0, "amount": t.amount or 0,
-        } for t in ticks]
+        # 快照 → 引擎播放序列：DB 存当日累计量额（单调不减），逐点预转为与上一
+        # 快照的差分（首条=原值），供 _process_tick 差分累加回当日累计（cum）；
+        # high/low 为快照滚动极值、close 为最新价，原样保留；open（今开）
+        # 当日常量由 normalize_day_constants 填充
+        ctx.ticks = []
+        prev_v = prev_a = 0
+        for t in ticks:
+            v = t.volume or 0
+            a = t.amount or 0
+            ctx.ticks.append({
+                "time_key": t.time_key,
+                "high": t.high, "low": t.low, "close": t.close,
+                "volume": max(0, v - prev_v),
+                "amount": max(0, a - prev_a),
+            })
+            prev_v, prev_a = v, a
 
-        # 昨收填充：来自 day_kline 天维度原始行情（入库时维护，缺失时生成侧从
-        # stock_kline 回补），统一写入每根 tick，保证推送给前端的昨收恒为
-        # 有效数值（与 REST ticks 恢复接口同口径，详见 normalize_last_close）
-        self.normalize_last_close(ctx.ticks, r.code, r.trade_date, r.data_source)
+        # 当日常量填充（昨收 + 今开）：来自 day_kline 天维度真实行情（快照入库
+        # 时维护，缺失时昨收从 stock_kline 回补、今开以首条快照 close 兑底），
+        # 统一写入每根 tick，保证推送给前端的昨收/今开恒为有效数值（与 REST
+        # ticks 恢复接口同口径，详见 normalize_day_constants）
+        self.normalize_day_constants(ctx.ticks, r.code, r.trade_date,
+                                     r.data_source)
 
         # 进度恢复（后端重启场景）：优先 Redis 快照；Redis 缺失/不可用时
         # 以 DB last_time_key（每根 tick 落库）反推已推进位置，保证走势
@@ -519,19 +539,26 @@ class GameEngine:
                         m.time_key <= r.last_time_key).scalar() or 0)
         return round(done / total * 100, 1)
 
-    def normalize_last_close(self, ticks: list, code: str, trade_date: str,
-                             data_source: str) -> list:
-        """昨收填充（调用方须处于 app context，勿套 _ensure_ctx）
-
-        昨收（上一交易日收盘）为日维度常量，由 day_kline 表在行情入库时维护
-        （与 tick 表对齐；tick 表已不再存 last_close）。此处读取当日记录值并
-        统一写入每根 tick dict，保证引擎 _load_context 与 REST ticks 恢复接口
-        同口径；当日无有效值时以前一完整交易日的 close 兜底（绝不用当日价格
-        充当基准）。
+    def normalize_day_constants(self, ticks: list, code: str, trade_date: str,
+                                data_source: str) -> list:
+        """当日常量填充（调用方须处于 app context，勿套 _ensure_ctx）
+    
+        昨收（上一交易日收盘）与今开（当日开盘）为日维度常量，由 day_kline 表在
+        行情入库时维护（与 tick 表对齐；tick 表已不再存 last_close/open）。此处
+        读取当日记录值并统一写入每根 tick dict，保证引擎 _load_context 与 REST
+        ticks 恢复接口同口径；当日昨收无有效值时以前一完整交易日的 close 兑底
+        （绝不用当日价格充当基准），今开缺失时以首条快照 close 兑底。
         """
         base_close = self.day_last_close(code, trade_date, data_source)
+        day = self._day_row(code, trade_date, data_source)
+        day_open = 0.0
+        if day is not None and _valid_price(day.open):
+            day_open = float(day.open)
+        if not _valid_price(day_open) and ticks:
+            day_open = float(ticks[0]["close"] or 0)
         for t in ticks:
             t["last_close"] = base_close
+            t["open"] = day_open
         return ticks
 
     def day_last_close(self, code: str, trade_date: str, data_source: str) -> float:
@@ -594,17 +621,19 @@ class GameEngine:
                            code, trade_date, e)
 
     def refresh_day(self, code: str, trade_date: str, data_source: str,
-                    last_close_hint: float = 0.0) -> bool:
-        """tick 入库后同步维护天维度日行情 day_kline（与 tick 表对齐）
+                    last_close_hint: float = 0.0, open_hint: float = 0.0) -> bool:
+        """快照入库后同步维护天维度真实行情 day_kline（与 tick 表对齐）
 
         调用方须处于 app context（行情上传/批量写入后调用，勿套 _ensure_ctx）。
         昨收写入前确定链：hint（上传/生成方携带）> 库内有效旧值 > stock_kline
         天维度回补（_kline_last_close）；三者均无效时拒绝写入——last_close
         无效（空/0）的日行情视为异常数据，不入库、不派生 game_days，返回 False
-        （调用方应提示错误；已入库的 tick 行情本身不受影响）。
+        （调用方应提示错误；已入库的快照行情本身不受影响）。
+        今开（open）为当日常量随 open_hint 维护，缺失时保留库内旧值（全新日以
+        首条快照 close 兑底）。
         写入两步：
-        1) day_kline：按 tick 表现存数据聚合（条数/首末时间/OHLC 均对账自
-           tick），昨收取确定链结果；
+        1) day_kline：按 tick 表现存快照聚合当日终值（条数/首末时间/极值/末条
+           累计量额均对账自 tick），昨收取确定链结果；
         2) game_days：游戏选择/管理层派生同步（is_complete 随 day_kline）。
         游戏选择与开局数据读取不再扫描 tick 表（tick 表仅游戏运行时使用）。
         """
@@ -612,6 +641,7 @@ class GameEngine:
             return False
         table = "tick_data" if data_source == "qmt" else "tick_data_sim"
         hint = _valid_price(last_close_hint) and float(last_close_hint) or 0.0
+        oh = _valid_price(open_hint) and float(open_hint) or 0.0
         # 昨收确定链：hint > 库内有效旧值 > stock_kline 天维度（仅生成侧）
         lc = hint
         if not _valid_price(lc):
@@ -629,7 +659,7 @@ class GameEngine:
         params = {"code": code, "trade_date": trade_date,
                   "data_source": data_source,
                   "date_end": f"{trade_date} 15:00:00",
-                  "last_close": lc}
+                  "last_close": lc, "open_hint": oh}
         try:
             db.session.execute(
                 text(_DAY_KLINE_UPSERT_SQL.format(table=table)), params)
@@ -951,7 +981,7 @@ class GameEngine:
 
     @_ensure_ctx
     def _process_tick(self, ctx: RoundContext, tick: dict):
-        """处理一根 3s tick：更新行情 + 撮合"""
+        """处理一个快照点：更新行情 + 撮合"""
         r = ctx.round
         acct = ctx.acct
         acct.last_price = tick["close"]
@@ -1008,16 +1038,21 @@ class GameEngine:
 
     @_ensure_ctx
     def _try_fill(self, ctx: RoundContext, order: GameOrder, tick: dict) -> bool:
-        """尝试撮合一笔委托，成交返回 True；未触及返回 False"""
+        """尝试撮合一笔委托，成交返回 True；未触及返回 False
+
+        快照口径下 high/low 是截至该时刻的当日滚动极值，不代表本时刻可成交的
+        价格区间，因此限价单以最新价（快照 close）触发：买单价 <= 限价、
+        卖单价 >= 限价即成交（成交价=限价），市价单按最新价成交。
+        """
         acct = ctx.acct
         direction, otype, price, shares = order.direction, order.order_type, order.price, order.shares
         filled = False
         fill_price = price
 
         if otype == "limit":
-            if direction == "buy" and tick["low"] <= price:
+            if direction == "buy" and tick["close"] <= price:
                 filled = True
-            elif direction == "sell" and tick["high"] >= price:
+            elif direction == "sell" and tick["close"] >= price:
                 filled = True
             else:
                 return False

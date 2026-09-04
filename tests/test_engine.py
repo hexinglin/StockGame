@@ -110,7 +110,8 @@ class TestMatching:
         r, ctx = running_round
         ok, order, msg = engine.place_order(r.id, "buy", "limit", 1.05, 10000)
         assert ok, msg
-        ticks = [t for t in ctx.ticks if t["low"] <= 1.05]
+        # 快照撮合：限价买单由最新价触发（close <= 限价即成交）
+        ticks = [t for t in ctx.ticks if t["close"] <= 1.05]
         assert ticks
         engine._process_tick(ctx, ticks[0])
         fresh = self._fetch_order(app, order["order_id"])
@@ -122,7 +123,8 @@ class TestMatching:
         r, ctx = running_round
         ok, order, msg = engine.place_order(r.id, "sell", "limit", 0.99, 10000)
         assert ok, msg
-        ticks = [t for t in ctx.ticks if t["high"] >= 0.99]
+        # 快照撮合：限价卖单由最新价触发（close >= 限价即成交）
+        ticks = [t for t in ctx.ticks if t["close"] >= 0.99]
         assert ticks
         engine._process_tick(ctx, ticks[0])
         fresh = self._fetch_order(app, order["order_id"])
@@ -186,7 +188,8 @@ class TestSettlement:
         assert o1.status == "filled"
 
         ok, o2, _ = engine.place_order(r.id, "sell", "limit", 1.05, 10000)
-        ticks = [t for t in ctx.ticks if t["high"] >= 1.05]
+        # 快照撮合：限价卖单由最新价触发（close >= 1.05，仅末点 close=1.05 满足）
+        ticks = [t for t in ctx.ticks if t["close"] >= 1.05]
         engine._process_tick(ctx, ticks[0])
         with app.app_context():
             o2 = GameOrder.query.filter_by(order_id=o2["order_id"]).first()
@@ -326,11 +329,12 @@ class TestDayKlineGuard:
         with app.app_context():
             db.session.add(TickData(
                 code=code, trade_date=date, time_key=f"{date} 09:30:00",
-                open=1.0, high=1.0, low=1.0, close=1.0, volume=100, amount=100))
+                high=1.0, low=1.0, close=1.0, volume=100, amount=100))
             db.session.commit()
             try:
                 assert engine.refresh_day(code, date, "qmt",
-                                          last_close_hint=9.99) is True
+                                          last_close_hint=9.99,
+                                          open_hint=1.0) is True
                 row = DayKline.query.filter_by(code=code, trade_date=date,
                                                data_source="qmt").first()
                 assert row is not None

@@ -18,14 +18,15 @@ logger = logging.getLogger(__name__)
 
 agent_bp = Blueprint("agent", __name__, url_prefix="/api/v1/agent")
 
-# SQL 兼容 upsert（PG 9.5+）；昨收 last_close 不再入库 tick 表，
-# 由下方 refresh_day 同步到 day_kline（开局原始数据，game_days 随之派生）
+# SQL 兼容 upsert（PG 9.5+）；今开 open / 昨收 last_close 为当日常量不再入库
+# tick 表（快照字段最小化），由下方 refresh_day 作为 hint 维护到 day_kline
+# （开局原始数据，game_days 随之派生）
 _UPSERT_TICK_SQL = text("""
-INSERT INTO tick_data (code, trade_date, time_key, open, high, low, close, volume, amount, created_at)
-VALUES (:code, :trade_date, :time_key, :open, :high, :low, :close, :volume, :amount, :created_at)
+INSERT INTO tick_data (code, trade_date, time_key, high, low, close, volume, amount, created_at)
+VALUES (:code, :trade_date, :time_key, :high, :low, :close, :volume, :amount, :created_at)
 ON CONFLICT (code, time_key) DO UPDATE SET
   trade_date = EXCLUDED.trade_date,
-  open = EXCLUDED.open, high = EXCLUDED.high, low = EXCLUDED.low, close = EXCLUDED.close,
+  high = EXCLUDED.high, low = EXCLUDED.low, close = EXCLUDED.close,
   volume = EXCLUDED.volume, amount = EXCLUDED.amount,
   created_at = EXCLUDED.created_at
 """)
@@ -33,11 +34,12 @@ ON CONFLICT (code, time_key) DO UPDATE SET
 
 @agent_bp.route("/tick", methods=["POST"])
 def upload_tick():
-    """原始行情上传 — 每个 (code, time_key) 仅一条数据（幂等 upsert）
+    """当日快照行情上传 — 每个 (code, time_key) 仅一条数据（幂等 upsert）
 
-    body: {agent_name, code, time_key, open, high, low, close, volume, amount,
-           last_close?}；last_close 仅作为当日昨收 hint 维护到 day_kline
-    （tick 表不存该字段）。
+    body: {agent_name, code, time_key, high, low, close, volume, amount,
+           last_close?, open?}；字段为快照语义（close=最新价、high/low=当日
+    滚动极值、volume/amount=当日累计量额）；last_close/open 为当日常量，仅作为
+    hint 维护到 day_kline（tick 表不存该字段）。
     """
     data = request.get_json(silent=True) or {}
     code = data.get("code", "")
@@ -55,7 +57,6 @@ def upload_tick():
                 "code": code,
                 "trade_date": trade_date,
                 "time_key": time_key,
-                "open": data.get("open", 0),
                 "high": data.get("high", 0),
                 "low": data.get("low", 0),
                 "close": data.get("close", 0),
@@ -70,12 +71,13 @@ def upload_tick():
         logger.error("tick 入库失败: %s", e)
         return jsonify({"code": 500, "message": f"tick 入库失败: {e}"}), 500
 
-    # 同步维护天维度原始行情（昨收 hint 随上传携带，缺失时引擎按链回补）；
+    # 同步维护天维度真实行情（昨收/今开 hint 随上传携带，缺失时引擎按链兑底）；
     # day_kline 生成与 tick 入库解耦：昨收暂缺仅暂缓 day 侧，tick 入库不阻断
     from ..engine.game_engine import get_engine
     engine = get_engine()
     day_ok = engine.refresh_day(code, trade_date, "qmt",
-                                last_close_hint=data.get("last_close", 0))
+                                last_close_hint=data.get("last_close", 0),
+                                open_hint=data.get("open", 0))
 
     # 更新 agent_status.last_tick_at（无论 day 是否暂缓，agent 活跃状态照常维护）
     _touch_agent(agent_name, tick=True)
