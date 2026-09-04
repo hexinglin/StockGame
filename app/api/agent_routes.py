@@ -70,18 +70,14 @@ def upload_tick():
         logger.error("tick 入库失败: %s", e)
         return jsonify({"code": 500, "message": f"tick 入库失败: {e}"}), 500
 
-    # 同步维护天维度原始行情（昨收 hint 随上传携带，缺失时由引擎回补）
+    # 同步维护天维度原始行情（昨收 hint 随上传携带，缺失时引擎按链回补）；
+    # day_kline 生成与 tick 入库解耦：昨收暂缺仅暂缓 day 侧，tick 入库不阻断
     from ..engine.game_engine import get_engine
     engine = get_engine()
-    if not engine.refresh_day(code, trade_date, "qmt",
-                              last_close_hint=data.get("last_close", 0)):
-        # 昨收缺失（hint/库内旧值/stock_kline 均无效）属异常行情：day_kline
-        # 拒绝入库（不派生 game_days）。tick 本身已入库，明确提示上传方错误。
-        return jsonify({"code": 1, "message": "tick 已入库，但昨收缺失"
-                        "（last_close 为空/0）属异常数据，day_kline 未生成，"
-                        "请携带有效 last_close 后重试"})
+    day_ok = engine.refresh_day(code, trade_date, "qmt",
+                                last_close_hint=data.get("last_close", 0))
 
-    # 更新 agent_status.last_tick_at
+    # 更新 agent_status.last_tick_at（无论 day 是否暂缓，agent 活跃状态照常维护）
     _touch_agent(agent_name, tick=True)
 
     # 更新 Redis 最新行情快照（全局 live）；昨收取 day_kline 维护值
@@ -91,6 +87,13 @@ def upload_tick():
         "close": data.get("close", 0),
         "last_close": engine.day_last_close(code, trade_date, "qmt"),
     })
+
+    if not day_ok:
+        # tick 已真正入库；day_kline/game_days 因昨收缺失暂缓生成（不写脏数
+        # 据），后续携带有效 last_close 的 tick 上传会自动补齐（refresh_day
+        # 幂等，按 tick 表现存数据全量对账），亦可用 refresh_all_days 重建
+        return jsonify({"code": 0, "message": "tick 已入库；day_kline 暂缓生成"
+                        "（昨收缺失），后续携带有效 last_close 将自动补齐"})
 
     return jsonify({"code": 0, "message": "ok"})
 
@@ -116,12 +119,25 @@ def heartbeat():
     cache.set_heartbeat(agent_name, ts)
 
     status = AgentStatus.query.filter_by(agent_name=agent_name).first()
+    # 首次上线或离线后恢复 → socket 广播（主页面 Agent 状态实时刷新）
+    notify = status is None or not status.is_alive
     if status is None:
         status = AgentStatus(agent_name=agent_name)
         db.session.add(status)
     status.last_heartbeat_at = datetime.fromtimestamp(ts)
     status.is_alive = True
     db.session.commit()
+
+    if notify:
+        from ..engine.game_engine import get_engine
+        get_engine().emit("agent:status", {
+            "agent_name": agent_name,
+            "is_alive": True,
+            "last_heartbeat_at": status.last_heartbeat_at.strftime(
+                "%Y-%m-%d %H:%M:%S"),
+            "last_tick_at": status.last_tick_at.strftime(
+                "%Y-%m-%d %H:%M:%S") if status.last_tick_at else None,
+        })
 
     return jsonify({"code": 0, "message": "ok"})
 

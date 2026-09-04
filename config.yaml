@@ -24,7 +24,7 @@ data_source:
 heartbeat:
   interval_sec: 60        # agent 心跳周期
   timeout_sec: 180        # 超过 3 个周期判离线
-  check_interval_sec: 300 # 后端 5 分钟检查一次
+  check_interval_sec: 15  # 后端 15s 检查一次（agent 离线/恢复页面近实时呈现）
   alert_cooldown_sec: 1800  # 告警防抖 30 分钟
 
 feishu:

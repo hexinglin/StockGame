@@ -15,10 +15,10 @@
     <header id="top-bar">
         <div class="top-left">
             <h1>StockGame <span class="sub">股票模拟交易游戏</span></h1>
-            <span class="mode-badge" id="agentStatusBadge">Agent: --</span>
+            <span class="mode-badge" id="agentStatusBadge" title="行情采集 Agent 实时在线状态（socket 推送，离线约 3 分钟无心跳判定）">Agent: --</span>
         </div>
         <div class="top-right">
-            <span class="ws-status" id="wsStatus" title="与后端的实时推送连接状态（进入游戏后建立）">● 未连接</span>
+            <span class="ws-status" id="wsStatus" title="与后端的实时推送连接状态（打开页面即建立）">● 未连接</span>
             <span class="data-time" id="dataTime"></span>
             <button class="btn-refresh" onclick="loadAll()" title="刷新">⟳</button>
         </div>

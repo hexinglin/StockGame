@@ -23,7 +23,7 @@ data_source:
 heartbeat:
   interval_sec: 60
   timeout_sec: 180
-  check_interval_sec: 300
+  check_interval_sec: 15
   alert_cooldown_sec: 1800
 
 feishu:

@@ -89,30 +89,48 @@ class TestTickAPI:
         resp = client.post("/api/v1/agent/tick", json={"code": "X"})
         assert resp.status_code == 400
 
-    def test_upload_tick_missing_last_close_rejected(self, client, app):
-        """昨收缺失（hint 无效且无库内旧值/外部回补）→ tick 入库但 day_kline
-        拒绝并提示错误（异常数据不入库）"""
+    def test_upload_tick_missing_last_close_day_deferred(self, client, app):
+        """昨收缺失（hint 无效且无库内旧值/外部回补）→ tick 照常真正入库；
+        day_kline/game_days 暂缓生成；后续携带有效 last_close 的上传自动补齐"""
         code, date = "API588000", "2099-03-01"
         with app.app_context():
             TickData.query.filter_by(code=code, trade_date=date).delete()
             DayKline.query.filter_by(code=code, trade_date=date).delete()
             GameDay.query.filter_by(code=code, trade_date=date).delete()
             db.session.commit()
-        resp = client.post("/api/v1/agent/tick", json={
+        payload = {
             "agent_name": "test_agent", "code": code, "trade_date": date,
             "time_key": f"{date} 10:00:00",
             "open": 1.0, "high": 1.01, "low": 0.99, "close": 1.0,
             "volume": 1000, "amount": 1000,   # 不带 last_close
-        })
+        }
+        resp = client.post("/api/v1/agent/tick", json=payload)
         assert resp.status_code == 200
         body = resp.get_json()
-        assert body["code"] == 1
+        assert body["code"] == 0
         assert "昨收" in body["message"]
         with app.app_context():
-            # tick 已入库（原始行情本身不受影响），day_kline/game_days 零写入
-            assert TickData.query.filter_by(code=code, trade_date=date).count() == 1
-            assert DayKline.query.filter_by(code=code, trade_date=date).count() == 0
-            assert GameDay.query.filter_by(code=code, trade_date=date).count() == 0
+            # tick 已真正入库（上传主链路不受 day 暂缓影响）
+            assert TickData.query.filter_by(
+                code=code, trade_date=date).count() == 1
+            # day_kline/game_days 暂缓：零写入
+            assert DayKline.query.filter_by(
+                code=code, trade_date=date).count() == 0
+            assert GameDay.query.filter_by(
+                code=code, trade_date=date).count() == 0
+
+        # 同一 time_key 携带有效 last_close 重传 → day_kline/game_days 自动补齐
+        payload["last_close"] = 1.2
+        resp = client.post("/api/v1/agent/tick", json=payload)
+        assert resp.get_json()["code"] == 0
+        with app.app_context():
+            day = DayKline.query.filter_by(
+                code=code, trade_date=date).first()
+            assert day is not None
+            assert day.last_close == 1.2
+            assert day.tick_count == 1
+            assert GameDay.query.filter_by(
+                code=code, trade_date=date).count() == 1
 
 
 class TestHeartbeatAPI:

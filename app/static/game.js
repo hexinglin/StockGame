@@ -210,16 +210,37 @@ function pickDate(v) {
     closeDateDropdown();
 }
 
+// Agent 在线状态：HTTP 全量（loadAll）+ socket 增量（agent:status）合并渲染
+let AGENTS = [];
+
 function renderAgentStatus(agent) {
+    AGENTS = ((agent && agent.data) || []).map(a => Object.assign({}, a));
+    renderAgentBadge();
+}
+
+function onAgentStatus(a) {
+    // 后端推送单条状态变化（首次上线/离线恢复/超时离线）
+    if (!a || !a.agent_name) return;
+    const i = AGENTS.findIndex(x => x.agent_name === a.agent_name);
+    if (i >= 0) Object.assign(AGENTS[i], a);
+    else AGENTS.push(Object.assign({}, a));
+    renderAgentBadge();
+}
+
+function renderAgentBadge() {
     const badge = document.getElementById("agentStatusBadge");
-    if (!agent || !agent.data || !agent.data.length) {
+    if (!badge) return;
+    if (!AGENTS.length) {
         badge.textContent = "Agent: 无";
         badge.className = "mode-badge";
         return;
     }
-    const a = agent.data[0];
-    badge.textContent = `Agent: ${a.agent_name} ${a.is_alive ? "在线" : "离线"}`;
-    badge.className = "mode-badge " + (a.is_alive ? "alive" : "dead");
+    badge.textContent = "Agent: " + AGENTS
+        .map(a => `${a.agent_name} ${a.is_alive ? "在线" : "离线"}`)
+        .join(" / ");
+    // 任一 agent 离线即整体警示（红色），全部在线为绿色
+    badge.className = "mode-badge " +
+        (AGENTS.some(a => !a.is_alive) ? "dead" : "alive");
 }
 
 function statusText(s) {
@@ -347,7 +368,7 @@ async function enterGame(roundId) {
         document.getElementById("gTime").textContent =
             lt0.length >= 19 ? lt0.slice(11, 19) : (lt0.length >= 8 ? lt0.slice(-8) : "--:--:--");
         initChart();
-        initSocket();
+        joinRoundRoom();
 
         // 恢复分时图到当前进度（按 last_time_key 截断）
         const lastKey = state.round.last_time_key;
@@ -382,10 +403,12 @@ async function enterGame(roundId) {
 }
 
 function backToRounds() {
-    if (state.socket) state.socket.disconnect();
-    state.socket = null;
+    // 退出轮次房间但保留全局连接（agent 状态推送等仍需实时接收）
+    if (state.socket && state.socket.connected && state.roundId) {
+        state.socket.emit("leave_round", { round_id: state.roundId });
+    }
     state.roundId = null;
-    setWsStatus("● 未连接");   // 主动返回：无实时通道，非故障
+    setWsStatus("● 已连接", "ok");   // 全局实时通道保持，非断开
     document.getElementById("view-game").style.display = "none";
     document.getElementById("view-rounds").style.display = "block";
     document.title = "StockGame 股票模拟交易游戏";
@@ -422,7 +445,7 @@ function setWsStatus(text, cls) {
 }
 
 function initSocket() {
-    if (state.socket) { state.socket.disconnect(); }
+    if (state.socket) return;   // 页面级全局连接：打开即建立，进入/返回游戏不重建
     if (typeof io === "undefined") {
         // socket.io 客户端脚本（CDN）未加载：实时推送不可用，但不阻断页面其它功能
         console.error("socket.io 客户端未加载（检查 CDN 可用性）");
@@ -433,7 +456,8 @@ function initSocket() {
     state.socket = ws;
     ws.on("connect", () => {
         setWsStatus("● 已连接", "ok");
-        ws.emit("join_round", { round_id: state.roundId });
+        // 断线自动重连后若处于游戏视图，重新加入轮次房间恢复推送
+        if (state.roundId) ws.emit("join_round", { round_id: state.roundId });
     });
     ws.on("disconnect", () => {
         setWsStatus("● 已断开", "err");
@@ -442,11 +466,21 @@ function initSocket() {
         // socket.io 会自动重连，重连成功后上方 connect 回调恢复"已连接"
         setWsStatus("● 连接失败", "err");
     });
+    // 公共事件：agent 上线/离线实时推送（轮次管理页顶栏徽标）
+    ws.on("agent:status", onAgentStatus);
+    // 游戏事件：常驻注册，进入游戏后 join_round 即收到本轮次推送
     ws.on("game:quote", onQuote);
     ws.on("game:order_update", onOrderUpdate);
     ws.on("game:trade", onTrade);
     ws.on("game:account", onAccount);
     ws.on("game:status", onGameStatus);
+}
+
+function joinRoundRoom() {
+    // 进入游戏：加入轮次房间；socket 尚未连好时由 connect 回调兜底加入
+    if (state.socket && state.socket.connected && state.roundId) {
+        state.socket.emit("join_round", { round_id: state.roundId });
+    }
 }
 
 function onQuote(q) {
@@ -1041,5 +1075,6 @@ setInterval(() => {
     document.getElementById("dataTime").textContent = new Date().toLocaleTimeString("zh-CN", { hour12: false });
 }, 1000);
 
-// 启动
+// 启动：全局实时连接（agent 上线/离线实时推送）+ 首屏数据加载
+initSocket();
 loadAll();
