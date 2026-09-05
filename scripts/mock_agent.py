@@ -24,8 +24,7 @@ mock_agent.py — 模拟 QMT Agent（自测工具）
     - volume/amount 输出为"增量前缀累计"（快照口径：当日累计，单调不减），
       游戏消费端差分还原分钟量能；high/low 为滚动极值、close 为最新价
   今开 open / 昨收 last_close 为当日常量不入 tick 表：随生成值作为 hint
-  写入 day_kline（与 tick 对齐的天维度真实行情），game_days（游戏选择/管理）
-  随之派生。
+  写入 game_days（与 tick 对齐的天维度真实行情，日期管理唯一权威表）。
 """
 import argparse
 import datetime
@@ -278,13 +277,14 @@ def gen_scenario_day(trade_date: str, code: str, scenario: str) -> tuple:
 
 # ───────────── 写入 tick_data ─────────────
 
-# day_kline（与 tick 对齐的天维度真实行情）聚合 upsert 模板
+# game_days（天维度真实行情 + 轮次计数）聚合 upsert 模板
 # （__TABLE__ 为 tick_data/tick_data_sim 白名单；命名参数 %(name)s 风格）
 # 快照口径：volume/amount 取末条快照累计值（array_agg DESC [1]），不可 sum；
 # high/low = max/min 各快照滚动极值；open（今开）为当日常量：hint 有效则写
-# hint，否则保留库内旧值（INSERT 时以首条快照 close 兑底）
-_SYNC_DAY_KLINE_SQL = """
-INSERT INTO day_kline (code, trade_date, data_source, open, high, low, close,
+# hint，否则保留库内旧值（INSERT 时以首条快照 close 兑底）；round_count 为
+# 游戏侧轮次计数，随轮次创建/删除单独维护，此处不覆盖
+_SYNC_GAME_DAY_SQL = """
+INSERT INTO game_days (code, trade_date, data_source, open, high, low, close,
                        volume, amount, last_close, tick_count, first_time_key,
                        last_time_key, is_complete)
 SELECT %(code)s, %(trade_date)s, %(data_source)s,
@@ -299,7 +299,7 @@ SELECT %(code)s, %(trade_date)s, %(data_source)s,
 FROM __TABLE__
 WHERE code = %(code)s AND trade_date = %(trade_date)s
 ON CONFLICT (code, trade_date, data_source) DO UPDATE SET
-  open = CASE WHEN %(open_hint)s > 0 THEN %(open_hint)s ELSE day_kline.open END,
+  open = CASE WHEN %(open_hint)s > 0 THEN %(open_hint)s ELSE game_days.open END,
   high = EXCLUDED.high, low = EXCLUDED.low, close = EXCLUDED.close,
   volume = EXCLUDED.volume, amount = EXCLUDED.amount,
   tick_count = EXCLUDED.tick_count,
@@ -307,32 +307,21 @@ ON CONFLICT (code, trade_date, data_source) DO UPDATE SET
   last_time_key = EXCLUDED.last_time_key,
   is_complete = EXCLUDED.is_complete,
   last_close = CASE WHEN EXCLUDED.last_close > 0 THEN EXCLUDED.last_close
-                    ELSE day_kline.last_close END,
-  updated_at = now()
-"""
-
-# game_days（游戏选择/管理层）派生同步（is_complete 随 day_kline，round_count 不覆盖）
-_SYNC_GAME_DAY_SQL = """
-INSERT INTO game_days (code, trade_date, data_source, is_complete)
-SELECT code, trade_date, data_source, is_complete
-FROM day_kline
-WHERE code = %s AND trade_date = %s AND data_source = %s
-ON CONFLICT (code, trade_date, data_source) DO UPDATE SET
-  is_complete = EXCLUDED.is_complete,
+                    ELSE game_days.last_close END,
   updated_at = now()
 """
 
 
 def sync_game_day(dsn: str, code: str, trade_date: str, table: str,
                   last_close: float = 0.0, open_hint: float = 0.0):
-    """写入/刷新天维度真实行情 day_kline 并派生 game_days（与后端 refresh_day 同口径）
+    """写入/刷新 game_days 天维度真实行情（与后端 refresh_day 同口径）
 
     按 (code, trade_date) 从指定 tick 表聚合统计该日行情（快照口径：条数/首末
-    时间/极值/末条累计量额与 tick 表对齐；open 为当日常量随 open_hint 维护）；
-    昨收确定链：hint（生成侧从 stock_kline 读取/内置）> 库内已有有效值；两者
-    均无效时拒绝写入——last_close 无效（空/0/NaN）的日行情视为异常数据，不入
-    库、不派生 game_days（提示错误，请携带有效 last_close 后重试）。表名仅允许
-    tick_data / tick_data_sim（qmt/sim）。
+    时间/极值/末条累计量额与 tick 表对齐；open 为当日常量随 open_hint 维护；
+    round_count 为游戏侧轮次计数不覆盖）；昨收确定链：hint（生成侧从
+    stock_kline 读取/内置）> 库内已有有效值；两者均无效时拒绝写入——
+    last_close 无效（空/0/NaN）的日行情视为异常数据，不入库（提示错误，请
+    携带有效 last_close 后重试）。表名仅允许 tick_data / tick_data_sim（qmt/sim）。
     """
     if table not in ("tick_data", "tick_data_sim"):
         log("错误: sync_game_day 表名仅支持 tick_data/tick_data_sim: %s" % table)
@@ -347,7 +336,7 @@ def sync_game_day(dsn: str, code: str, trade_date: str, table: str,
             # hint 无效：回读库内已有有效昨收（upsert 分支会保留旧值，
             # 但全新行需显式回读才能获得有效值）
             cur.execute(
-                "SELECT last_close FROM day_kline "
+                "SELECT last_close FROM game_days "
                 "WHERE code=%s AND trade_date=%s AND data_source=%s "
                 "AND last_close > 0 AND last_close < 'Infinity' LIMIT 1",
                 (code, trade_date, data_source))
@@ -355,7 +344,7 @@ def sync_game_day(dsn: str, code: str, trade_date: str, table: str,
             if row:
                 lc = float(row[0])
         if not (lc and lc == lc and lc > 0):
-            log("错误: day_kline 拒绝写入 %s %s %s：昨收缺失（hint/库内旧值均无效），"
+            log("错误: game_days 拒绝写入 %s %s %s：昨收缺失（hint/库内旧值均无效），"
                 "last_close 为空/0 属异常数据不入库，请携带有效 last_close 后重试"
                 % (code, trade_date, data_source))
             return
@@ -364,14 +353,13 @@ def sync_game_day(dsn: str, code: str, trade_date: str, table: str,
         params = {"code": code, "trade_date": trade_date,
                   "data_source": data_source, "last_close": lc,
                   "date_end": trade_date + " 15:00:00", "open_hint": oh}
-        cur.execute(_SYNC_DAY_KLINE_SQL.replace("__TABLE__", table), params)
-        cur.execute(_SYNC_GAME_DAY_SQL, (code, trade_date, data_source))
+        cur.execute(_SYNC_GAME_DAY_SQL.replace("__TABLE__", table), params)
         conn.commit()
         cur.close()
-        log("刷新 day_kline/game_days: code=%s date=%s source=%s last_close=%s open=%s"
+        log("刷新 game_days: code=%s date=%s source=%s last_close=%s open=%s"
             % (code, trade_date, data_source, lc, oh))
     except Exception as e:
-        log("刷新 day_kline/game_days 失败: %s（请先执行 python migrate_db.py 建表）" % e)
+        log("刷新 game_days 失败: %s（请先执行 python migrate_db.py 建表）" % e)
     finally:
         conn.close()
 
@@ -384,7 +372,7 @@ def write_ticks(dsn: str, code: str, ticks: list, table: str = "tick_data",
     滚动极值、close 为最新价；逐行 INSERT ... ON CONFLICT (code, time_key)
     DO UPDATE，数据库自动去重并保留最新写入值。重复写入同一日时，已存在的行
     被覆盖更新，无残留重复记录，中途失败也不会丢旧数据。写入完成后同步刷新
-    day_kline/game_days 天维度真实行情（昨收随生成值维护，今开取 open_hint）。
+    game_days 天维度真实行情（昨收随生成值维护，今开取 open_hint）。
     """
     conn = get_conn(dsn)
     try:
@@ -421,10 +409,10 @@ def write_ticks(dsn: str, code: str, ticks: list, table: str = "tick_data",
 
 
 def verify_ticks(dsn: str, code: str, date: str):
-    """入库校验：条数 / 时间范围 / 量额单调 / day_kline 对齐（快照口径）
+    """入库校验：条数 / 时间范围 / 量额单调 / game_days 对齐（快照口径）
 
     完整日参考 240~242 根 1min × 20 = 4800~4840 条（真实 QMT 与模拟生成
-    口径略有差异，仅提示，不视为错误）；快照口径对账：day_kline.volume/amount
+    口径略有差异，仅提示，不视为错误）；快照口径对账：game_days.volume/amount
     应等于 tick_data 末条快照的当日累计值（输出末条累计供核对）；序列差分无
     负值即量额单调不减（无回退自洽）。
     """
@@ -436,10 +424,10 @@ def verify_ticks(dsn: str, code: str, date: str):
             "FROM tick_data WHERE code=%s AND trade_date=%s", (code, date))
         cnt, t0, t1, lo, hi = cur.fetchone()
         cur.execute(
-            "SELECT last_close, is_complete, tick_count FROM day_kline "
+            "SELECT last_close, is_complete, tick_count FROM game_days "
             "WHERE code=%s AND trade_date=%s AND data_source='qmt'", (code, date))
         day = cur.fetchone()
-        # 末条快照当日累计值（day_kline 对账基准）；序列差分负值计数（单调性）
+        # 末条快照当日累计值（game_days 对账基准）；序列差分负值计数（单调性）
         cur.execute(
             "SELECT (array_agg(volume ORDER BY time_key DESC))[1],"
             "       (array_agg(amount ORDER BY time_key DESC))[1] "
@@ -464,7 +452,7 @@ def verify_ticks(dsn: str, code: str, date: str):
                 % (code, date, cnt, t0, t1, lo, hi, lc, day_cnt, align, complete,
                    last_v, last_a, "是" if neg_cnt == 0 else "否(%d 处回退)" % neg_cnt))
         else:
-            log("警告: %s %s 无 day_kline 日记录，请检查 sync_game_day 是否执行"
+            log("警告: %s %s 无 game_days 日记录，请检查 sync_game_day 是否执行"
                 % (code, date))
         return cnt
     finally:
@@ -508,7 +496,7 @@ def load_minutes_from_autotrade(autotrade_dsn: str, code: str, date: str) -> lis
 def run_live(cfg, code: str, date: str, sleep: float):
     """实时模式：从 tick_data 读取该日快照，按 3s 间隔 POST 行情 + 60s 心跳
 
-    今开 open / 昨收 last_close 为当日常量，从 day_kline 天维度真实行情读出
+    今开 open / 昨收 last_close 为当日常量，从 game_days 天维度真实行情读出
     （tick 表已不再存），随每根 POST 上报；volume/amount 为当日累计值原样上报
     （与后端存储口径一致，后端自行差分消费）。
     """
@@ -518,7 +506,7 @@ def run_live(cfg, code: str, date: str, sleep: float):
     try:
         cur = conn.cursor()
         cur.execute(
-            "SELECT open, last_close FROM day_kline "
+            "SELECT open, last_close FROM game_days "
             "WHERE code=%s AND trade_date=%s AND data_source='qmt'",
             (code, date))
         day = cur.fetchone()

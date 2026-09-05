@@ -6,10 +6,12 @@
 流程:
 1. 以管理员身份连接现有 PG 实例的 postgres 默认库，检查 stockgame 库是否存在，
    不存在则 CREATE DATABASE stockgame;
-2. 连接 stockgame 库执行 migrations/init.sql 建表（幂等）。
-3. day_kline 昨收回补：完整交易日但 last_close 缺失/无效时，从 AutoTrade 库
+2. 连接 stockgame 库执行 migrations/init.sql 建表 + 存量刷新（幂等，无清理类操作）。
+3. game_days 昨收回补：完整交易日但 last_close 缺失/无效时，从 AutoTrade 库
    stock_kline 天维度读取（1d 行 last_close 优先，其次当日 1m 首根）并更新
-   （仅生成侧一次回补，tick 表已不再存 last_close；game_days 不存昨收）。
+   （仅生成侧一次回补，tick 表已不再存 last_close）。
+4. 昨收防线 apply_last_close_guardrail：回补后仍 last_close 无效的孤儿/异常行
+   物理删除，SET NOT NULL + 收紧 CHECK 约束（先回补救能救的，再删救不了的）。
 """
 import argparse
 import os
@@ -75,7 +77,7 @@ def run_sql_file(dsn: str, sql_path: str):
 
 
 def backfill_day_last_close(dsn: str, auto_dsn: str) -> int:
-    """day_kline 昨收回补（幂等）：完整交易日但 last_close 缺失/无效的记录
+    """game_days 昨收回补（幂等）：完整交易日但 last_close 缺失/无效的记录
 
     从 AutoTrade 库 stock_kline 天维度读取昨收（口径与引擎 _kline_last_close
     一致：当日 1d 行 last_close 优先，其次当日 1m 首根），仅更新缺失行，
@@ -90,7 +92,7 @@ def backfill_day_last_close(dsn: str, auto_dsn: str) -> int:
     try:
         cur = conn.cursor()
         cur.execute(
-            "SELECT code, trade_date FROM day_kline "
+            "SELECT code, trade_date FROM game_days "
             "WHERE is_complete = true AND (last_close IS NULL OR last_close <= 0) "
             "GROUP BY code, trade_date")
         pairs = cur.fetchall()
@@ -114,7 +116,7 @@ def backfill_day_last_close(dsn: str, auto_dsn: str) -> int:
             if not row or not row[0] or row[0] != row[0]:
                 continue
             cur.execute(
-                "UPDATE day_kline SET last_close=%s, updated_at=now() "
+                "UPDATE game_days SET last_close=%s, updated_at=now() "
                 "WHERE code=%s AND trade_date=%s "
                 "AND (last_close IS NULL OR last_close <= 0)",
                 (float(row[0]), code, trade_date))
@@ -126,9 +128,44 @@ def backfill_day_last_close(dsn: str, auto_dsn: str) -> int:
         auto.close()
         conn.close()
     if n:
-        print(f"[回补] day_kline 昨收从 stock_kline 回补 {n} 条（{len(pairs)} 日）")
+        print(f"[回补] game_days 昨收从 stock_kline 回补 {n} 条（{len(pairs)} 日）")
     else:
         print(f"[回补] 无需回补（检查 {len(pairs)} 日：stock_kline 均无可用昨收或记录已有效）")
+    return n
+
+
+def apply_last_close_guardrail(dsn: str) -> int:
+    """昨收防线（幂等）：删除 last_close 无效的孤儿/异常行 + 约束收紧
+
+    必须在 backfill_day_last_close 之后执行：能回补修复的行先修，救不了的
+    残留（无对应 stock_kline 昨收）在此物理删除。tick 快照数据不受影响，
+    需要时以有效昨收 refresh_all_days 重建。收紧 last_close NOT NULL + CHECK
+    （必有效，无 NULL 语义）。返回删除行数。
+    """
+    conn = psycopg2.connect(**_parse_dsn(dsn))
+    conn.autocommit = True
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "DELETE FROM game_days WHERE last_close IS NULL "
+            "OR NOT (last_close > 0 AND last_close < 'Infinity')")
+        n = cur.rowcount
+        cur.execute("ALTER TABLE game_days "
+                    "ALTER COLUMN last_close SET NOT NULL")
+        cur.execute("ALTER TABLE game_days DROP CONSTRAINT IF EXISTS "
+                    "ck_game_days_last_close_valid")
+        cur.execute("ALTER TABLE game_days ADD CONSTRAINT "
+                    "ck_game_days_last_close_valid "
+                    "CHECK (last_close > 0 AND last_close < 'Infinity')")
+        cur.close()
+    finally:
+        conn.close()
+    if n:
+        print(f"[防线] 清理 {n} 行 last_close 无效的孤儿/异常行，"
+              "CHECK/NOT NULL 约束已收紧")
+    else:
+        print("[防线] 无需清理（game_days 全部行 last_close 有效），"
+              "CHECK/NOT NULL 约束已收紧")
     return n
 
 
@@ -157,6 +194,7 @@ def main():
 
     auto_dsn = cfg.get("data_source.autotrade_dsn", "")
     backfill_day_last_close(dsn, auto_dsn)
+    apply_last_close_guardrail(dsn)
 
     print("数据库迁移完成!")
 

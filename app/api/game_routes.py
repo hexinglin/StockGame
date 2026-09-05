@@ -27,7 +27,7 @@ def _err(message, code=400):
 
 @game_bp.route("/dates", methods=["GET"])
 def dates():
-    """可运行交易日列表（按 code 过滤，默认 588000.SH；选择/管理索引：game_days）
+    """可运行交易日列表（按 code 过滤，默认 588000.SH；权威源：game_days）
 
     参数:
       code       标的代码（缺省返回全部 code 的日期映射）
@@ -48,7 +48,7 @@ def dates():
         else:
             result = engine.available_dates(code, allow_sim)
     else:
-        # 全部 code 的日期（game_days 选择/管理中实盘 + 转换模拟的 code 并集）
+        # 全部 code 的日期（game_days 权威：实盘 + 转换模拟并集，与日期选择同源）
         from ..dbdata.models import GameDay
         codes = [c for (c,) in db.session.query(GameDay.code).distinct().all()]
         result = {}
@@ -64,7 +64,7 @@ def dates():
 
 @game_bp.route("/days/refresh", methods=["POST"])
 def refresh_days():
-    """重建/刷新 day_kline（与 tick 对齐）并派生 game_days（选择/管理用）
+    """重建/刷新 game_days 天维度行情（与 tick 对齐，日期管理唯一权威表）
 
     body 可选: {code?, trade_date?}；缺省全量重建（幂等，逐日覆盖）。
     """
@@ -217,7 +217,7 @@ def ticks(round_id):
     快照口径：tick 表存当日累计量额（单调不减），对外转为与上一条快照的
     差分（首条=原值）供前端分钟聚合/均价线累加；high/low 为快照滚动极值、
     close 为最新价，原样透传（今高/今低逐点刷新、价格分钟定型）；open（今开）
-    由 day_kline 当日常量填充（缺失以首条 close 兑底，与引擎同口径）。
+    由 game_days 当日常量填充（缺失以首条 close 兑底，与引擎同口径）。
     """
     from ..dbdata.models import TickData, TickDataSim
     r = GameRound.query.get(round_id)
@@ -238,7 +238,7 @@ def ticks(round_id):
                      "volume": max(0, v - prev_v), "amount": max(0, a - prev_a)})
         prev_v, prev_a = v, a
     # 当日常量填充（昨收 + 今开，与引擎 _load_context 同口径）：两值由
-    # day_kline 天维度真实行情维护（入库时清洗 + stock_kline/首条 close 兑底），
+    # game_days 天维度真实行情维护（入库时清洗 + stock_kline/首条 close 兑底），
     # 此处按记录值统一回填，保证前端恢复与实时推送一致且恒可解析
     get_engine().normalize_day_constants(
         data, r.code, r.trade_date, r.data_source or "qmt")

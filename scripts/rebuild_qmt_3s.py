@@ -10,10 +10,10 @@ stock_kline(1m) 为源，按 mock_agent 同款算法（gen_snapshots_from_minute
 特性:
 - 幂等可重跑：write_ticks 逐行 INSERT ... ON CONFLICT (code, time_key)
   DO UPDATE，3s 展开含每分钟整分首根，天然覆盖旧分钟行、无残留；
-- 昨收防线兼容：昨收优先取 day_kline(qmt) 已有有效值（防漂移），无则用
-  AutoTrade 1m 携带值；均无效的日（如部分日 02-06）day_kline/game_days
+- 昨收防线兼容：昨收优先取 game_days(qmt) 已有有效值（防漂移），无则用
+  AutoTrade 1m 携带值；均无效的日（如部分日 02-06）game_days
   拒绝写入，与后端防线口径一致；
-- 重灌后自动同步 day_kline（tick_count/is_complete 对账）并派生 game_days。
+- 重灌后自动同步 game_days（tick_count/is_complete 对账）。
 
 用法: python scripts/rebuild_qmt_3s.py [--code 588000.SH]
                                        [--start 2026-01-01] [--end 2026-02-28]
@@ -51,12 +51,12 @@ def target_days(dsn: str, code: str, start: str, end: str) -> list:
 
 
 def existing_last_close(dsn: str, code: str, date: str) -> float:
-    """day_kline(qmt) 现有有效昨收（无则 0.0）"""
+    """game_days(qmt) 现有有效昨收（无则 0.0）"""
     conn = get_conn(dsn)
     try:
         cur = conn.cursor()
         cur.execute(
-            "SELECT last_close FROM day_kline WHERE code=%s AND trade_date=%s "
+            "SELECT last_close FROM game_days WHERE code=%s AND trade_date=%s "
             "AND data_source='qmt' AND last_close > 0 AND last_close < 'Infinity' "
             "LIMIT 1", (code, date))
         row = cur.fetchone()
@@ -111,7 +111,7 @@ def main():
         if not lc:
             lc = auto_lc
         if not (lc and lc == lc and lc > 0):
-            log("警告 %s: 昨收无效（库内/AutoTrade 均缺失），重灌后 day_kline 将拒绝写入"
+            log("警告 %s: 昨收无效（库内/AutoTrade 均缺失），重灌后 game_days 将拒绝写入"
                 % date)
         ticks = gen_snapshots_from_minutes(minutes, lc)
         log("==> %s 重灌: 1m %d 根 -> 快照 %d 条 (last_close=%s)"

@@ -16,7 +16,7 @@ from datetime import datetime
 from sqlalchemy import text
 
 from ..dbdata.database import db
-from ..dbdata.models import (GameRound, GameOrder, GameTrade, GameDay, DayKline,
+from ..dbdata.models import (GameRound, GameOrder, GameTrade, GameDay,
                              TickData, TickDataSim)
 from ..messaging.cache import get_cache
 from ..utils.config import Config
@@ -41,13 +41,14 @@ O_REJECTED = "rejected"
 _TICK_SEC = 1.0          # 1x 速度每秒推送一根 tick
 _CLOCK_INTERVAL = 0.1    # 时钟推进周期（秒）
 
-# 按 tick 表现存快照聚合写入 day_kline（天维度真实行情，与 tick 表对齐）的
-# upsert 模板（表名白名单拼接）。快照口径：volume/amount 为当日累计值，取末条
-# 快照（array_agg DESC [1]）而非 sum；high/low=max/min 各快照滚动极值；
-# open（今开）为当日常量：hint 有效则写 hint，否则保留库内旧值（INSERT 时以
-# 首条快照 close 兑底）。last_close 维护链见 refresh_day 注释
-_DAY_KLINE_UPSERT_SQL = """
-INSERT INTO day_kline (code, trade_date, data_source, open, high, low, close,
+# 按 tick 表现存快照聚合 upsert 到 game_days（天维度真实行情，与 tick 表
+# 对齐的日期管理唯一权威表）的模板（表名白名单拼接）。快照口径：
+# volume/amount 为当日累计值，取末条快照（array_agg DESC [1]）而非 sum；
+# high/low=max/min 各快照滚动极值；open（今开）为当日常量：hint 有效则写
+# hint，否则保留库内旧值（INSERT 时以首条快照 close 兑底）。last_close 维护
+# 链见 refresh_day 注释
+_GAME_DAY_UPSERT_SQL = """
+INSERT INTO game_days (code, trade_date, data_source, open, high, low, close,
                        volume, amount, last_close, tick_count, first_time_key,
                        last_time_key, is_complete)
 SELECT :code, :trade_date, :data_source,
@@ -62,7 +63,7 @@ SELECT :code, :trade_date, :data_source,
 FROM {table}
 WHERE code = :code AND trade_date = :trade_date
 ON CONFLICT (code, trade_date, data_source) DO UPDATE SET
-  open = CASE WHEN :open_hint > 0 THEN :open_hint ELSE day_kline.open END,
+  open = CASE WHEN :open_hint > 0 THEN :open_hint ELSE game_days.open END,
   high = EXCLUDED.high, low = EXCLUDED.low, close = EXCLUDED.close,
   volume = EXCLUDED.volume, amount = EXCLUDED.amount,
   tick_count = EXCLUDED.tick_count,
@@ -70,18 +71,7 @@ ON CONFLICT (code, trade_date, data_source) DO UPDATE SET
   last_time_key = EXCLUDED.last_time_key,
   is_complete = EXCLUDED.is_complete,
   last_close = CASE WHEN EXCLUDED.last_close > 0 THEN EXCLUDED.last_close
-                    ELSE day_kline.last_close END,
-  updated_at = now()
-"""
-
-# game_days（游戏选择/管理层）派生同步：is_complete 随 day_kline，round_count 不覆盖
-_GAME_DAY_SYNC_SQL = """
-INSERT INTO game_days (code, trade_date, data_source, is_complete)
-SELECT code, trade_date, data_source, is_complete
-FROM day_kline
-WHERE code = :code AND trade_date = :trade_date AND data_source = :data_source
-ON CONFLICT (code, trade_date, data_source) DO UPDATE SET
-  is_complete = EXCLUDED.is_complete,
+                    ELSE game_days.last_close END,
   updated_at = now()
 """
 
@@ -178,11 +168,12 @@ class GameEngine:
 
     @_ensure_ctx
     def _day_map(self, code: str) -> dict:
-        """标的可开局交易日来源映射（仅完整交易日）
+        """标的可开局交易日来源映射（仅完整交易日，权威源：game_days）
 
-        返回 {trade_date: {"qmt": bool, "sim": bool}}；数据来自 game_days
-        （游戏选择/管理层，is_complete=true 即该日末根 tick >= 15:00:00，
-        由 day_kline 在行情入库时派生同步）。
+        返回 {trade_date: {"qmt": bool, "sim": bool}}；game_days 为天维度真实
+        行情表（与 tick 表对齐，行情入库时维护刷新），is_complete=true 即该日
+        末根 tick >= 15:00:00。日期选择/管理一律以 game_days 为准（tick 表仅
+        在游戏运行时读取）。
         """
         result = {}
         rows = (db.session.query(GameDay.trade_date, GameDay.data_source)
@@ -226,17 +217,17 @@ class GameEngine:
     def date_details(self, code: str, allow_sim: bool = False) -> list:
         """可运行交易日 + 天维度原始行情（选择/开局界面用，QMT 优先）
 
-        可开局判定来自 game_days（选择/管理层），行情元数据
-        （tick_count/OHLC/last_close 等）从 day_kline 读取（与 tick 表对齐
-        的原始数据，入库时维护），不触碰 tick 行情表。
+        可开局判定与行情元数据（tick_count/OHLC/last_close 等）均来自
+        game_days（权威源：与 tick 对齐的天维度真实行情，is_complete 完整日
+        标记），不触碰 tick 行情表。
         """
         items = self._date_items(code, allow_sim)
         if not items:
             return []
-        klines = (DayKline.query.filter(
-                  DayKline.code == code,
-                  DayKline.trade_date.in_(list(items)),
-                  DayKline.is_complete.is_(True)).all())
+        klines = (GameDay.query.filter(
+                  GameDay.code == code,
+                  GameDay.trade_date.in_(list(items)),
+                  GameDay.is_complete.is_(True)).all())
         meta = {(d.trade_date, d.data_source): d for d in klines}
         result = []
         for trade_date, src in items.items():
@@ -293,8 +284,6 @@ class GameEngine:
         )
         db.session.add(r)
         db.session.commit()
-        # 该日已创建轮次数 +1（game_days 选择/管理层，随创建/删除物理维护）
-        self._adjust_round_count(code, trade_date, r.data_source, 1)
         logger.info("创建轮次 id=%s code=%s date=%s source=%s",
                     r.id, code, trade_date, r.data_source)
         return r, ""
@@ -313,7 +302,6 @@ class GameEngine:
             # 手动级联删除（SQLAlchemy 不自动级联）：委托/成交/轮次行全部物理删除
             GameOrder.query.filter_by(round_id=round_id).delete()
             GameTrade.query.filter_by(round_id=round_id).delete()
-            code, trade_date, data_source = r.code, r.trade_date, r.data_source or "qmt"
             db.session.delete(r)
             db.session.commit()
 
@@ -322,9 +310,6 @@ class GameEngine:
             cache.delete_account(round_id)
             cache.delete_progress(round_id)
             cache.delete_quote(str(round_id))
-
-            # 该日已创建轮次数 -1（随删除物理回落，不留计数残留）
-            self._adjust_round_count(code, trade_date, data_source, -1)
             return True, ""
 
     @_ensure_ctx
@@ -457,7 +442,7 @@ class GameEngine:
             })
             prev_v, prev_a = v, a
 
-        # 当日常量填充（昨收 + 今开）：来自 day_kline 天维度真实行情（快照入库
+        # 当日常量填充（昨收 + 今开）：来自 game_days 天维度真实行情（快照入库
         # 时维护，缺失时昨收从 stock_kline 回补、今开以首条快照 close 兑底），
         # 统一写入每根 tick，保证推送给前端的昨收/今开恒为有效数值（与 REST
         # ticks 恢复接口同口径，详见 normalize_day_constants）
@@ -543,7 +528,7 @@ class GameEngine:
                                 data_source: str) -> list:
         """当日常量填充（调用方须处于 app context，勿套 _ensure_ctx）
     
-        昨收（上一交易日收盘）与今开（当日开盘）为日维度常量，由 day_kline 表在
+        昨收（上一交易日收盘）与今开（当日开盘）为日维度常量，由 game_days 表在
         行情入库时维护（与 tick 表对齐；tick 表已不再存 last_close/open）。此处
         读取当日记录值并统一写入每根 tick dict，保证引擎 _load_context 与 REST
         ticks 恢复接口同口径；当日昨收无有效值时以前一完整交易日的 close 兑底
@@ -562,7 +547,7 @@ class GameEngine:
         return ticks
 
     def day_last_close(self, code: str, trade_date: str, data_source: str) -> float:
-        """当日昨收：优先 day_kline 记录 last_close（调用方须处于 app context）
+        """当日昨收：优先 game_days 记录 last_close（调用方须处于 app context）
 
         无效（缺失/0/NaN）时以更早完整交易日的 close 兜底（同数据源优先，
         其次另一数据源），语义即上一交易日收盘价；无更早完整日时返回 0
@@ -573,69 +558,43 @@ class GameEngine:
             return float(day.last_close)
         other = "sim" if data_source == "qmt" else "qmt"
         for src in (data_source, other):
-            prev = (DayKline.query.filter(
-                    DayKline.code == code,
-                    DayKline.data_source == src,
-                    DayKline.is_complete.is_(True),
-                    DayKline.trade_date < trade_date)
-                    .order_by(DayKline.trade_date.desc()).first())
+            prev = (GameDay.query.filter(
+                    GameDay.code == code,
+                    GameDay.data_source == src,
+                    GameDay.is_complete.is_(True),
+                    GameDay.trade_date < trade_date)
+                    .order_by(GameDay.trade_date.desc()).first())
             if prev and _valid_price(prev.close):
                 return float(prev.close)
         return 0.0
 
     def _day_row(self, code: str, trade_date: str, data_source: str):
-        """查询某日 day_kline 记录（调用方须处于 app context）
+        """查询某日 game_days 记录（调用方须处于 app context）
 
         先按指定数据源精确查；查不到时回退同日任意数据源（避免记录缺失时
         昨收完全不可用）。
         """
-        day = (DayKline.query.filter_by(code=code, trade_date=trade_date,
-                                        data_source=data_source).first())
+        day = (GameDay.query.filter_by(code=code, trade_date=trade_date,
+                                       data_source=data_source).first())
         if day is None:
-            day = (DayKline.query.filter_by(code=code, trade_date=trade_date)
+            day = (GameDay.query.filter_by(code=code, trade_date=trade_date)
                    .first())
         return day
 
-    # ── game_days 天维度记录维护 ──
-
-    def _adjust_round_count(self, code: str, trade_date: str, data_source: str,
-                            delta: int) -> None:
-        """维护 game_days.round_count（该日已创建轮次数：创建 +1 / 删除 -1，下限 0）
-
-        调用方须处于 app context；game_days 行缺失（理论不发生：轮次只能建于
-        game_days 已登记的完整交易日）时仅记录日志，不影响轮次主流程。
-        """
-        try:
-            db.session.execute(
-                text("UPDATE game_days "
-                     "SET round_count = GREATEST(round_count + :delta, 0), "
-                     "updated_at = now() "
-                     "WHERE code = :code AND trade_date = :trade_date "
-                     "AND data_source = :data_source"),
-                {"delta": delta, "code": code, "trade_date": trade_date,
-                 "data_source": data_source})
-            db.session.commit()
-        except Exception as e:
-            db.session.rollback()
-            logger.warning("维护 game_days.round_count 失败 code=%s date=%s: %s",
-                           code, trade_date, e)
-
     def refresh_day(self, code: str, trade_date: str, data_source: str,
                     last_close_hint: float = 0.0, open_hint: float = 0.0) -> bool:
-        """快照入库后同步维护天维度真实行情 day_kline（与 tick 表对齐）
+        """快照入库后同步维护 game_days 天维度真实行情（与 tick 表对齐）
 
         调用方须处于 app context（行情上传/批量写入后调用，勿套 _ensure_ctx）。
         昨收写入前确定链：hint（上传/生成方携带）> 库内有效旧值 > stock_kline
         天维度回补（_kline_last_close）；三者均无效时拒绝写入——last_close
-        无效（空/0）的日行情视为异常数据，不入库、不派生 game_days，返回 False
-        （调用方应提示错误；已入库的快照行情本身不受影响）。
+        无效（空/0）的日行情视为异常数据，不入库，返回 False（调用方应提示
+        错误；已入库的快照行情本身不受影响）。
         今开（open）为当日常量随 open_hint 维护，缺失时保留库内旧值（全新日以
         首条快照 close 兑底）。
-        写入两步：
-        1) day_kline：按 tick 表现存快照聚合当日终值（条数/首末时间/极值/末条
-           累计量额均对账自 tick），昨收取确定链结果；
-        2) game_days：游戏选择/管理层派生同步（is_complete 随 day_kline）。
-        游戏选择与开局数据读取不再扫描 tick 表（tick 表仅游戏运行时使用）。
+        单表 upsert：按 tick 表现存快照聚合当日终值（条数/首末时间/极值/末条
+        累计量额均对账自 tick），昨收取确定链结果；游戏选择与开局数据读取
+        不再扫描 tick 表（tick 表仅游戏运行时使用）。
         """
         if data_source not in ("qmt", "sim"):
             return False
@@ -652,7 +611,7 @@ class GameEngine:
                 lc = self._kline_last_close(code, trade_date)
         if not _valid_price(lc):
             logger.warning(
-                "刷新 day_kline 拒绝: %s %s %s 昨收缺失（last_close hint/库内旧值/"
+                "刷新 game_days 拒绝: %s %s %s 昨收缺失（last_close hint/库内旧值/"
                 "stock_kline 均无效），异常日行情不入库，请携带有效 last_close 后重试",
                 code, trade_date, data_source)
             return False
@@ -662,21 +621,20 @@ class GameEngine:
                   "last_close": lc, "open_hint": oh}
         try:
             db.session.execute(
-                text(_DAY_KLINE_UPSERT_SQL.format(table=table)), params)
-            db.session.execute(text(_GAME_DAY_SYNC_SQL), params)
+                text(_GAME_DAY_UPSERT_SQL.format(table=table)), params)
             db.session.commit()
         except Exception as e:
             db.session.rollback()
-            logger.warning("刷新 day_kline/game_days 失败 code=%s date=%s src=%s: %s",
+            logger.warning("刷新 game_days 失败 code=%s date=%s src=%s: %s",
                            code, trade_date, data_source, e)
             return False
         return True
 
     def refresh_all_days(self, code: str = None, trade_date: str = None) -> int:
-        """全量重建 day_kline/game_days（迁移/修复用，调用方须处于 app context）
+        """全量重建 game_days（迁移/修复用，调用方须处于 app context）
 
-        遍历 tick_data / tick_data_sim 现存日期逐日刷新（先写 day_kline 再
-        派生 game_days），返回处理日期数。
+        遍历 tick_data / tick_data_sim 现存日期逐日刷新（单表 upsert），返回
+        处理日期数。
         """
         pairs = set()
         for model, src in ((TickData, "qmt"), (TickDataSim, "sim")):
@@ -691,7 +649,7 @@ class GameEngine:
                 continue
             if self.refresh_day(c, d, src):
                 n += 1
-        logger.info("day_kline/game_days 重建完成: %d 日", n)
+        logger.info("game_days 重建完成: %d 日", n)
         return n
 
     def _kline_last_close(self, code: str, trade_date: str) -> float:

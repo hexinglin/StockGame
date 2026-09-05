@@ -20,7 +20,8 @@ import datetime
 import os
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, PROJECT_ROOT)
 
 from app.utils.config import Config
 from mock_agent import (get_conn, log, load_minutes_from_autotrade,
@@ -41,7 +42,7 @@ def upsert_sim_ticks(dsn: str, code: str, date: str, ticks: list,
     close 为最新价；逐行 INSERT ... ON CONFLICT DO UPDATE，数据库按
     (code, time_key) 自动去重并保留最新写入值。重复转换同一日时，已存在的行
     被覆盖更新，无残留重复记录，中途失败也不会丢旧数据。写入完成后同步写入
-    day_kline（与 tick 对齐）并派生 game_days（昨收随生成值维护，今开取 open_hint）。
+    game_days（与 tick 对齐）天维度行情（昨收随生成值维护，今开取 open_hint）。
     """
     conn = get_conn(dsn)
     try:
@@ -67,7 +68,7 @@ def upsert_sim_ticks(dsn: str, code: str, date: str, ticks: list,
         cur.close()
         log("upsert tick_data_sim: code=%s date=%s 共 %d 条快照（已按 code+time_key 去重，保留最新）"
             % (code, date, len(rows)))
-        # 同步写入 day_kline（与 tick 对齐）并派生 game_days（昨收 hint 取生成时的 last_close）
+        # 同步写入 game_days（与 tick 对齐）天维度行情（昨收 hint 取生成时的 last_close）
         if ticks:
             hint = next((float(t["last_close"]) for t in ticks
                          if t.get("last_close")), 0.0)
@@ -78,10 +79,10 @@ def upsert_sim_ticks(dsn: str, code: str, date: str, ticks: list,
 
 
 def verify(dsn: str, code: str, date: str):
-    """入库校验：条数 / 时间范围 / OHLC 区间 / day_kline 对齐记录（快照口径）
+    """入库校验：条数 / 时间范围 / OHLC 区间 / game_days 对齐记录（快照口径）
 
     标准完整日 = 241 根 1min × 20 点 = 4820 条（仅提示，不视为错误）；
-    day_kline.volume/amount 应等于 tick_data_sim 末条快照的当日累计值。
+    game_days.volume/amount 应等于 tick_data_sim 末条快照的当日累计值。
     """
     conn = get_conn(dsn)
     try:
@@ -91,7 +92,7 @@ def verify(dsn: str, code: str, date: str):
             "FROM tick_data_sim WHERE code=%s AND trade_date=%s", (code, date))
         cnt, t0, t1, lo, hi = cur.fetchone()
         cur.execute(
-            "SELECT last_close, is_complete, tick_count FROM day_kline "
+            "SELECT last_close, is_complete, tick_count FROM game_days "
             "WHERE code=%s AND trade_date=%s AND data_source='sim'", (code, date))
         day = cur.fetchone()
         cur.execute(
@@ -106,12 +107,12 @@ def verify(dsn: str, code: str, date: str):
             lc, complete, dkcnt = day
             aligned = "对齐" if dkcnt == cnt else "不对齐(%s vs %s)" % (dkcnt, cnt)
             log("校验: %s %s 共 %d 条, 时间 %s ~ %s, low=%s, high=%s, "
-                "day_kline 昨收=%s, 完整日=%s, tick 对账=%s, "
+                "game_days 昨收=%s, 完整日=%s, tick 对账=%s, "
                 "末条累计 volume=%s amount=%s"
                 % (code, date, cnt, t0, t1, lo, hi, lc, complete, aligned,
                    last_v, last_a))
         else:
-            log("警告: %s %s 无 day_kline 日记录，请检查 sync_game_day 是否执行"
+            log("警告: %s %s 无 game_days 日记录，请检查 sync_game_day 是否执行"
                 % (code, date))
         return cnt
     finally:
@@ -121,7 +122,8 @@ def verify(dsn: str, code: str, date: str):
 def main():
     parser = argparse.ArgumentParser(
         description="stockkline 1min → 3s 转换（一次仅一个交易日）")
-    parser.add_argument("--config", default="config.yaml")
+    parser.add_argument("--config", default=None,
+                        help="配置文件路径（默认 $STOCKGAME_CONFIG 或项目根 config.yaml）")
     parser.add_argument("--code", default=DEFAULT_CODE,
                         help="股票代码，默认 %s（改脚本 DEFAULT_CODE）" % DEFAULT_CODE)
     parser.add_argument("--date", default=DEFAULT_DATE,
@@ -136,7 +138,9 @@ def main():
         log("错误: --date 格式应为 YYYY-MM-DD，且一次只能转换一个交易日")
         sys.exit(1)
 
-    cfg = Config.get_instance(args.config)
+    cfg = Config.get_instance(
+        args.config or os.environ.get("STOCKGAME_CONFIG")
+        or os.path.join(PROJECT_ROOT, "config.yaml"))
     auto_dsn = cfg.get("data_source.autotrade_dsn", "")
     dsn = cfg.get("database.path", "")
     if not auto_dsn:

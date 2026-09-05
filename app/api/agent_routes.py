@@ -19,8 +19,8 @@ logger = logging.getLogger(__name__)
 agent_bp = Blueprint("agent", __name__, url_prefix="/api/v1/agent")
 
 # SQL 兼容 upsert（PG 9.5+）；今开 open / 昨收 last_close 为当日常量不再入库
-# tick 表（快照字段最小化），由下方 refresh_day 作为 hint 维护到 day_kline
-# （开局原始数据，game_days 随之派生）
+# tick 表（快照字段最小化），由下方 refresh_day 作为 hint 维护到 game_days
+# （天维度行情 + 日期管理唯一权威表）
 _UPSERT_TICK_SQL = text("""
 INSERT INTO tick_data (code, trade_date, time_key, high, low, close, volume, amount, created_at)
 VALUES (:code, :trade_date, :time_key, :high, :low, :close, :volume, :amount, :created_at)
@@ -39,7 +39,7 @@ def upload_tick():
     body: {agent_name, code, time_key, high, low, close, volume, amount,
            last_close?, open?}；字段为快照语义（close=最新价、high/low=当日
     滚动极值、volume/amount=当日累计量额）；last_close/open 为当日常量，仅作为
-    hint 维护到 day_kline（tick 表不存该字段）。
+    hint 维护到 game_days（tick 表不存该字段）。
     """
     data = request.get_json(silent=True) or {}
     code = data.get("code", "")
@@ -72,7 +72,7 @@ def upload_tick():
         return jsonify({"code": 500, "message": f"tick 入库失败: {e}"}), 500
 
     # 同步维护天维度真实行情（昨收/今开 hint 随上传携带，缺失时引擎按链兑底）；
-    # day_kline 生成与 tick 入库解耦：昨收暂缺仅暂缓 day 侧，tick 入库不阻断
+    # game_days 生成与 tick 入库解耦：昨收暂缺仅暂缓 day 侧，tick 入库不阻断
     from ..engine.game_engine import get_engine
     engine = get_engine()
     day_ok = engine.refresh_day(code, trade_date, "qmt",
@@ -82,7 +82,7 @@ def upload_tick():
     # 更新 agent_status.last_tick_at（无论 day 是否暂缓，agent 活跃状态照常维护）
     _touch_agent(agent_name, tick=True)
 
-    # 更新 Redis 最新行情快照（全局 live）；昨收取 day_kline 维护值
+    # 更新 Redis 最新行情快照（全局 live）；昨收取 game_days 维护值
     cache = get_cache()
     cache.save_quote("live", {
         "code": code, "time_key": time_key,
@@ -91,10 +91,10 @@ def upload_tick():
     })
 
     if not day_ok:
-        # tick 已真正入库；day_kline/game_days 因昨收缺失暂缓生成（不写脏数
+        # tick 已真正入库；game_days 因昨收缺失暂缓生成（不写脏数
         # 据），后续携带有效 last_close 的 tick 上传会自动补齐（refresh_day
         # 幂等，按 tick 表现存数据全量对账），亦可用 refresh_all_days 重建
-        return jsonify({"code": 0, "message": "tick 已入库；day_kline 暂缓生成"
+        return jsonify({"code": 0, "message": "tick 已入库；game_days 暂缓生成"
                         "（昨收缺失），后续携带有效 last_close 将自动补齐"})
 
     return jsonify({"code": 0, "message": "ok"})

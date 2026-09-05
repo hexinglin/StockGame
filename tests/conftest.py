@@ -12,7 +12,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
 from app.main import create_app
 from app.dbdata.database import db
 from app.dbdata.models import (TickData, TickDataSim, GameRound, GameOrder,
-                                GameTrade, GameDay, DayKline)
+                                GameTrade, GameDay)
 from app.messaging.cache import get_cache
 from app.engine.game_engine import get_engine
 
@@ -39,7 +39,7 @@ def test_data(app):
     """生成一个完整小交易日的快照行情（3 根 1min bar × 20 = 60 条快照）
 
     快照口径：volume/amount 为当日累计（单调不减）、high/low 为滚动极值、
-    close 为最新价；day_kline 聚合时 volume/amount 取末条累计（非 sum）。
+    close 为最新价；game_days 聚合时 volume/amount 取末条累计（非 sum）。
     """
     from mock_agent import gen_snapshots_from_minutes
 
@@ -63,7 +63,7 @@ def test_data(app):
                 volume=t["volume"], amount=t["amount"],
             ))
         db.session.commit()
-        # 同步写入 day_kline（与 tick 对齐）并派生 game_days：开局/昨收读 day_kline
+        # 同步写入 game_days（与 tick 对齐）天维度行情：开局/昨收读 game_days
         get_engine().refresh_day(TEST_CODE, TEST_DATE, "qmt",
                                  last_close_hint=1.00, open_hint=1.00)
 
@@ -85,15 +85,10 @@ def _cleanup(app):
         db.session.delete(r)
     TickData.query.filter_by(code=TEST_CODE).delete()
     TickDataSim.query.filter_by(code=TEST_CODE).delete()
-    DayKline.query.filter_by(code=TEST_CODE).delete()
     GameDay.query.filter_by(code=TEST_CODE).delete()
     db.session.commit()
-    # 轮次行随批量清理物理删除后，game_days 计数同步回落（口径同 delete_round）
-    engine = get_engine()
-    for r in rounds:
-        engine._adjust_round_count(r.code, r.trade_date, r.data_source or "qmt", -1)
     # 重置引擎内存态
-    engine._rounds.clear()
+    get_engine()._rounds.clear()
 
 
 @pytest.fixture()

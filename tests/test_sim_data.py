@@ -11,7 +11,7 @@ import pytest
 
 from app.dbdata.database import db
 from app.dbdata.models import (TickDataSim, GameRound, GameOrder, GameTrade,
-                                GameDay, DayKline)
+                                GameDay)
 from app.messaging.cache import get_cache
 from app.engine.game_engine import get_engine
 
@@ -37,8 +37,8 @@ def _make_sim_ticks(code, date, last_close=1.10):
             volume=t["volume"], amount=t["amount"],
         ))
     db.session.commit()
-    # 同步写入 day_kline（与 tick 对齐）并派生 game_days：sim 日可见读 game_days，
-    # 开局原始数据（昨收/今开）读 day_kline；今开为当日常量随 hint 维护
+    # 同步写入 game_days（与 tick 对齐）天维度行情：sim 日可见性/开局原始数据
+    # （昨收/今开）均读 game_days；今开为当日常量随 hint 维护
     get_engine().refresh_day(code, date, "sim", last_close_hint=last_close,
                              open_hint=bars[0]["open"])
     return len(ticks)
@@ -56,14 +56,9 @@ def _cleanup_sim(app, code):
             get_cache().delete_quote(str(r.id))
             db.session.delete(r)
         TickDataSim.query.filter_by(code=code).delete()
-        DayKline.query.filter_by(code=code).delete()
         GameDay.query.filter_by(code=code).delete()
         db.session.commit()
-        engine = get_engine()
-        # 轮次行随批量清理物理删除后，game_days 计数同步回落（口径同 delete_round）
-        for r in rounds:
-            engine._adjust_round_count(r.code, r.trade_date, r.data_source or "qmt", -1)
-        engine._rounds.clear()
+        get_engine()._rounds.clear()
 
 
 @pytest.fixture()
