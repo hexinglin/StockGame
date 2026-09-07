@@ -21,8 +21,26 @@ from ..dbdata.models import (GameRound, GameOrder, GameTrade, GameDay,
 from ..messaging.cache import get_cache
 from ..utils.config import Config
 from .account import MockAccount
+from .grid_math import (normalize_params, build_grid_rows, mark_grid_status)
 
 logger = logging.getLogger(__name__)
+
+
+def _parse_game_time(time_key: str):
+    """行情 time_key（游戏时间 'YYYY-MM-DD HH:MM:SS'）→ datetime
+
+    委托/成交时间一律记游戏时间（行情时间轴），绝不使用真实时间——行情为
+    历史交易日时订单同样按历史日期落库，与前端分时图时间轴保持一致；
+    time_key 缺失/格式异常时返回 None（调用方自行兜底）。
+    """
+    if not time_key:
+        return None
+    try:
+        return datetime.strptime(time_key, "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        logger.warning("解析游戏时间失败: %r，订单时间记 None", time_key)
+        return None
+
 
 # 轮次状态
 ST_READY = "ready"
@@ -40,6 +58,49 @@ O_REJECTED = "rejected"
 
 _TICK_SEC = 1.0          # 1x 速度每秒推送一根 tick
 _CLOCK_INTERVAL = 0.1    # 时钟推进周期（秒）
+
+# ── 交易时段划分（盘前集合竞价 / 盘中连续 / 收盘集合竞价 / 盘后）──
+# A 股交易日结构：09:15-09:25 开盘集合竞价（09:25 出竞价价），09:25-09:30
+# 竞价等待段，09:30-11:30/13:00-14:57 连续竞价，14:57-15:00 收盘集合竞价
+# （只挂不撤），15:00 收盘。盘后（>15:00，如固定价交易）不进入游戏。
+_SESSION_PRE_FILL = "09:25:00"        # 开盘集合竞价撮合时点（出竞价价）
+_SESSION_CLOSING_START = "14:57:00"   # 收盘集合竞价开始（此后只挂不撤）
+_SESSION_DAY_END = "15:00:00"         # 交易日收盘（最后一根 tick）
+
+
+def _time_hms(time_key: str) -> str:
+    """取 time_key 的 HH:MM:SS 部分（格式异常时原样返回，供字符串比较）"""
+    return time_key[11:19] if len(time_key) >= 19 else time_key
+
+
+def _session_of(time_key: str) -> str:
+    """按 time_key 判定当前所属交易时段: pre / intraday / closing / post
+
+    - pre      盘前集合竞价（< 09:30:00，含 09:25 出竞价价）
+    - intraday 盘中连续竞价（09:30:00 ~ 14:56:59）
+    - closing  收盘集合竞价（14:57:00 ~ 15:00:00，只挂不撤）
+    - post     盘后（> 15:00:00，应被上层过滤，正常情况下不会到达）
+    """
+    hms = _time_hms(time_key)
+    if hms < "09:30:00":
+        return "pre"
+    if hms >= _SESSION_CLOSING_START:
+        return "closing" if hms <= _SESSION_DAY_END else "post"
+    return "intraday"
+
+
+def _is_auction_point(time_key: str) -> bool:
+    """当前 tick 是否为（开盘/收盘）集合竞价撮合点
+
+    返回 True 表示该 tick 时刻已到竞价撮合时点（盘前 09:25 后、收盘 15:00），
+    应以其最新价作为竞价价集中撮合；False 表示竞价等待期（只挂不撮）。
+    """
+    hms = _time_hms(time_key)
+    if hms < "09:30:00":
+        return hms >= _SESSION_PRE_FILL
+    if hms >= _SESSION_CLOSING_START:
+        return hms >= _SESSION_DAY_END
+    return False  # 盘中连续竞价，逐 tick 以最新价触及即成交（非竞价口径）
 
 # 按 tick 表现存快照聚合 upsert 到 game_days（天维度真实行情，与 tick 表
 # 对齐的日期管理唯一权威表）的模板（表名白名单拼接）。快照口径：
@@ -158,7 +219,22 @@ class GameEngine:
             "initial_cash": float(cfg.get("game.initial_cash", 500000)),
             "fee_rate": float(cfg.get("game.fee_rate", 0.0001)),
             "stock_code": cfg.get("game.stock_code", "588000.SH"),
+            # 网格表参数（Redis 覆盖优先，config.yaml game.grid 默认透底）
+            "grid": self._grid_params(),
         }
+
+    def _grid_params(self) -> dict:
+        """网格参数：Redis 覆盖值优先，否则 config.yaml game.grid 默认值兜底"""
+        cfg = Config.get_instance()
+        override = get_cache().load_config("grid")
+        raw = override if override else cfg.get("game.grid", None)
+        return normalize_params(raw)
+
+    def save_grid_params(self, params: dict) -> dict:
+        """保存网格参数覆盖（写 Redis），返回归一化后的参数"""
+        norm = normalize_params(params)
+        get_cache().save_config("grid", norm)
+        return norm
 
     # ── 可用交易日（基于 game_days 天维度记录，不扫 tick 表）──
 
@@ -400,6 +476,63 @@ class GameEngine:
             "account": acct,
         }
 
+    @_ensure_ctx
+    def get_grid(self, round_id: int) -> dict:
+        """网格表数据：网格行 + 触发状态（结单/成交推导），供前端「网格表」tab 渲染
+
+        锚点价确定链：昨收（day_last_close）> 最新成交价 > 引擎首根快照 close；
+        持仓量取账户 volume（底仓 + 买卖，均分到每格）。网格参数取自 config game.grid。
+        """
+        r = GameRound.query.get(round_id)
+        if not r:
+            return None
+
+        params = self._cfg()["grid"]
+        ctx = self._rounds.get(round_id)
+        acct = None
+        if ctx and ctx.acct:
+            acct = ctx.acct
+        elif r.status in (ST_RUNNING, ST_PAUSED, ST_FINISHED):
+            acct_dict = get_cache().load_account(round_id)
+            acct = MockAccount.from_dict(acct_dict) if acct_dict else None
+
+        # 锚点价（昨收优先）
+        anchor = self.day_last_close(r.code, r.trade_date, r.data_source or "qmt")
+        if not _valid_price(anchor):
+            anchor = r.last_price or 0
+        if not _valid_price(anchor) and ctx and ctx.ticks:
+            anchor = float(ctx.ticks[ctx.index]["close"] or 0)
+        if not _valid_price(anchor) and acct and _valid_price(acct.last_price):
+            anchor = float(acct.last_price)
+        anchor = round(float(anchor), 3)
+
+        volume = int(acct.volume) if acct else int(r.base_shares or 0)
+
+        # 成交记录（触发状态推导）
+        trades = self.list_trades(round_id)
+        rows = build_grid_rows(anchor, volume, params)
+        mark_grid_status(rows, trades, params)
+
+        return {
+            "round_id": round_id,
+            "anchor_price": anchor,
+            "last_price": r.last_price,
+            "total_shares": volume,
+            "params": params,
+            "rows": [
+                {
+                    "idx": x["idx"],
+                    "buy_price": x["buy_price"],
+                    "sell_price": x["sell_price"],
+                    "shares": x["shares"],
+                    "status": x["status"],
+                    "buy_hit": x["buy_hit"],
+                    "sell_hit": x["sell_hit"],
+                }
+                for x in rows
+            ],
+        }
+
     # ── 启动 / 暂停 / 变速 ──
 
     def _load_context(self, round_id: int) -> (RoundContext, str):
@@ -415,11 +548,16 @@ class GameEngine:
             return None, "轮次不存在"
 
         ctx = RoundContext(r)
-        # 加载该日 tick（按轮次数据源: qmt → tick_data，sim → tick_data_sim）
+        # 加载该日 tick（按轮次数据源: qmt → tick_data，sim → tick_data_sim）。
+        # 过滤盘后数据（> 15:00:00，如固定价交易尾巴）：游戏只播盘前集合竞价 /
+        # 盘中连续 / 收盘集合竞价（末根为 15:00:00 收盘价，is_last 据此结算），
+        # 盘后不计入游戏、不到盘后结束才结算（避免虚拟盘后被当作持续推进）。
         m = self._tick_model(r.data_source)
+        day_end = f"{r.trade_date} {_SESSION_DAY_END}"
         ticks = (
             db.session.query(m)
-            .filter(m.code == r.code, m.trade_date == r.trade_date)
+            .filter(m.code == r.code, m.trade_date == r.trade_date,
+                    m.time_key <= day_end)
             .order_by(m.time_key)
             .all()
         )
@@ -829,6 +967,9 @@ class GameEngine:
                     return False, None, "可卖持仓不足"
 
             order_id = "R%d_%s" % (round_id, uuid.uuid4().hex[:12].upper())
+            # 委托时间记游戏时间：最后已播出快照的 time_key（尚未开播时以首根
+            # 快照时间兑底），与行情时间轴一致而非真实时间
+            game_now = ctx.round.last_time_key or ctx.ticks[0]["time_key"]
             order = GameOrder(
                 order_id=order_id,
                 round_id=round_id,
@@ -838,6 +979,7 @@ class GameEngine:
                 price=price,
                 shares=shares,
                 status=O_PENDING,
+                created_at=_parse_game_time(game_now),
                 frozen_amount=acct.frozen_amount(price, shares) if direction == "buy" else 0,
             )
             db.session.add(order)
@@ -865,6 +1007,10 @@ class GameEngine:
                 return False, "委托不存在"
             if order.status != O_PENDING:
                 return False, f"仅 pending 状态可撤（当前: {order.status}）"
+            # 收盘集合竞价时段（14:57-15:00）只挂不撤（与真实收盘集合竞价规则一致）：
+            # 防止盘中挂单在收盘竞价被撤走、影响收盘集合竞价撮合成交
+            if r.last_time_key and _session_of(r.last_time_key) == "closing":
+                return False, "收盘集合竞价时段（14:57-15:00）不可撤单"
 
             # 解冻
             if ctx and ctx.acct:
@@ -970,15 +1116,33 @@ class GameEngine:
             "progress": round(ctx.index / len(ctx.ticks) * 100, 1) if ctx.ticks else 0,
         }, room=f"round_{r.id}")
 
-        # 撮合所有 pending 订单（按委托时间排序）
+        # 撮合所有 pending 订单（按委托时间排序）。按交易时段分流：
+        #   - 盘中连续竞价（intraday）：每根 tick 以最新价触及即成交（默认口径）
+        #   - 开盘/收盘集合竞价点（auction）：以竞价价（=该 tick 最新价）集中撮合
+        #   - 竞价等待期（盘前 09:25 前、收盘 14:57-15:00 未到 15:00）：只挂不撮，
+        #     直接跳过（未来到竞价点再按竞价价集中处理）。
+        session = _session_of(tick["time_key"])
+        is_auction = session != "intraday" and _is_auction_point(tick["time_key"])
         filled_any = False
-        for order_id, order in list(ctx.pending.items()):
-            if order.status != O_PENDING:
-                ctx.pending.pop(order_id, None)
-                continue
-            if self._try_fill(ctx, order, tick):
-                filled_any = True
-                ctx.pending.pop(order_id, None)
+        if is_auction:
+            auction_price = tick["close"]
+            for order_id, order in list(ctx.pending.items()):
+                if order.status != O_PENDING:
+                    ctx.pending.pop(order_id, None)
+                    continue
+                if self._try_fill(ctx, order, tick, auction_price=auction_price):
+                    filled_any = True
+                    ctx.pending.pop(order_id, None)
+        elif session == "intraday":
+            auction_price = None
+            for order_id, order in list(ctx.pending.items()):
+                if order.status != O_PENDING:
+                    ctx.pending.pop(order_id, None)
+                    continue
+                if self._try_fill(ctx, order, tick):
+                    filled_any = True
+                    ctx.pending.pop(order_id, None)
+        # else: 竞价等待期（pre 未到 09:25 / closing 未到 15:00）——只挂不撮，跳过
 
         # 本 tick 无成交 → 周期性持久化轮次行情（last_price/last_time_key）。
         # 高速档每 tick 都 commit 远程库开销极大（x60≈60 次/秒），改为每 10 tick 一次；
@@ -995,27 +1159,41 @@ class GameEngine:
             self._settle(ctx.round.id, reason="收盘", auto=True)
 
     @_ensure_ctx
-    def _try_fill(self, ctx: RoundContext, order: GameOrder, tick: dict) -> bool:
+    def _try_fill(self, ctx: RoundContext, order: GameOrder, tick: dict,
+                  auction_price: float = None) -> bool:
         """尝试撮合一笔委托，成交返回 True；未触及返回 False
 
-        快照口径下 high/low 是截至该时刻的当日滚动极值，不代表本时刻可成交的
-        价格区间，因此限价单以最新价（快照 close）触发：买单价 <= 限价、
-        卖单价 >= 限价即成交（成交价=限价），市价单按最新价成交。
+        连续竞价（auction_price=None）：快照口径下 high/low 是截至该时刻的
+        当日滚动极值，不代表本时刻可成交的价格区间，因此限价单以最新价
+        （快照 close）触发：买单价 <= 限价、卖单价 >= 限价即成交（成交价=限价），
+        市价单按最新价成交。
+
+        集合竞价（auction_price 传入竞价价）：限价单以竞价价触发——买单限价 >= 竞价价
+        成交、卖单限价 <= 竞价价成交，成交价=竞价价（集合竞价以竞价价撮合，成交
+        价恒等于竞价价，而非限价）；市价单同样按竞价价成交。
         """
         acct = ctx.acct
         direction, otype, price, shares = order.direction, order.order_type, order.price, order.shares
+        if order.status != O_PENDING:
+            return False
         filled = False
         fill_price = price
 
         if otype == "limit":
-            if direction == "buy" and tick["close"] <= price:
-                filled = True
-            elif direction == "sell" and tick["close"] >= price:
-                filled = True
-            else:
+            if auction_price is not None:   # 集合竞价：限价以竞价价为基准
+                if direction == "buy" and price >= auction_price:
+                    filled, fill_price = True, auction_price
+                elif direction == "sell" and price <= auction_price:
+                    filled, fill_price = True, auction_price
+            else:                           # 连续竞价：限价以最新价为基准
+                if direction == "buy" and tick["close"] <= price:
+                    filled = True
+                elif direction == "sell" and tick["close"] >= price:
+                    filled = True
+            if not filled:
                 return False
         else:  # market
-            fill_price = tick["close"]
+            fill_price = auction_price if auction_price is not None else tick["close"]
             filled = True
 
         if not filled:
@@ -1057,7 +1235,8 @@ class GameEngine:
         order.filled_shares = shares
         order.filled_price = fill_price
         order.fee = fee
-        order.filled_at = datetime.now()
+        # 成交时间记游戏时间（当前撮合快照的 time_key），与成交记录 trade_time 同源
+        order.filled_at = _parse_game_time(tick["time_key"])
 
         # 累计已实现盈亏与手续费
         if direction == "buy":

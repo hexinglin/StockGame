@@ -20,6 +20,7 @@
         <div class="top-right">
             <span class="ws-status" id="wsStatus" title="与后端的实时推送连接状态（打开页面即建立）">● 未连接</span>
             <span class="data-time" id="dataTime"></span>
+            <button class="btn-config" onclick="openConfig('grid')" title="功能配置入口（网格参数等）">⚙ 配置</button>
             <button class="btn-refresh" onclick="loadAll()" title="刷新">⟳</button>
         </div>
     </header>
@@ -115,6 +116,7 @@
                 <span><i class="dot price-dot"></i>价格</span>
                 <span><i class="dot avg-dot"></i>均价</span>
                 <span><i class="dot pre-dot"></i>昨收</span>
+                <button class="legend-toggle" id="btnPreMarket" onclick="togglePreMarket()" title="显示/隐藏盘前集合竞价段（同花顺式竞价线）">盘前竞价</button>
                 <span class="legend-note">（1 分钟一个点，尾部点为实时跳变）</span>
             </div>
         </section>
@@ -153,12 +155,13 @@
         </aside>
     </div>
 
-    <!-- 下方 tab：委托/成交/持仓/账户 -->
+    <!-- 下方 tab：委托/成交/账户/网格表 -->
     <div class="records-panel">
         <nav class="records-tabs">
             <button class="rec-tab" data-tab="orders" onclick="switchRecTab('orders')">委托</button>
             <button class="rec-tab" data-tab="trades" onclick="switchRecTab('trades')">成交</button>
             <button class="rec-tab active" data-tab="account" onclick="switchRecTab('account')">账户</button>
+            <button class="rec-tab" data-tab="grid" onclick="switchRecTab('grid')">网格表</button>
         </nav>
         <div class="records-body">
             <table id="ordersTable" class="rec-table" style="display:none">
@@ -170,6 +173,31 @@
                 <tbody></tbody>
             </table>
             <div id="accountBox"></div>
+            <div id="gridBox" style="display:none"></div>
+        </div>
+    </div>
+</div>
+
+<!-- 配置浮层（网格等参数） -->
+<div class="help-overlay" id="configOverlay" style="display:none;">
+    <div class="config-panel" onclick="event.stopPropagation()">
+        <div class="config-head">
+            <h3 id="configTitle">⚙ 配置</h3>
+            <button class="config-close" onclick="closeConfig()">✕</button>
+        </div>
+        <div class="config-desc">网格表参数：锚点（昨收）上下各展开多行网格，每行 = 买点 + 卖点。<br>卖点 = 买点 + sell_gap_ratio×间距（"2x为卖点"）。</div>
+        <div class="config-form" id="configForm">
+            <div class="config-row"><label>grid_spacing</label><input type="number" id="cfg_spacing" step="0.001"><span class="cfg-note">网格间距</span></div>
+            <div class="config-row"><label>init_value</label><input type="number" id="cfg_init" step="0.001"><span class="cfg-note">买点线初始值</span></div>
+            <div class="config-row"><label>offset</label><input type="number" id="cfg_offset" step="0.001"><span class="cfg-note">off 值</span></div>
+            <div class="config-row"><label>sell_gap_ratio</label><input type="number" id="cfg_ratio" step="1"><span class="cfg-note">卖点=买点+N×间距</span></div>
+            <div class="config-row"><label>grid_up</label><input type="number" id="cfg_up" step="1"><span class="cfg-note">锚点上方行数</span></div>
+            <div class="config-row"><label>grid_down</label><input type="number" id="cfg_down" step="1"><span class="cfg-note">锚点下方行数</span></div>
+            <div class="config-row"><label>hit_tolerance</label><input type="number" id="cfg_tol" step="0.001"><span class="cfg-note">成交命中容差</span></div>
+        </div>
+        <div class="config-actions">
+            <button class="btn-primary" onclick="saveGridConfig()">保存</button>
+            <button class="btn-sm" onclick="closeConfig()">取消</button>
         </div>
     </div>
 </div>

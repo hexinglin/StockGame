@@ -210,6 +210,37 @@ def account(round_id):
     return _ok(data.get("account"))
 
 
+@game_bp.route("/rounds/<int:round_id>/grid", methods=["GET"])
+def grid(round_id):
+    """网格表：网格行（买点/卖点/均分股数）+ 成交触发状态推导
+
+    锚点基准：昨收 last_close（优先）> 最新成交价 > 首根快照 close。
+    """
+    data = get_engine().get_grid(round_id)
+    if not data:
+        return _err("轮次不存在", 404)
+    return _ok(data)
+
+
+# ── 网格配置 ──
+
+@game_bp.route("/config/grid", methods=["GET"])
+def get_grid_config():
+    """读取网格配置（Redis 覆盖优先，config.yaml 默认值兜底）"""
+    return _ok(get_engine()._grid_params())
+
+
+@game_bp.route("/config/grid", methods=["PUT"])
+def put_grid_config():
+    """保存网格配置（写 Redis，仅校验数值字段）"""
+    body = request.get_json(silent=True) or {}
+    allowed = {"grid_spacing", "init_value", "offset", "sell_gap_ratio",
+               "grid_up", "grid_down", "hit_tolerance"}
+    params = {k: v for k, v in body.items() if k in allowed and isinstance(v, (int, float))}
+    norm = get_engine().save_grid_params(params)
+    return _ok(norm, "网格配置已保存")
+
+
 @game_bp.route("/rounds/<int:round_id>/ticks", methods=["GET"])
 def ticks(round_id):
     """分时图恢复数据（该日全部快照的轻量字段，按轮次数据源读表）
@@ -220,13 +251,18 @@ def ticks(round_id):
     由 game_days 当日常量填充（缺失以首条 close 兑底，与引擎同口径）。
     """
     from ..dbdata.models import TickData, TickDataSim
+    from ..engine.game_engine import _SESSION_DAY_END
     r = GameRound.query.get(round_id)
     if not r:
         return _err("轮次不存在", 404)
     m = TickDataSim if (r.data_source or "qmt") == "sim" else TickData
+    # 过滤盘后数据（> 15:00:00，固定价交易尾巴）：前端恢复与引擎 _load_context
+    # 同口径（游戏只播盘前竞价/盘中/收盘竞价，末根为 15:00:00 收盘价）
+    day_end = f"{r.trade_date} {_SESSION_DAY_END}"
     rows = (db.session.query(m.time_key, m.high,
                              m.low, m.close, m.volume, m.amount)
-            .filter(m.code == r.code, m.trade_date == r.trade_date)
+            .filter(m.code == r.code, m.trade_date == r.trade_date,
+                    m.time_key <= day_end)
             .order_by(m.time_key).all())
     tail = request.args.get("tail", type=int, default=0)
     data = []

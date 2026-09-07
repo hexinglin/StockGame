@@ -20,7 +20,7 @@ const state = {
     socket: null,
     chart: null,
     lastTickVol: 0,         // 当笔快照增量成交量（盘口模拟用）
-    
+    showPreMarket: false,   // 是否显示盘前集合竞价段（默认隐藏，保持 09:30-15:00 主轴）
 };
 
 const FEE_RATE = 0.0001;    // 万1
@@ -387,10 +387,11 @@ async function enterGame(roundId) {
         const tickTotal = state.ticks.length;
         updateProgress(tickTotal && upto.length ? upto.length / tickTotal * 100 : 0);
 
-        // 加载委托/成交/账户
+        // 加载委托/成交/账户/网格表
         loadOrders();
         loadTrades();
         loadAccount();
+        loadGrid();
         refreshQuoteDisplay(true);   // 进入游戏首次完整渲染（含盘口），不节流
 
         // 若已结束，显示结算信息
@@ -540,6 +541,7 @@ function onTrade(t) {
     toast(`成交 ${t.direction === "buy" ? "买入" : "卖出"} ${fmt(t.shares)}股 @${t.price}`, "success");
     loadTrades();
     // 账户由随后的 game:account 推送实时刷新，无需再发 HTTP 请求（去冗余）
+    if (document.getElementById("gridBox").style.display !== "none") loadGrid();
 }
 
 function onAccount(acct) {
@@ -582,6 +584,20 @@ const TRADING_MINUTES = (() => {
     out.push("15:00");
     return out;   // 121 + 1 + 121 = 243
 })();
+
+// 盘前集合竞价段：同花顺式分时图会在开盘（09:30）左侧附加一小段集合竞价区。
+// 真实盘前竞价区间为 09:15-09:25（09:25 出竞价价），09:25-09:30 为等待段。
+// 数据源（QMT）盘前通常仅 09:25 一个竞价点；竞价区末锚点不重复写 09:30
+// （主轴 TRADING_MINUTES 首点即 09:30），收盘竞价价线以水平线贯穿竞价区展示。
+// 首锚点 "竞价" 为纯语义标签（集合竞价区占位，无数据），09:15 为过程锚点（无数据），
+// 09:25 为竞价成交价实点（若数据存在），09:30 起无缝接开盘主分时线。
+const PRE_MARKET_MINUTES = ["竞价", "09:15", "09:25"];
+// 组合轴：showPre=true 时在盘中主轴上增加盘前竞价段；false 保持原 243 点主轴
+function tradingAxis(showPre) {
+    return showPre ? [...PRE_MARKET_MINUTES, ...TRADING_MINUTES] : TRADING_MINUTES;
+}
+// 盘前段在组合轴中的前置长度（showPre 时为 3，否则 0）
+function preAxisLen(showPre) { return showPre ? PRE_MARKET_MINUTES.length : 0; }
 
 let _chartResizeBound = false;
 function initChart() {
@@ -634,21 +650,38 @@ function updateChart() {
     const points = state.minutePoints.concat(state.livePoint ? [state.livePoint] : []);
     const byMin = new Map(points.map(p => [p.time, p]));
 
-    // 固定 x 轴：完整交易日 241 分钟；未开盘/缺分钟的时段为 null（不连线）
-    const times = TRADING_MINUTES;
+    // x 轴：默认 09:30-15:00 主交易日轴；开启盘前后在左侧附加集兑竞价段
+    const showPre = !!state.showPreMarket;
+    const times = tradingAxis(showPre);
+    const preLen = preAxisLen(showPre);
     const data = times.map(m => byMin.get(m) || null);
-    const prices = data.map(p => (p ? p.price : null));
-    const vols = data.map(p => (p ? p.vol : null));
 
-    // 均价线：按交易日顺序累计成交额/量（缺分钟跳过，累计不中断）
+    // 与完整 x 轴等长的 series 数据：盘前竞价段与盘中主分时线分离。
+    //   盘中价格线只画 09:30 及其后（盘前段留空，不连线到竞价区）；
+    //   盘前段用独立 series 标出集合竞价价（同花顺式）：竞价区一条水平虚线段 +
+    //   09:25 竞价实点；竞价段不参与均价累计（同花顺均价线自开盘 09:30 起算）。
+    const preIsIdx = new Set();
+    for (let i = 0; i < preLen; i++) preIsIdx.add(i);
+    const prices = data.map((p, i) => (p && !preIsIdx.has(i) ? p.price : null));
+    const vols = data.map((p, i) => (p && !preIsIdx.has(i) ? p.vol : null));
+    // 竞价段：只有含 09:25 实点的格子有价格值；其余（"竞价"/"09:15"）水平段留空
+    const prePrices = data.map((p, i) => (p && preIsIdx.has(i) ? p.price : null));
+
+    // 均价线：自开盘起累计成交额/量（缺分钟跳过，累计不中断）；盘前段不参与
     let ca = 0, cv = 0;
-    const avgs = data.map(p => {
-        if (p) { ca += p.amount || (p.price * p.vol); cv += p.vol; }
-        return p && cv > 0 ? +(ca / cv).toFixed(4) : null;
+    const avgs = data.map((p, i) => {
+        if (p && !preIsIdx.has(i)) { ca += p.amount || (p.price * p.vol); cv += p.vol; }
+        return (p && !preIsIdx.has(i)) && cv > 0 ? +(ca / cv).toFixed(4) : null;
     });
 
+    // 昨收基准线自开盘起；盘前段以竞价价作水平基准线（同花顺竞价区显示竞价价
+    // 而非昨收），无竞价数据时以昨收兑底
     const lastClose = state.lastClose || (points.length && points[0].price) || 0;
-    const baseLine = data.map(p => (p ? lastClose : null));
+    // 盘前基准线取真实竞价价；仅当竞价区存在竞价数据时才铺满整段（贯穿竞价区水平虚线），
+    // 无竞价数据时整段不渲染，避免虚假的昨收基准线出现在竞价区
+    const preBase = prePrices.find(v => v !== null && v !== undefined) ?? null;
+    const preBaseLine = data.map((p, i) => (preIsIdx.has(i) && preBase != null ? preBase : null));
+    const baseLine = data.map((p, i) => (p && !preIsIdx.has(i) ? lastClose : null));
     const upColor = "#e64545", downColor = "#1a9e5c";
     const lastP = points[points.length - 1];
     const prevP = points[points.length - 2];
@@ -667,24 +700,32 @@ function updateChart() {
                 const i = params[0].dataIndex;
                 const p = data[i];
                 if (!p) return "";
-                return `<b>${p.time}</b><br/>价格: ${p.price}<br/>成交量: ${fmtVol(p.vol)}<br/>均价: ${avgs[i] !== null ? avgs[i] : "--"}`;
+                // 盘前竞价段无均价（自开盘起算），盘口/量能仍可展示
+                const isPre = i < preLen;
+                const avgTxt = !isPre && avgs[i] !== null ? avgs[i] : "--";
+                return `<b>${p.time}</b><br/>价格: ${p.price}<br/>成交量: ${fmtVol(p.vol)}<br/>均价: ${avgTxt}`;
             },
         },
         xAxis: [
             {
                 type: "category", data: times, boundaryGap: false,
                 axisLine: { lineStyle: { color: "#666" } },
-                // 固定刻度：每半小时一个；午休合并标签放在占位中点使两侧等距
+                // 固定刻度：每半小时一个；午休合并标签放在占位中点使两侧等距。
+                // 盘前竞价段（前缀）始终显示，「竞价」标签锚在 09:25 处
                 axisLabel: {
                     color: "#999", fontSize: 10,
                     interval: (idx) => {
+                        if (idx < preLen) return true;       // 盘前竞价段锚点
                         const m = times[idx];
                         if (!m) return false;
                         if (m === "午休") return true;      // 合并标签锚点
                         if (m === "11:30" || m === "13:00") return false;  // 已并入午休标签
                         return m.endsWith(":00") || m.endsWith(":30");
                     },
-                    formatter: (val, idx) => (times[idx] === "午休" ? "11:30/13:00" : val),
+                    formatter: (val, idx) => {
+                        if (idx < preLen) return val === "09:25" ? "竞价" : "";
+                        return times[idx] === "午休" ? "11:30/13:00" : val;
+                    },
                 },
             },
             { type: "category", data: times, gridIndex: 1, axisLabel: { show: false }, axisTick: { show: false }, splitLine: { show: false } },
@@ -729,6 +770,14 @@ function updateChart() {
                     },
                 },
             },
+            // 盘前集合竞价线（同花顺式）：竞价区一条水平虚线（用竞价基准价），
+            // 09:25 处为竞价成交实点（symbol 圆点）。无竞价数据时不渲染（全部 null）
+            { name: "盘前竞价", type: "line", data: preBaseLine, xAxisIndex: 0, yAxisIndex: 0, showSymbol: false,
+              lineStyle: { width: 1.5, color: "#7aa2f7", type: "dashed" },
+              symbol: "circle", symbolSize: 6, itemStyle: { color: "#7aa2f7" }, connectNulls: false },
+            // 竞价实点：仅在 09:25 有真实竞价价时标点（穿透水平虚线）
+            { name: "竞价", type: "line", data: prePrices.map(v => v !== null ? v : null), showSymbol: true, symbol: "circle",
+              symbolSize: 7, lineStyle: { opacity: 0 }, itemStyle: { color: "#7aa2f7" }, connectNulls: false },
             { name: "均价", type: "line", data: avgs, showSymbol: false, lineStyle: { width: 1, color: "#f5c542" } },
             { name: "昨收", type: "line", data: baseLine, showSymbol: false, lineStyle: { width: 1, color: "#888", type: "dashed" } },
             { name: "成交量", type: "bar", data: vols, xAxisIndex: 1, yAxisIndex: 1, barWidth: "70%",
@@ -738,6 +787,14 @@ function updateChart() {
               } } },
         ],
     });
+}
+
+// ───────────── 盘前竞价段显隐切换 ─────────────
+function togglePreMarket() {
+    state.showPreMarket = !state.showPreMarket;
+    const btn = document.getElementById("btnPreMarket");
+    if (btn) btn.classList.toggle("active", state.showPreMarket);
+    updateChart();
 }
 
 // ───────────── 行情显示 ─────────────
@@ -924,11 +981,14 @@ async function finishRound() {
 }
 
 // ───────────── 记录 tab ─────────────
+let _lastGridTs = 0;
 function switchRecTab(tab) {
     document.querySelectorAll(".rec-tab").forEach(b => b.classList.toggle("active", b.dataset.tab === tab));
     document.getElementById("ordersTable").style.display = tab === "orders" ? "" : "none";
     document.getElementById("tradesTable").style.display = tab === "trades" ? "" : "none";
     document.getElementById("accountBox").style.display = tab === "account" ? "" : "none";
+    document.getElementById("gridBox").style.display = tab === "grid" ? "" : "none";
+    if (tab === "grid") { _lastGridTs = 0; loadGrid(); }   // 切 tab 强制刷新
 }
 
 async function loadOrders() {
@@ -1030,6 +1090,128 @@ function renderAccount(a, force) {
             <div class="acct-item"><span>累计手续费</span><b>${fmt(a.fee_total)}</b></div>
         </div>`;
 }
+
+// ───────────── 网格表 ─────────────
+const GRID_STATUS = {
+    pending: { text: "待成交", cls: "st-pending" },
+    buy:     { text: "已购", cls: "st-buy" },
+    sell:    { text: "已售", cls: "st-sell" },
+    done:    { text: "已完成", cls: "st-filled" },
+};
+
+async function loadGrid() {
+    if (!state.roundId) return;
+    // 高速档节流：网格表为 innerHTML 全量重建，无需每 tick 刷新
+    const now = Date.now();
+    if (now - _lastGridTs < RENDER_THROTTLE_MS) return;
+    _lastGridTs = now;
+    try {
+        const resp = await api(`/api/v1/game/rounds/${state.roundId}/grid`);
+        renderGrid(resp.data || {});
+    } catch (e) { /* 忽略 */ }
+}
+
+function renderGrid(g) {
+    const box = document.getElementById("gridBox");
+    if (!box) return;
+    const rows = g.rows || [];
+    if (!rows.length) {
+        box.innerHTML = '<div class="empty-cell">暂无网格</div>';
+        return;
+    }
+    const p = g.params || {};
+    // 参数摘要栏
+    const meta = `
+        <div class="grid-meta">
+            <span>锚点 <b>${fmt(g.anchor_price, 3)}</b></span>
+            <span>最新价 <b class="${(g.last_price >= g.anchor_price) ? "up" : "down"}">${fmt(g.last_price, 3)}</b></span>
+            <span>总持仓 <b>${fmt(g.total_shares)}</b></span>
+            <span>间距 <b>${p.grid_spacing}</b></span>
+            <span>卖点=买点+${p.sell_gap_ratio}×间距</span>
+        </div>`;
+    // 价格行高亮：当前最新价所在区间（前档买点 ≥ 现价 ≥ 后档买点）
+    let activeIdx = null;
+    const last = g.last_price || 0;
+    for (let i = 0; i < rows.length; i++) {
+        if (last >= rows[i].buy_price) activeIdx = i;
+    }
+    const trs = rows.map((r, i) => {
+        const st = GRID_STATUS[r.status] || GRID_STATUS.pending;
+        // 买卖点是否已触发
+        const buyCls = r.buy_hit ? "up" : "";
+        const sellCls = r.sell_hit ? "down" : "";
+        // 现价恰在此格（买点与卖点之间）→ 高亮行
+        const inRange = (last >= r.buy_price && last <= r.sell_price);
+        const activeCls = (i === activeIdx || inRange) ? "grid-row-active" : "";
+        return `
+            <tr class="${activeCls}">
+                <td>${r.idx}</td>
+                <td class="${buyCls} up">${fmt(r.buy_price, 3)}</td>
+                <td class="${sellCls} down">${fmt(r.sell_price, 3)}</td>
+                <td>${fmt(r.shares)}</td>
+                <td><span class="${st.cls}">${st.text}</span></td>
+            </tr>`;
+    }).join("");
+    box.innerHTML = `
+        ${meta}
+        <table class="rec-table grid-table">
+            <thead><tr><th>格号</th><th>买点</th><th>卖点</th><th>配持仓</th><th>状态</th></tr></thead>
+            <tbody>${trs}</tbody>
+        </table>`;
+}
+
+// ───────────── 配置浮层 ─────────────
+function openConfig(type) {
+    // 目前仅网格配置；后续功能参数可扩展 type 分支
+    const overlay = document.getElementById("configOverlay");
+    overlay.style.display = "flex";
+    document.getElementById("configTitle").textContent = "⚙ 网格配置";
+    loadGridConfig();
+}
+
+function closeConfig() {
+    document.getElementById("configOverlay").style.display = "none";
+}
+
+async function loadGridConfig() {
+    try {
+        const resp = await api("/api/v1/game/config/grid");
+        const p = resp.data || {};
+        const set = (id, v) => { const el = document.getElementById(id); if (el && v !== undefined && v !== null) el.value = v; };
+        set("cfg_spacing", p.grid_spacing);
+        set("cfg_init", p.init_value);
+        set("cfg_offset", p.offset);
+        set("cfg_ratio", p.sell_gap_ratio);
+        set("cfg_up", p.grid_up);
+        set("cfg_down", p.grid_down);
+        set("cfg_tol", p.hit_tolerance);
+    } catch (e) { toast(e.message, "error"); }
+}
+
+async function saveGridConfig() {
+    const body = {
+        grid_spacing: Number(document.getElementById("cfg_spacing").value),
+        init_value: Number(document.getElementById("cfg_init").value),
+        offset: Number(document.getElementById("cfg_offset").value),
+        sell_gap_ratio: Number(document.getElementById("cfg_ratio").value),
+        grid_up: Number(document.getElementById("cfg_up").value),
+        grid_down: Number(document.getElementById("cfg_down").value),
+        hit_tolerance: Number(document.getElementById("cfg_tol").value),
+    };
+    try {
+        await api("/api/v1/game/config/grid", "PUT", body);
+        toast("网格配置已保存", "success");
+        // 保存后若正在游戏视图且已打开网格表，立即刷新
+        if (state.roundId) loadGrid();
+        closeConfig();
+    } catch (e) { toast(e.message, "error"); }
+}
+
+// 点击浮层外关闭
+(function () {
+    const ov = document.getElementById("configOverlay");
+    if (ov) ov.addEventListener("click", closeConfig);
+})();
 
 // ───────────── 快捷键帮助浮层 ─────────────
 function toggleHelp() {

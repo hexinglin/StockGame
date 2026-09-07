@@ -110,6 +110,8 @@ CREATE INDEX IF NOT EXISTS ix_game_rounds_code_date ON game_rounds (code, trade_
 CREATE INDEX IF NOT EXISTS ix_game_rounds_status ON game_rounds (status);
 
 -- 委托（状态机 pending/filled/cancelled/rejected，整单成交）
+-- 时间口径：created_at/filled_at 为游戏时间（引擎按行情 time_key 写入，
+-- 与真实时间解耦），不设 DEFAULT（由引擎显式赋值，杜绝真实时间混入）。
 CREATE TABLE IF NOT EXISTS game_orders (
   id BIGSERIAL PRIMARY KEY,
   order_id VARCHAR(50) UNIQUE NOT NULL,
@@ -121,7 +123,8 @@ CREATE TABLE IF NOT EXISTS game_orders (
   status VARCHAR(20) DEFAULT 'pending',
   filled_shares INT DEFAULT 0, filled_price REAL DEFAULT 0,
   fee REAL DEFAULT 0,
-  created_at TIMESTAMP DEFAULT now(), filled_at TIMESTAMP,
+  created_at TIMESTAMP,          -- 委托时间（游戏时间：行情 time_key）
+  filled_at TIMESTAMP,           -- 成交时间（游戏时间：行情 time_key）
   reject_reason TEXT DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS ix_game_orders_round_id ON game_orders (round_id);

@@ -150,6 +150,12 @@ def _on_quote(ContextInfo, data):
         # 昨收：推送自带 lastClose/preClose 优先，缺失时按日线序列推导兜底
         last_close = _v("lastClose", "preClose")
 
+        # QMT 分笔/快照推送的 volume 单位为「手」（1 手 = 100 股），amount 为「元」；
+        # 游戏消费端（均价线/成交量柱/累计量）统一以「股」为口径（与模拟源
+        # gen_snapshots_from_minutes 的 volume=股 一致，两源单位统一才不会撑高 Y 轴），
+        # 故此处 ×100 将手换算为股后再上报。
+        qmt_volume = _v("volume")
+
         payload = {
             "agent_name": AGENT_NAME,
             "code": _stock_code,
@@ -161,7 +167,7 @@ def _on_quote(ContextInfo, data):
             "low": _v("low"),
             "close": close_val,
             "last_close": last_close,
-            "volume": _v("volume"),
+            "volume": int(qmt_volume * 100) if qmt_volume > 0 else 0,
             "amount": _v("amount"),
         }
         _logdata(payload)

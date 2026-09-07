@@ -110,6 +110,8 @@ class TestMatching:
         r, ctx = running_round
         ok, order, msg = engine.place_order(r.id, "buy", "limit", 1.05, 10000)
         assert ok, msg
+        # 时间口径：委托时间记游戏时间（尚未开播时以首根快照 time_key 兑底）
+        assert order["created_at"] == ctx.ticks[0]["time_key"]
         # 快照撮合：限价买单由最新价触发（close <= 限价即成交）
         ticks = [t for t in ctx.ticks if t["close"] <= 1.05]
         assert ticks
@@ -118,11 +120,15 @@ class TestMatching:
         assert fresh.status == "filled"
         assert fresh.filled_price == pytest.approx(1.05)
         assert fresh.filled_shares == 10000
+        # 委托/成交时间均记游戏时间（行情 time_key），非真实时间
+        assert fresh.created_at.strftime("%Y-%m-%d %H:%M:%S") == ctx.ticks[0]["time_key"]
+        assert fresh.filled_at.strftime("%Y-%m-%d %H:%M:%S") == ticks[0]["time_key"]
 
     def test_limit_sell_fill(self, running_round, engine, app):
         r, ctx = running_round
         ok, order, msg = engine.place_order(r.id, "sell", "limit", 0.99, 10000)
         assert ok, msg
+        assert order["created_at"] == ctx.ticks[0]["time_key"]
         # 快照撮合：限价卖单由最新价触发（close >= 限价即成交）
         ticks = [t for t in ctx.ticks if t["close"] >= 0.99]
         assert ticks
@@ -130,6 +136,8 @@ class TestMatching:
         fresh = self._fetch_order(app, order["order_id"])
         assert fresh.status == "filled"
         assert fresh.filled_price == pytest.approx(0.99)
+        # 成交时间记游戏时间（撮合快照 time_key）
+        assert fresh.filled_at.strftime("%Y-%m-%d %H:%M:%S") == ticks[0]["time_key"]
 
     def test_limit_not_touch_pending(self, running_round, engine, app):
         r, ctx = running_round

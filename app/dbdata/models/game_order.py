@@ -1,8 +1,6 @@
 """
 游戏委托 ORM 模型
 """
-from datetime import datetime
-
 from sqlalchemy import Column, String, Integer, Float, DateTime, Text
 from ..database import Base
 
@@ -23,6 +21,7 @@ class GameOrder(Base):
     filled_shares = Column(Integer, default=0)
     filled_price = Column(Float, default=0)
     fee = Column(Float, default=0)
-    created_at = Column(DateTime, default=datetime.now)
-    filled_at = Column(DateTime)
+    # 时间口径：游戏时间（引擎按行情 time_key 写入，与真实时间解耦）
+    created_at = Column(DateTime)   # 委托时间（行情 time_key，引擎写入）
+    filled_at = Column(DateTime)    # 成交时间（行情 time_key，引擎写入）
     reject_reason = Column(Text, default="")

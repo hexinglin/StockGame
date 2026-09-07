@@ -21,6 +21,8 @@ HEARTBEAT_ALERT_PREFIX = "heartbeat:alert"
 # 最新行情（全局实时 + 轮次内）
 QUOTE_LIVE_KEY = "game:quote:live"
 QUOTE_ROUND_PREFIX = "game:quote"
+# 用户配置（网格等参数，可写覆盖，Redis 优先于 config.yaml 默认值）
+CFG_KEY_PREFIX = "game:cfg"
 
 _TTL_ACCT = 86400 * 30       # 账户 30 天
 _TTL_QUOTE = 86400 * 7       # 行情快照 7 天
@@ -227,6 +229,29 @@ class RedisCache:
             self._client.delete(prefix)
         except Exception as e:
             logger.warning("行情快照删除失败: %s", e)
+
+    # ── 用户配置（可写覆盖） ──
+
+    def save_config(self, namespace: str, cfg: dict):
+        """保存用户配置命名空间（如 grid），写入 Redis（TTL 1 年）"""
+        if not self.available:
+            return
+        try:
+            self._client.setex(f"{CFG_KEY_PREFIX}:{namespace}", 86400 * 365, json.dumps(cfg))
+        except Exception as e:
+            logger.warning("配置保存失败 namespace=%s: %s", namespace, e)
+
+    def load_config(self, namespace: str):
+        """读取用户配置命名空间，无则返回 None"""
+        if not self.available:
+            return None
+        try:
+            raw = self._client.get(f"{CFG_KEY_PREFIX}:{namespace}")
+            if raw:
+                return json.loads(raw)
+        except Exception as e:
+            logger.warning("配置读取失败 namespace=%s: %s", namespace, e)
+        return None
 
 
 # 全局单例
