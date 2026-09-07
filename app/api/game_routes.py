@@ -222,6 +222,20 @@ def grid(round_id):
     return _ok(data)
 
 
+@game_bp.route("/rounds/<int:round_id>/grid/interval", methods=["PUT"])
+def put_grid_interval(round_id):
+    """保存某行网格的间隔（随轮次持久化，Redis 存储，重进保持一致）"""
+    body = request.get_json(silent=True) or {}
+    idx = body.get("idx")
+    interval = body.get("interval")
+    if not isinstance(idx, (int, float)):
+        return _err("idx 缺失或非法", 400)
+    if not isinstance(interval, (int, float)):
+        return _err("interval 缺失或非法", 400)
+    imap = get_engine().save_grid_interval(round_id, int(idx), int(interval))
+    return _ok(imap, "间隔已保存")
+
+
 # ── 网格配置 ──
 
 @game_bp.route("/config/grid", methods=["GET"])
@@ -234,7 +248,7 @@ def get_grid_config():
 def put_grid_config():
     """保存网格配置（写 Redis，仅校验数值字段）"""
     body = request.get_json(silent=True) or {}
-    allowed = {"grid_spacing", "init_value", "offset", "sell_gap_ratio",
+    allowed = {"grid_spacing", "init_value", "offset", "interval",
                "grid_up", "grid_down", "hit_tolerance"}
     params = {k: v for k, v in body.items() if k in allowed and isinstance(v, (int, float))}
     norm = get_engine().save_grid_params(params)

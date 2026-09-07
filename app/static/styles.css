@@ -415,6 +415,13 @@ body {
 .grid-table td { font-variant-numeric: tabular-nums; }
 .grid-row-active td { background: rgba(59,110,246,.10); }
 .grid-table tr.grid-row-active:hover td { background: rgba(59,110,246,.14); }
+.grid-interval {
+    min-width: 44px; padding: 2px 6px; font-size: 11px;
+    background: var(--bg2); color: var(--text);
+    border: 1px solid var(--border); border-radius: 4px;
+    cursor: pointer;
+}
+.grid-interval:hover, .grid-interval:focus { border-color: var(--up); outline: none; }
 
 /* ── 配置浮层 ── */
 .config-panel {

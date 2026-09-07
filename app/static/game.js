@@ -982,6 +982,9 @@ async function finishRound() {
 
 // ───────────── 记录 tab ─────────────
 let _lastGridTs = 0;
+// 网格表行级状态（保留每行各自调整后的间隔，避免全量重绘时丢失）
+let gridRows = [];
+let gridLastData = null;
 function switchRecTab(tab) {
     document.querySelectorAll(".rec-tab").forEach(b => b.classList.toggle("active", b.dataset.tab === tab));
     document.getElementById("ordersTable").style.display = tab === "orders" ? "" : "none";
@@ -1107,14 +1110,67 @@ async function loadGrid() {
     _lastGridTs = now;
     try {
         const resp = await api(`/api/v1/game/rounds/${state.roundId}/grid`);
-        renderGrid(resp.data || {});
+        const g = resp.data || {};
+        gridLastData = g;
+        const iv = (g.params && g.params.interval) || 2;
+        // 每行附带独立的间隔（默认取全局，可逐行调整）
+        gridRows = (g.rows || []).map(r => ({
+            ...r,
+            interval: (r.interval !== undefined && r.interval !== null) ? r.interval : iv,
+        }));
+        renderGrid();
     } catch (e) { /* 忽略 */ }
 }
 
-function renderGrid(g) {
+// 间隔下拉框取值 → 该行买卖格号/价格重算
+function _gridBuyPrice(idx, sp, init) { return +(idx * sp + init).toFixed(3); }
+function _gridSellPrice(idx, sp, init, off) { return +(idx * sp + init + off).toFixed(3); }
+
+// 用指定间隔重算某行（方向分侧：买入行固定买格号，卖出行固定卖格号，即主格号 idx）
+function _setRowInterval(r, iv, p) {
+    const off = Math.max(iv - 1, 0);
+    const sp = parseFloat(p.grid_spacing) || 0.005;
+    const init = parseFloat(p.init_value) || 0.003;
+    const offset = parseFloat(p.offset) || 0.001;
+    r.interval = iv;
+    if (r.direction === "sell") {
+        r.sell_idx = r.idx;
+        r.buy_idx = r.idx - off;
+        r.sell_price = _gridSellPrice(r.sell_idx, sp, init, offset);
+        r.buy_price = _gridBuyPrice(r.buy_idx, sp, init);
+    } else {
+        r.buy_idx = r.idx;
+        r.sell_idx = r.idx + off;
+        r.buy_price = _gridBuyPrice(r.buy_idx, sp, init);
+        r.sell_price = _gridSellPrice(r.sell_idx, sp, init, offset);
+    }
+}
+
+async function applyGridInterval(i, val) {
+    const r = gridRows[i];
+    if (!r || !gridLastData) return;
+    const p = gridLastData.params || {};
+    const nv = parseInt(val, 10);
+    if (isNaN(nv)) return;
+    const old = r.interval;
+    _setRowInterval(r, nv, p);   // 乐观更新即时生效
+    renderGrid();
+    if (!state.roundId) return;
+    // 随轮次持久化，重进保持一致
+    try {
+        await api(`/api/v1/game/rounds/${state.roundId}/grid/interval`, "PUT", { idx: r.idx, interval: nv });
+    } catch (e) {
+        _setRowInterval(r, old, p);   // 失败回滚
+        renderGrid();
+        toast(e.message || "间隔保存失败", "error");
+    }
+}
+
+function renderGrid() {
     const box = document.getElementById("gridBox");
-    if (!box) return;
-    const rows = g.rows || [];
+    if (!box || !gridLastData) return;
+    const g = gridLastData;
+    const rows = gridRows;
     if (!rows.length) {
         box.innerHTML = '<div class="empty-cell">暂无网格</div>';
         return;
@@ -1126,8 +1182,7 @@ function renderGrid(g) {
             <span>锚点 <b>${fmt(g.anchor_price, 3)}</b></span>
             <span>最新价 <b class="${(g.last_price >= g.anchor_price) ? "up" : "down"}">${fmt(g.last_price, 3)}</b></span>
             <span>总持仓 <b>${fmt(g.total_shares)}</b></span>
-            <span>间距 <b>${p.grid_spacing}</b></span>
-            <span>卖点=买点+${p.sell_gap_ratio}×间距</span>
+            <span>间隔 <b>${p.interval}</b>(偏${p.interval - 1}格，可逐行调整)</span>
         </div>`;
     // 价格行高亮：当前最新价所在区间（前档买点 ≥ 现价 ≥ 后档买点）
     let activeIdx = null;
@@ -1143,9 +1198,16 @@ function renderGrid(g) {
         // 现价恰在此格（买点与卖点之间）→ 高亮行
         const inRange = (last >= r.buy_price && last <= r.sell_price);
         const activeCls = (i === activeIdx || inRange) ? "grid-row-active" : "";
+        const dirCls = (r.direction === "sell") ? "down" : "up";
+        const dirText = (r.direction === "sell") ? "卖出" : "买入";
+        const selOpts = [1, 2, 4, 6].map(v =>
+            `<option value="${v}" ${v === r.interval ? "selected" : ""}>${v}</option>`).join("");
         return `
             <tr class="${activeCls}">
-                <td>${r.idx}</td>
+                <td>${r.buy_idx}</td>
+                <td>${r.sell_idx}</td>
+                <td><select class="grid-interval" onchange="applyGridInterval(${i}, this.value)">${selOpts}</select></td>
+                <td class="${dirCls}">${dirText}</td>
                 <td class="${buyCls} up">${fmt(r.buy_price, 3)}</td>
                 <td class="${sellCls} down">${fmt(r.sell_price, 3)}</td>
                 <td>${fmt(r.shares)}</td>
@@ -1155,7 +1217,7 @@ function renderGrid(g) {
     box.innerHTML = `
         ${meta}
         <table class="rec-table grid-table">
-            <thead><tr><th>格号</th><th>买点</th><th>卖点</th><th>配持仓</th><th>状态</th></tr></thead>
+            <thead><tr><th>买格号</th><th>卖格号</th><th>间隔</th><th>方向</th><th>买点</th><th>卖点</th><th>配持仓</th><th>状态</th></tr></thead>
             <tbody>${trs}</tbody>
         </table>`;
 }
@@ -1181,7 +1243,7 @@ async function loadGridConfig() {
         set("cfg_spacing", p.grid_spacing);
         set("cfg_init", p.init_value);
         set("cfg_offset", p.offset);
-        set("cfg_ratio", p.sell_gap_ratio);
+        set("cfg_ratio", p.interval);
         set("cfg_up", p.grid_up);
         set("cfg_down", p.grid_down);
         set("cfg_tol", p.hit_tolerance);
@@ -1193,7 +1255,7 @@ async function saveGridConfig() {
         grid_spacing: Number(document.getElementById("cfg_spacing").value),
         init_value: Number(document.getElementById("cfg_init").value),
         offset: Number(document.getElementById("cfg_offset").value),
-        sell_gap_ratio: Number(document.getElementById("cfg_ratio").value),
+        interval: Number(document.getElementById("cfg_ratio").value),
         grid_up: Number(document.getElementById("cfg_up").value),
         grid_down: Number(document.getElementById("cfg_down").value),
         hit_tolerance: Number(document.getElementById("cfg_tol").value),

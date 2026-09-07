@@ -185,12 +185,12 @@
             <h3 id="configTitle">⚙ 配置</h3>
             <button class="config-close" onclick="closeConfig()">✕</button>
         </div>
-        <div class="config-desc">网格表参数：锚点（昨收）上下各展开多行网格，每行 = 买点 + 卖点。<br>卖点 = 买点 + sell_gap_ratio×间距（"2x为卖点"）。</div>
+        <div class="config-desc">网格表参数：锚点（昨收）上下各展开多行网格，每行 = 买入格号 + 卖出格号。<br>买点 = 买格号×间距+初始值；卖点 = 卖格号×间距+初始值+off；<br>间隔决定买卖格号偏移（间隔 2 → 偏 1 格）；方向由锚点分侧决定。</div>
         <div class="config-form" id="configForm">
             <div class="config-row"><label>grid_spacing</label><input type="number" id="cfg_spacing" step="0.001"><span class="cfg-note">网格间距</span></div>
             <div class="config-row"><label>init_value</label><input type="number" id="cfg_init" step="0.001"><span class="cfg-note">买点线初始值</span></div>
             <div class="config-row"><label>offset</label><input type="number" id="cfg_offset" step="0.001"><span class="cfg-note">off 值</span></div>
-            <div class="config-row"><label>sell_gap_ratio</label><input type="number" id="cfg_ratio" step="1"><span class="cfg-note">卖点=买点+N×间距</span></div>
+            <div class="config-row"><label>interval</label><select id="cfg_ratio"><option value="1">1</option><option value="2" selected>2</option><option value="4">4</option><option value="6">6</option></select><span class="cfg-note">间隔（买卖格号偏移+1）</span></div>
             <div class="config-row"><label>grid_up</label><input type="number" id="cfg_up" step="1"><span class="cfg-note">锚点上方行数</span></div>
             <div class="config-row"><label>grid_down</label><input type="number" id="cfg_down" step="1"><span class="cfg-note">锚点下方行数</span></div>
             <div class="config-row"><label>hit_tolerance</label><input type="number" id="cfg_tol" step="0.001"><span class="cfg-note">成交命中容差</span></div>

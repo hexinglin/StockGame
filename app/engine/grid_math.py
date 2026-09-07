@@ -3,10 +3,13 @@
 说明:    网格表纯函数 — 网格行生成 / 成交触发状态推导（参考 AutoTrade 网格数学）
 
     网格模型（每行 = 一个买点 + 一个卖点）:
-      - 买点线: buy(idx) = idx × grid_spacing + init_value      （一元一次直线，idx 整数）
-      - 卖点线: sell(idx) = buy(idx) + sell_gap_ratio × grid_spacing
-          sell_gap_ratio 默认 2（"2x为卖点"），即卖点 = 买点再往上涨 2 个间隔处。
-          等价 buy(idx + sell_gap_ratio)，保证"低位买、涨 2 格卖"的配对语义。
+      - 买点线: buy(idx) = idx × grid_spacing + init_value      （一元一次直线，idx 为买格号）
+      - 卖点线: sell(sell_idx) = sell_idx × grid_spacing + init_value + offset   （sell_idx 为卖格号）
+      - 间隔（interval，下拉 1/2/4/6，默认 2）决定买卖格号的偏移：off_grid = interval - 1。
+          买入方向行: 主格号=买格号，卖格号 = 买格号 + off_grid
+          卖出方向行: 主格号=卖格号，买格号 = 卖格号 - off_grid
+      - 方向（锚点分侧）: 主格号 < 锚点格号 → 买入（先买后卖）；> 锚点格号 → 卖出（先卖后买）。
+      - 调整间隔时: 买入行重算其卖出侧（卖格号+卖点）；卖出行重算其买入侧（买格号+买点）。
       - 锚点: 以昨收（last_close）为基准，定位其最近网格索引，向上下各展开 grid_up / grid_down 行。
       - 持仓合理化: 当前总持仓总量均分到每个网格行（向下取整到 100 股整数倍）。
 
@@ -19,8 +22,8 @@
 DEFAULT_GRID_PARAMS = {
     "grid_spacing": 0.005,      # 网格间隔（绝对价格）
     "init_value": 0.003,        # 买点线初始值（x=0 时买点价）
-    "offset": 0.001,            # off 值（卖点额外偏移，默认不叠加，预留扩展）
-    "sell_gap_ratio": 2,        # 卖点 = 买点 + sell_gap_ratio × 间隔（"2x为卖点"）
+    "offset": 0.001,            # off 值（卖点线偏移）
+    "interval": 2,              # 间隔（下拉 1/2/4/6）：买卖格号偏移 = interval - 1
     "grid_up": 8,               # 锚点上方网格行数
     "grid_down": 8,             # 锚点下方网格行数
     "hit_tolerance": 0.001,     # 成交触发命中容差（绝对价格 ±）
@@ -37,7 +40,7 @@ def normalize_params(raw: dict) -> dict:
     for k in p:
         v = raw.get(k)
         if isinstance(v, (int, float)) and not isinstance(v, bool) and v >= 0:
-            p[k] = float(v) if k != "grid_up" and k != "grid_down" and k != "sell_gap_ratio" else int(v)
+            p[k] = float(v) if k not in ("grid_up", "grid_down", "interval") else int(v)
     return p
 
 
@@ -54,10 +57,10 @@ def buy_grid_price(idx: int, init_value: float, grid_spacing: float,
     return round(idx * grid_spacing + init_value, 3)
 
 
-def sell_grid_price(idx: int, init_value: float, grid_spacing: float,
-                    sell_gap_ratio: float = 2, hit_tolerance: float = 0.0) -> float:
-    """卖点价格 = 买点 + sell_gap_ratio × 间隔（保留 3 位小数）"""
-    return round(buy_grid_price(idx, init_value, grid_spacing) + sell_gap_ratio * grid_spacing, 3)
+def sell_grid_price(sell_idx: int, init_value: float, grid_spacing: float,
+                    offset: float = 0.0) -> float:
+    """卖点价格（卖格号 sell_idx）：sell(sell_idx) = sell_idx × grid_spacing + init_value + offset（保留 3 位小数）"""
+    return round(sell_idx * grid_spacing + init_value + offset, 3)
 
 
 def is_hit(price: float, grid_price: float, hit_tolerance: float) -> bool:
@@ -65,22 +68,33 @@ def is_hit(price: float, grid_price: float, hit_tolerance: float) -> bool:
     return abs(price - grid_price) <= hit_tolerance + _GRID_EPS
 
 
-def build_grid_rows(anchor_price: float, total_shares: int, params: dict) -> list:
+def build_grid_rows(anchor_price: float, total_shares: int, params: dict,
+                    interval_map: dict = None) -> list:
     """生成网格行列表（围绕锚点向上下展开，持仓均分到各格）
 
     Args:
         anchor_price: 锚点价（通常昨收 last_close），用于定位中心网格索引
         total_shares: 当前总持仓量（均分到每格）
         params: 归一化后的网格参数（normalize_params 输出）
+        interval_map: 可选，每行自定义间隔 {主格号idx(int): interval}，
+            命中的行用自定义间隔，否则用 params.interval 默认。用于持久化行级间隔。
 
     Returns:
-        list[dict]: 每行 {idx, buy_price, sell_price, shares, status, buy_hit, sell_hit}
-            按买点价由低到高排序（idx 升序）
+        list[dict]: 每行 {idx, direction, buy_idx, sell_idx, interval, buy_price,
+            sell_price, shares, status, buy_hit, sell_hit}，按 idx 升序
     """
     p = params
     spacing = float(p["grid_spacing"])
     init_value = float(p["init_value"])
-    ratio = int(p["sell_gap_ratio"])
+    offset = float(p["offset"])
+    default_interval = int(p.get("interval", 2))
+    imap = {}
+    if interval_map:
+        for k, v in interval_map.items():
+            try:
+                imap[int(k)] = int(v)
+            except (TypeError, ValueError):
+                continue
     up = int(p["grid_up"])
     down = int(p["grid_down"])
 
@@ -90,10 +104,25 @@ def build_grid_rows(anchor_price: float, total_shares: int, params: dict) -> lis
     base = grid_level_of(anchor_price, init_value, spacing)
     rows = []
     for idx in range(base - down, base + up + 1):
+        interval = max(imap.get(idx, default_interval), 1)
+        off_grid = max(interval - 1, 0)      # 间隔 → 买卖格号偏移（interval 最小 1 → 偏移 0）
+        # 锚点分侧方向：低价侧（< 锚点格号）→ 买入；高价侧（>= 锚点格号）→ 卖出
+        if idx < base:
+            direction = "buy"
+            buy_idx = idx
+            sell_idx = idx + off_grid
+        else:
+            direction = "sell"
+            sell_idx = idx
+            buy_idx = idx - off_grid
         rows.append({
-            "idx": idx,
-            "buy_price": buy_grid_price(idx, init_value, spacing),
-            "sell_price": sell_grid_price(idx, init_value, spacing, ratio),
+            "idx": idx,                     # 主格号
+            "direction": direction,         # 方向：buy(先买后卖) / sell(先卖后买)
+            "buy_idx": buy_idx,             # 买入格号
+            "sell_idx": sell_idx,           # 卖出格号
+            "interval": interval,           # 该行实际生效间隔（可逐行覆盖）
+            "buy_price": buy_grid_price(buy_idx, init_value, spacing),
+            "sell_price": sell_grid_price(sell_idx, init_value, spacing, offset),
             "shares": 0,
             "status": "pending",
             "buy_hit": False,

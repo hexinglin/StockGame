@@ -236,6 +236,14 @@ class GameEngine:
         get_cache().save_config("grid", norm)
         return norm
 
+    def save_grid_interval(self, round_id: int, idx: int, interval: int) -> dict:
+        """保存某轮次某行的行级间隔（写 Redis，随轮次持久化），返回该轮次全部间隔映射"""
+        ns = f"grid_int:{round_id}"
+        imap = dict(get_cache().load_config(ns) or {})
+        imap[str(int(idx))] = max(int(interval), 1)
+        get_cache().save_config(ns, imap)
+        return imap
+
     # ── 可用交易日（基于 game_days 天维度记录，不扫 tick 表）──
 
     def _tick_model(self, data_source: str):
@@ -508,9 +516,12 @@ class GameEngine:
 
         volume = int(acct.volume) if acct else int(r.base_shares or 0)
 
+        # 行级间隔持久化：读取该轮次的间隔覆盖 {主格号idx: interval}
+        interval_map = get_cache().load_config(f"grid_int:{round_id}") or {}
+
         # 成交记录（触发状态推导）
         trades = self.list_trades(round_id)
-        rows = build_grid_rows(anchor, volume, params)
+        rows = build_grid_rows(anchor, volume, params, interval_map)
         mark_grid_status(rows, trades, params)
 
         return {
@@ -522,6 +533,10 @@ class GameEngine:
             "rows": [
                 {
                     "idx": x["idx"],
+                    "direction": x["direction"],
+                    "buy_idx": x["buy_idx"],
+                    "sell_idx": x["sell_idx"],
+                    "interval": x["interval"],
                     "buy_price": x["buy_price"],
                     "sell_price": x["sell_price"],
                     "shares": x["shares"],
