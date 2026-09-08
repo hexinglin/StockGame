@@ -923,8 +923,8 @@ class GameEngine:
 
     @_ensure_ctx
     def set_speed(self, round_id: int, speed: int) -> (bool, str):
-        if speed not in (1, 10, 60):
-            return False, "speed 仅支持 1/10/60"
+        if speed not in (1, 5, 10, 60):
+            return False, "speed 仅支持 1/5/10/60"
         with self._lock:
             r = GameRound.query.get(round_id)
             if not r:

@@ -198,6 +198,8 @@ class TestControl:
         resp = client.get(f"/api/v1/game/rounds/{rid}")
         assert resp.get_json()["data"]["status"] == "running"
 
+        resp = client.post(f"/api/v1/game/rounds/{rid}/speed", json={"speed": 5})
+        assert resp.get_json()["code"] == 0
         resp = client.post(f"/api/v1/game/rounds/{rid}/speed", json={"speed": 10})
         assert resp.get_json()["code"] == 0
         resp = client.post(f"/api/v1/game/rounds/{rid}/speed", json={"speed": 99})

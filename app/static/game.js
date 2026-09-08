@@ -20,7 +20,8 @@ const state = {
     socket: null,
     chart: null,
     lastTickVol: 0,         // 当笔快照增量成交量（盘口模拟用）
-    showPreMarket: false,   // 是否显示盘前集合竞价段（默认隐藏，保持 09:30-15:00 主轴）
+    showPreMarket: false,   // 是否显示盘前集合竞价段：进入游戏默认按行情时间打开（<09:40），过 09:40 自动关闭
+    preAutoClosed: false,   // 是否已跨过 09:40 自动关闭点（只自动关闭一次，之后交用户手动控制）
 };
 
 const FEE_RATE = 0.0001;    // 万1
@@ -275,7 +276,7 @@ function renderRoundList(rounds) {
                 ${r.status === "running" ? `<button class="btn-sm btn-warn" onclick="pauseRound(${r.id})">暂停</button>` : ""}
                 ${r.status === "paused" ? `<button class="btn-sm btn-ok" onclick="resumeRound(${r.id})">继续</button>` : ""}
                 ${(r.status === "running" || r.status === "paused") ? `
-                    <button class="btn-sm" onclick="speedRound(${r.id}, ${r.speed === 1 ? 10 : (r.speed === 10 ? 60 : 1)})">变速→${r.speed === 1 ? 10 : (r.speed === 10 ? 60 : 1)}x</button>
+                    <button class="btn-sm" onclick="speedRound(${r.id}, ${r.speed === 1 ? 5 : (r.speed === 5 ? 10 : (r.speed === 10 ? 60 : 1))})">变速→${r.speed === 1 ? 5 : (r.speed === 5 ? 10 : (r.speed === 10 ? 60 : 1))}x</button>
                     <button class="btn-sm btn-warn" onclick="finishRoundFromList(${r.id})">结束</button>` : ""}
                 <button class="btn-sm btn-danger" onclick="deleteRound(${r.id})">删除</button>
             </div>
@@ -369,6 +370,12 @@ async function enterGame(roundId) {
             lt0.length >= 19 ? lt0.slice(11, 19) : (lt0.length >= 8 ? lt0.slice(-8) : "--:--:--");
         initChart();
         joinRoundRoom();
+
+        // 新游戏默认打开盘前竞价；行情时间已过 09:40 则保持关闭（之后由用户手动切换）。
+        // preAutoClosed 记录"已跨过自动关闭点"，过 09:40 后用户手动打开不会被反复覆盖
+        const preAuto = preMarketAutoClose(state.round.last_time_key || "");
+        state.preAutoClosed = preAuto;
+        setShowPreMarket(!preAuto);
 
         // 恢复分时图到当前进度（按 last_time_key 截断）
         const lastKey = state.round.last_time_key;
@@ -511,6 +518,14 @@ function onQuote(q) {
     state.cumAmount = q.cum_amount;
     state.cumVolume = q.cum_volume;
     state.lastTickVol = q.volume || 0;   // 当笔 tick 成交量（供盘口模拟用）
+    state.lastTk = q.time_key;           // 最新行情时间（供盘前自动关闭兜底）
+
+    // 行情时间首次跨过 09:40 即标记"已自动关闭一次"，并顺带关闭当前打开的盘前段；
+    // 之后用户手动切换显示/隐藏不再被反复覆盖
+    if (!state.preAutoClosed && preMarketAutoClose(q.time_key)) {
+        state.preAutoClosed = true;
+        if (state.showPreMarket) setShowPreMarket(false);
+    }
 
     // 行情时间显示（精确到秒）
     const tStr = q.time_key.length >= 19 ? q.time_key.slice(11, 19) : q.time_key.slice(-8);
@@ -587,17 +602,11 @@ const TRADING_MINUTES = (() => {
 
 // 盘前集合竞价段：同花顺式分时图会在开盘（09:30）左侧附加一小段集合竞价区。
 // 真实盘前竞价区间为 09:15-09:25（09:25 出竞价价），09:25-09:30 为等待段。
-// 数据源（QMT）盘前通常仅 09:25 一个竞价点；竞价区末锚点不重复写 09:30
-// （主轴 TRADING_MINUTES 首点即 09:30），收盘竞价价线以水平线贯穿竞价区展示。
-// 首锚点 "竞价" 为纯语义标签（集合竞价区占位，无数据），09:15 为过程锚点（无数据），
-// 09:25 为竞价成交价实点（若数据存在），09:30 起无缝接开盘主分时线。
+// 盘前段标签与价格在 updateChart 中按真实分钟点动态构建：多点连成竞价折线
+// （反映竞价过程形态），点少时以开盘价填充（水平线贯穿竞价区）。
+// 首锚点 "竞价" 为纯语义标签（集合竞价区占位），09:30 起无缝接开盘主分时线。
 const PRE_MARKET_MINUTES = ["竞价", "09:15", "09:25"];
-// 组合轴：showPre=true 时在盘中主轴上增加盘前竞价段；false 保持原 243 点主轴
-function tradingAxis(showPre) {
-    return showPre ? [...PRE_MARKET_MINUTES, ...TRADING_MINUTES] : TRADING_MINUTES;
-}
-// 盘前段在组合轴中的前置长度（showPre 时为 3，否则 0）
-function preAxisLen(showPre) { return showPre ? PRE_MARKET_MINUTES.length : 0; }
+
 
 let _chartResizeBound = false;
 function initChart() {
@@ -650,22 +659,43 @@ function updateChart() {
     const points = state.minutePoints.concat(state.livePoint ? [state.livePoint] : []);
     const byMin = new Map(points.map(p => [p.time, p]));
 
-    // x 轴：默认 09:30-15:00 主交易日轴；开启盘前后在左侧附加集兑竞价段
+    // x 轴：默认 09:30-15:00 主交易日轴；开启盘前后在左侧附加集合竞价段。
+    // 盘前段按真实分钟点动态构建：多点连成竞价折线；点少时用开盘价填充铺满
     const showPre = !!state.showPreMarket;
-    const times = tradingAxis(showPre);
-    const preLen = preAxisLen(showPre);
+    // 盘前真实分钟点（< 09:30，按时间升序，含实时未完成的 live 点）
+    const preRaw = points
+        .filter(p => p.time < "09:30")
+        .sort((a, b) => (a.time < b.time ? -1 : a.time > b.time ? 1 : 0));
+    // 开盘价：今开 > 09:30 首点 > 昨收（盘前少点填充用）
+    const openP = state.dayOpen
+        || (points.find(p => p.time >= "09:30") || {}).price
+        || state.lastClose || 0;
+    let preLabels, preVals;
+    if (showPre && preRaw.length >= 2) {
+        // 多点：真实竞价价连线（前导"竞价"锚点用首点价，保证折线连续）
+        preLabels = ["竞价", ...preRaw.map(p => p.time)];
+        preVals   = [preRaw[0].price, ...preRaw.map(p => p.price)];
+    } else {
+        // 点少/未开启：固定锚点 + 开盘价填充（水平线贯穿竞价区）；开盘价无效则留空
+        const fillP = openP > 0 ? openP : null;
+        preLabels = PRE_MARKET_MINUTES;
+        preVals   = [fillP, fillP, fillP];
+    }
+    const preLen = showPre ? preLabels.length : 0;
+    const times = showPre ? [...preLabels, ...TRADING_MINUTES] : TRADING_MINUTES;
     const data = times.map(m => byMin.get(m) || null);
 
     // 与完整 x 轴等长的 series 数据：盘前竞价段与盘中主分时线分离。
     //   盘中价格线只画 09:30 及其后（盘前段留空，不连线到竞价区）；
-    //   盘前段用独立 series 标出集合竞价价（同花顺式）：竞价区一条水平虚线段 +
-    //   09:25 竞价实点；竞价段不参与均价累计（同花顺均价线自开盘 09:30 起算）。
+    //   盘前段用"盘前竞价"series 展示：多点=真实竞价价折线，点少=开盘价填充水平线；
+    //   竞价段不参与均价累计（均价线自开盘 09:30 起算）。
     const preIsIdx = new Set();
     for (let i = 0; i < preLen; i++) preIsIdx.add(i);
     const prices = data.map((p, i) => (p && !preIsIdx.has(i) ? p.price : null));
     const vols = data.map((p, i) => (p && !preIsIdx.has(i) ? p.vol : null));
-    // 竞价段：只有含 09:25 实点的格子有价格值；其余（"竞价"/"09:15"）水平段留空
-    const prePrices = data.map((p, i) => (p && preIsIdx.has(i) ? p.price : null));
+    // 竞价段价格：多点=真实竞价价（折线带点）；点少=开盘价填充（水平线）。
+    // 数组按盘前标签索引取 preVals，与盘中各 series（null）对齐
+    const prePrices = data.map((p, i) => (preIsIdx.has(i) ? preVals[i] : null));
 
     // 均价线：自开盘起累计成交额/量（缺分钟跳过，累计不中断）；盘前段不参与
     let ca = 0, cv = 0;
@@ -677,10 +707,8 @@ function updateChart() {
     // 昨收基准线自开盘起；盘前段以竞价价作水平基准线（同花顺竞价区显示竞价价
     // 而非昨收），无竞价数据时以昨收兑底
     const lastClose = state.lastClose || (points.length && points[0].price) || 0;
-    // 盘前基准线取真实竞价价；仅当竞价区存在竞价数据时才铺满整段（贯穿竞价区水平虚线），
-    // 无竞价数据时整段不渲染，避免虚假的昨收基准线出现在竞价区
-    const preBase = prePrices.find(v => v !== null && v !== undefined) ?? null;
-    const preBaseLine = data.map((p, i) => (preIsIdx.has(i) && preBase != null ? preBase : null));
+    // 盘前竞价价线由"盘前竞价"series 承载（真实多点折线 / 开盘价填充水平线），
+    // 不再叠加单独的水平虚线基准，避免与折线重叠
     const baseLine = data.map((p, i) => (p && !preIsIdx.has(i) ? lastClose : null));
     const upColor = "#e64545", downColor = "#1a9e5c";
     const lastP = points[points.length - 1];
@@ -723,7 +751,7 @@ function updateChart() {
                         return m.endsWith(":00") || m.endsWith(":30");
                     },
                     formatter: (val, idx) => {
-                        if (idx < preLen) return val === "09:25" ? "竞价" : "";
+                        if (idx < preLen) return val === "竞价" ? "竞价" : (val || "");
                         return times[idx] === "午休" ? "11:30/13:00" : val;
                     },
                 },
@@ -770,14 +798,12 @@ function updateChart() {
                     },
                 },
             },
-            // 盘前集合竞价线（同花顺式）：竞价区一条水平虚线（用竞价基准价），
-            // 09:25 处为竞价成交实点（symbol 圆点）。无竞价数据时不渲染（全部 null）
-            { name: "盘前竞价", type: "line", data: preBaseLine, xAxisIndex: 0, yAxisIndex: 0, showSymbol: false,
-              lineStyle: { width: 1.5, color: "#7aa2f7", type: "dashed" },
-              symbol: "circle", symbolSize: 6, itemStyle: { color: "#7aa2f7" }, connectNulls: false },
-            // 竞价实点：仅在 09:25 有真实竞价价时标点（穿透水平虚线）
-            { name: "竞价", type: "line", data: prePrices.map(v => v !== null ? v : null), showSymbol: true, symbol: "circle",
-              symbolSize: 7, lineStyle: { opacity: 0 }, itemStyle: { color: "#7aa2f7" }, connectNulls: false },
+            // 盘前集合竞价线：多点=真实竞价价折线（带实点）；点少=开盘价填充的水平线。
+            // 无数据（未开启 / 开盘价无效）时不渲染（全部 null）
+            { name: "盘前竞价", type: "line", data: prePrices, xAxisIndex: 0, yAxisIndex: 0,
+              showSymbol: true, symbol: "circle", symbolSize: 5,
+              lineStyle: { width: 1.5, color: "#7aa2f7" },
+              itemStyle: { color: "#7aa2f7" }, connectNulls: false },
             { name: "均价", type: "line", data: avgs, showSymbol: false, lineStyle: { width: 1, color: "#f5c542" } },
             { name: "昨收", type: "line", data: baseLine, showSymbol: false, lineStyle: { width: 1, color: "#888", type: "dashed" } },
             { name: "成交量", type: "bar", data: vols, xAxisIndex: 1, yAxisIndex: 1, barWidth: "70%",
@@ -790,10 +816,19 @@ function updateChart() {
 }
 
 // ───────────── 盘前竞价段显隐切换 ─────────────
-function togglePreMarket() {
-    state.showPreMarket = !state.showPreMarket;
+// 判断行情时间是否已到/超过自动关闭盘前竞价的时刻（09:40）
+function preMarketAutoClose(timeKey) {
+    const hhmm = timeKey && timeKey.length >= 16 ? timeKey.slice(11, 16) : (timeKey || "");
+    return !!hhmm && hhmm >= "09:40";
+}
+// 统一设置盘前竞价段显隐（同步按钮高亮），图表刷新由调用方控制
+function setShowPreMarket(show) {
+    state.showPreMarket = !!show;
     const btn = document.getElementById("btnPreMarket");
     if (btn) btn.classList.toggle("active", state.showPreMarket);
+}
+function togglePreMarket() {
+    setShowPreMarket(!state.showPreMarket);
     updateChart();
 }
 
@@ -1204,6 +1239,7 @@ function renderGrid() {
             `<option value="${v}" ${v === r.interval ? "selected" : ""}>${v}</option>`).join("");
         return `
             <tr class="${activeCls}">
+                <td>${i + 1}</td>
                 <td>${r.buy_idx}</td>
                 <td>${r.sell_idx}</td>
                 <td><select class="grid-interval" onchange="applyGridInterval(${i}, this.value)">${selOpts}</select></td>
@@ -1217,7 +1253,7 @@ function renderGrid() {
     box.innerHTML = `
         ${meta}
         <table class="rec-table grid-table">
-            <thead><tr><th>买格号</th><th>卖格号</th><th>间隔</th><th>方向</th><th>买点</th><th>卖点</th><th>配持仓</th><th>状态</th></tr></thead>
+            <thead><tr><th>序号</th><th>买格号</th><th>卖格号</th><th>间隔</th><th>方向</th><th>买点</th><th>卖点</th><th>配持仓</th><th>状态</th></tr></thead>
             <tbody>${trs}</tbody>
         </table>`;
 }
@@ -1313,8 +1349,10 @@ document.addEventListener("keydown", (e) => {
         case "1":
             e.preventDefault(); setSpeed(1); break;
         case "2":
-            e.preventDefault(); setSpeed(10); break;
+            e.preventDefault(); setSpeed(5); break;
         case "3":
+            e.preventDefault(); setSpeed(10); break;
+        case "4":
             e.preventDefault(); setSpeed(60); break;
     }
 });
@@ -1323,6 +1361,14 @@ document.addEventListener("keydown", (e) => {
 setInterval(() => {
     document.getElementById("dataTime").textContent = new Date().toLocaleTimeString("zh-CN", { hour12: false });
 }, 1000);
+
+// 盘前竞价自动关闭兜底：个别 tick 边界漏判时按最新行情时间补一次（过 09:40 即关闭一次）
+setInterval(() => {
+    if (!state.preAutoClosed && state.lastTk && preMarketAutoClose(state.lastTk)) {
+        state.preAutoClosed = true;
+        if (state.showPreMarket) setShowPreMarket(false);
+    }
+}, 500);
 
 // 启动：全局实时连接（agent 上线/离线实时推送）+ 首屏数据加载
 initSocket();

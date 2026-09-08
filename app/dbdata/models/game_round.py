@@ -14,7 +14,7 @@ class GameRound(Base):
     code = Column(String(20), default="588000.SH", index=True)
     trade_date = Column(String(10), nullable=False, index=True)
     status = Column(String(20), default="ready")  # ready/running/paused/finished/aborted
-    speed = Column(Integer, default=1)            # 1/10/60
+    speed = Column(Integer, default=1)            # 1/5/10/60
     data_source = Column(String(10), default="qmt")  # 行情数据源: qmt(实盘)/sim(转换模拟)
     created_at = Column(DateTime, default=datetime.now)
     started_at = Column(DateTime)
