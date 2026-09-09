@@ -48,6 +48,9 @@ def check_heartbeats(app):
     cfg = Config.get_instance()
     timeout_sec = cfg.get("heartbeat.timeout_sec", 180)
     alert_cooldown = cfg.get("heartbeat.alert_cooldown_sec", 1800)
+    # 飞书通知开关：默认关闭（本地非 dev / 正式环境禁用），
+    # 仅当配置 feishu.enabled=true 时发送离线/恢复卡片
+    feishu_enabled = cfg.get("feishu.enabled", False)
     cache = get_cache()
 
     with app.app_context():
@@ -76,7 +79,7 @@ def check_heartbeats(app):
             offline = last_ts <= 0 or (now - last_ts) > timeout_sec
 
             if offline:
-                if not cache.has_alert(name):
+                if feishu_enabled and not cache.has_alert(name):
                     logger.warning("心跳离线: %s last=%s", name, last_str or "无记录")
                     resp = feishu.send_heartbeat_alert(
                         name, last_str or "无记录",
@@ -90,7 +93,7 @@ def check_heartbeats(app):
                     _notify_status(name, False, last_str,
                                    _fmt(agent.last_tick_at))
             else:
-                if cache.has_alert(name):
+                if feishu_enabled and cache.has_alert(name):
                     logger.info("心跳恢复: %s", name)
                     feishu.send_heartbeat_recover(name)
                     cache.clear_alert(name)

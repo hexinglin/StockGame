@@ -42,6 +42,9 @@ AGENT_NAME = "qmt_live"
 HEARTBEAT_INTERVAL = 60                   # 心跳周期（秒）
 SYNC_TIMEOUT = 10
 
+# tick 上传失败时的本地归档目录（D 盘专属文件夹，按天一个文件追加）
+_FAIL_TICK_DIR = r"D:\StockGame\TickFailed"
+
 _last_sent_time = None   # 上次已上报的 time_key（秒级节流，防同秒重复推送）
 
 
@@ -57,7 +60,11 @@ def _logdata(data):
     print(data["time_key"], '信息', data, time.strftime("%H:%M:%S", time.localtime(t)))
 
 def _http_post(endpoint, data, timeout=SYNC_TIMEOUT):
-    """HTTP POST 通用函数，返回解析后的 JSON dict，失败返回 None"""
+    """HTTP POST 通用函数
+
+    成功返回后端 JSON dict；失败返回 {"code": -1, "error": 异常信息}，
+    供调用方区分失败并记录到本地归档。
+    """
     url = BACKEND_URL + endpoint
     try:
         if requests is None:
@@ -72,7 +79,28 @@ def _http_post(endpoint, data, timeout=SYNC_TIMEOUT):
         return r.json()
     except Exception as e:
         _log("HTTP POST %s 失败: %s" % (endpoint, e))
-        return None
+        return {"code": -1, "error": str(e)}
+
+def _save_failed_tick(payload, error=""):
+    """tick 上传失败时，将数据按天落盘到 D 盘专属文件夹（jsonl 追加）
+
+    文件按行情所属交易日（time_key 的日期，兼容缺失时用当天本地日期）命名，
+    如 failed_2026-09-09.jsonl；每行一条 JSON，便于事后回溯/补传。
+    失败原因 error 非空时以 "_error" 字段一并写入，便于排查。
+    """
+    try:
+        date = (payload.get("time_key") or "")[:10] \
+            or time.strftime("%Y-%m-%d", time.localtime())
+        os.makedirs(_FAIL_TICK_DIR, exist_ok=True)
+        path = os.path.join(_FAIL_TICK_DIR, "failed_%s.jsonl" % date)
+        record = dict(payload)
+        if error:
+            record["_error"] = error
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        _log("tick 上传失败已落盘: %s" % path)
+    except Exception as e:
+        _log("tick 失败数据落盘异常: %s" % e)
 
 def _quote_time_key(bar):
     """从订阅推送行情提取秒级 time_key（'%Y-%m-%d %H:%M:%S'）
@@ -109,6 +137,7 @@ def _on_quote(ContextInfo, data):
     分笔推送字段为 quoter 快照: time(毫秒)/stime/lastPrice/lastClose/
     open/high/low/volume/amount（昨收字段部分版本命名 preClose）。
     """
+    payload = None
     try:
         if not isinstance(data, dict):
             return
@@ -171,9 +200,14 @@ def _on_quote(ContextInfo, data):
             "amount": _v("amount"),
         }
         _logdata(payload)
-        _http_post("/api/v1/agent/tick", payload)
+        resp = _http_post("/api/v1/agent/tick", payload)
+        if resp is None or resp.get("code") != 0:
+            _save_failed_tick(payload, error=(resp or {}).get("error", ""))
     except Exception as e:
         _log("订阅回调异常: %s" % e)
+        # 请求/组装过程抛异常时，若已生成 payload 也一并落盘保留（带错误原因）
+        if payload:
+            _save_failed_tick(payload, error=str(e))
 
 
 def heartbeat(ContextInfo):

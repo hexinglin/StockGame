@@ -4,7 +4,7 @@
 """
 import logging
 import time
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 from flask import Blueprint, jsonify, request
 from sqlalchemy import text
@@ -15,6 +15,10 @@ from ..messaging.cache import get_cache
 from ..utils.config import Config
 
 logger = logging.getLogger(__name__)
+
+# 行情/交易均为北京时间；部署容器默认 UTC（未设 TZ），datetime.now() 会偏 8 小时，
+# 导致展示的"上传时间"早于行情时间。此处固定东八区，避免依赖系统/容器时区。
+_CN_TZ = timezone(timedelta(hours=8))
 
 agent_bp = Blueprint("agent", __name__, url_prefix="/api/v1/agent")
 
@@ -103,7 +107,8 @@ def upload_tick():
         "volume": data.get("volume", 0),
         "amount": data.get("amount", 0),
         "last_close": last_close_val,
-        "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        # 上传时间按东八区（北京时间）格式化，与行情 time_key 保持一致时区
+        "created_at": datetime.now(_CN_TZ).strftime("%Y-%m-%d %H:%M:%S"),
     })
 
     if not day_ok:

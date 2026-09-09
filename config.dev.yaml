@@ -28,6 +28,8 @@ heartbeat:
 
 feishu:
   webhook_url: "https://open.feishu.cn/open-apis/bot/v2/hook/f91e7e9b-05f8-44a3-8b02-3ffd8c488f3a"
+  # dev 环境开启飞书通知（QMT 离线/恢复告警）
+  enabled: true
 
 game:
   stock_code: "588000.SH"

@@ -1343,12 +1343,14 @@ function renderLatest(el, d) {
     const chgCls = up ? "up" : "down";
     const sign = chg >= 0 ? "+" : "-";
     const tm = d.trade_date || (d.time_key || "").slice(0, 10);
-    const hhmm = (d.time_key || "").length >= 16 ? d.time_key.slice(11, 16) : (d.time_key || "--:--");
+    // 行情时间显示到秒（time_key 为 "YYYY-MM-DD HH:MM:SS"），缺秒时回退到分
+    const hhmmss = (d.time_key || "").length >= 19 ? d.time_key.slice(11, 19)
+        : ((d.time_key || "").length >= 16 ? d.time_key.slice(11, 16) : (d.time_key || "--:--"));
     el.innerHTML = `
         <div class="latest-stock">
             <span class="rc-code">${d.code || "--"}</span>
             <span class="src-tag qmt">QMT</span>
-            <span class="latest-date">${tm} ${hhmm}</span>
+            <span class="latest-date">${tm} ${hhmmss}</span>
         </div>
         <div class="latest-price">
             <span class="big-price ${up ? "up" : "down"}">${fmt(close, 3)}</span>
@@ -1363,7 +1365,7 @@ function renderLatest(el, d) {
             <div class="acct-item"><span>最低</span><b class="down">${fmt(Number(d.low), 3)}</b></div>
             <div class="acct-item"><span>昨收</span><b>${fmt(lastClose, 3)}</b></div>
             <div class="acct-item"><span>成交量</span><b>${fmtVol(Number(d.volume))}</b></div>
-            <div class="acct-item"><span>成交额</span><b>${fmt(Number(d.amount))}</b></div>
+            <div class="acct-item"><span>成交额</span><b>${fmtVol(Number(d.amount))}</b></div>
             <div class="acct-item"><span>上传时间</span><b class="latest-up">${d.created_at || "--"}</b></div>
             <div class="acct-item"><span>Agent</span><b>${d.agent_name || "unknown"}</b></div>
         </div>`;
