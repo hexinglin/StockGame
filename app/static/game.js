@@ -1311,6 +1311,79 @@ async function saveGridConfig() {
     if (ov) ov.addEventListener("click", closeConfig);
 })();
 
+// ───────────── 最新上传记录浮层 ─────────────
+async function openLatestUpload() {
+    const overlay = document.getElementById("latestOverlay");
+    const content = document.getElementById("latestContent");
+    if (!overlay || !content) return;
+    overlay.style.display = "flex";
+    content.innerHTML = '<div class="latest-loading">⏳ 加载中…</div>';
+    try {
+        const resp = await api("/api/v1/agent/latest");
+        if (resp.data) renderLatest(content, resp.data);
+        else renderLatestEmpty(content);
+    } catch (e) {
+        content.innerHTML = '<div class="latest-empty"><div class="latest-empty-icon">😕</div>' +
+            '<p class="latest-empty-title">加载失败</p><p class="latest-empty-tip">' +
+            (e.message || "请求出错") + '</p></div>';
+    }
+}
+
+function closeLatest() {
+    const overlay = document.getElementById("latestOverlay");
+    if (overlay) overlay.style.display = "none";
+}
+
+function renderLatest(el, d) {
+    const close = Number(d.close) || 0;
+    const lastClose = Number(d.last_close) || 0;
+    const up = close >= lastClose;
+    const chg = close - lastClose;
+    const pct = lastClose ? chg / lastClose * 100 : 0;
+    const chgCls = up ? "up" : "down";
+    const sign = chg >= 0 ? "+" : "-";
+    const tm = d.trade_date || (d.time_key || "").slice(0, 10);
+    const hhmm = (d.time_key || "").length >= 16 ? d.time_key.slice(11, 16) : (d.time_key || "--:--");
+    el.innerHTML = `
+        <div class="latest-stock">
+            <span class="rc-code">${d.code || "--"}</span>
+            <span class="src-tag qmt">QMT</span>
+            <span class="latest-date">${tm} ${hhmm}</span>
+        </div>
+        <div class="latest-price">
+            <span class="big-price ${up ? "up" : "down"}">${fmt(close, 3)}</span>
+            <span class="chg-box">
+                <span class="chg ${chgCls}">${sign}${fmt(Math.abs(chg), 3)}</span>
+                <span class="chg ${chgCls}">${sign}${Math.abs(pct).toFixed(2)}%</span>
+            </span>
+        </div>
+        <div class="latest-grid">
+            <div class="acct-item"><span>今开</span><b>${fmt(Number(d.open), 3)}</b></div>
+            <div class="acct-item"><span>最高</span><b class="up">${fmt(Number(d.high), 3)}</b></div>
+            <div class="acct-item"><span>最低</span><b class="down">${fmt(Number(d.low), 3)}</b></div>
+            <div class="acct-item"><span>昨收</span><b>${fmt(lastClose, 3)}</b></div>
+            <div class="acct-item"><span>成交量</span><b>${fmtVol(Number(d.volume))}</b></div>
+            <div class="acct-item"><span>成交额</span><b>${fmt(Number(d.amount))}</b></div>
+            <div class="acct-item"><span>上传时间</span><b class="latest-up">${d.created_at || "--"}</b></div>
+            <div class="acct-item"><span>Agent</span><b>${d.agent_name || "unknown"}</b></div>
+        </div>`;
+}
+
+function renderLatestEmpty(el) {
+    el.innerHTML = `
+        <div class="latest-empty">
+            <div class="latest-empty-icon">📭</div>
+            <p class="latest-empty-title">暂无上传数据</p>
+            <p class="latest-empty-tip">QMT Agent 上传行情后即可在此查看；<br>数据保存在 Redis，保留 25 小时。</p>
+        </div>`;
+}
+
+// 点击浮层外关闭
+(function () {
+    const ov = document.getElementById("latestOverlay");
+    if (ov) ov.addEventListener("click", closeLatest);
+})();
+
 // ───────────── 快捷键帮助浮层 ─────────────
 function toggleHelp() {
     const el = document.getElementById("helpOverlay");

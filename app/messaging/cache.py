@@ -23,9 +23,12 @@ QUOTE_LIVE_KEY = "game:quote:live"
 QUOTE_ROUND_PREFIX = "game:quote"
 # 用户配置（网格等参数，可写覆盖，Redis 优先于 config.yaml 默认值）
 CFG_KEY_PREFIX = "game:cfg"
+# 最新上传记录（QMT 上传的最近一条行情快照）
+AGENT_LATEST_KEY = "agent:latest_upload"
 
 _TTL_ACCT = 86400 * 30       # 账户 30 天
 _TTL_QUOTE = 86400 * 7       # 行情快照 7 天
+_TTL_LATEST = 25 * 3600      # 最新上传记录 25 小时
 
 
 class RedisCache:
@@ -229,6 +232,29 @@ class RedisCache:
             self._client.delete(prefix)
         except Exception as e:
             logger.warning("行情快照删除失败: %s", e)
+
+    # ── 最新上传记录 ──
+
+    def save_latest_upload(self, record: dict):
+        """保存 QMT 最新上传的行情快照记录（25 小时过期）"""
+        if not self.available:
+            return
+        try:
+            self._client.setex(AGENT_LATEST_KEY, _TTL_LATEST, json.dumps(record))
+        except Exception as e:
+            logger.warning("最新上传记录保存失败: %s", e)
+
+    def load_latest_upload(self):
+        """读取最新上传记录，无则返回 None"""
+        if not self.available:
+            return None
+        try:
+            raw = self._client.get(AGENT_LATEST_KEY)
+            if raw:
+                return json.loads(raw)
+        except Exception as e:
+            logger.warning("最新上传记录读取失败: %s", e)
+        return None
 
     # ── 用户配置（可写覆盖） ──
 

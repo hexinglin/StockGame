@@ -15,7 +15,7 @@
     <header id="top-bar">
         <div class="top-left">
             <h1>StockGame <span class="sub">股票模拟交易游戏</span></h1>
-            <span class="mode-badge" id="agentStatusBadge" title="行情采集 Agent 实时在线状态（socket 推送，离线约 3 分钟无心跳判定）">Agent: --</span>
+            <span class="mode-badge" id="agentStatusBadge" title="行情采集 Agent 实时在线状态（socket 推送，离线约 3 分钟无心跳判定）；点击查看最新上传记录" onclick="openLatestUpload()">Agent: --</span>
         </div>
         <div class="top-right">
             <span class="ws-status" id="wsStatus" title="与后端的实时推送连接状态（打开页面即建立）">● 未连接</span>
@@ -221,6 +221,18 @@
             <tr><td class="key">?</td><td>显示 / 关闭本帮助</td></tr>
         </table>
         <p class="help-tip">提示：输入框聚焦时快捷键不生效</p>
+    </div>
+</div>
+
+<!-- 最新上传记录浮层（点击 Agent 徽标查看） -->
+<div class="help-overlay" id="latestOverlay" style="display:none;">
+    <div class="latest-panel" onclick="event.stopPropagation()">
+        <div class="config-head">
+            <h3>📡 最新上传记录</h3>
+            <button class="config-close" onclick="closeLatest()">✕</button>
+        </div>
+        <div class="config-desc">QMT Agent 上传的最近一条行情快照（数据保存于 Redis，保留 25 小时）</div>
+        <div id="latestContent"></div>
     </div>
 </div>
 

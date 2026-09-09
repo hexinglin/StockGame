@@ -47,9 +47,12 @@ body {
 .mode-badge {
     background: #2a3454; color: var(--text2);
     padding: 3px 10px; border-radius: 10px; font-size: 11px;
+    cursor: pointer; transition: background .15s, color .15s;
 }
 .mode-badge.alive { background: rgba(35,178,109,.15); color: var(--ok); }
 .mode-badge.dead { background: rgba(212,61,61,.15); color: var(--danger); }
+.mode-badge.alive:hover { background: rgba(35,178,109,.3); color: #fff; }
+.mode-badge.dead:hover { background: rgba(212,61,61,.3); color: #fff; }
 
 .ws-status { font-size: 12px; color: var(--text2); }
 .ws-status.ok { color: var(--ok); }
@@ -447,6 +450,27 @@ body {
 .config-row input:focus { border-color: var(--primary); }
 .cfg-note { font-size: 11px; color: #5a6280; white-space: nowrap; }
 .config-actions { display: flex; gap: 10px; justify-content: flex-end; }
+
+/* ── 最新上传记录浮层 ── */
+.latest-panel {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+    padding: 20px 24px; min-width: 480px; max-width: 560px;
+}
+.latest-stock { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
+.latest-stock .rc-code { font-size: 18px; font-weight: 700; color: #fff; }
+.latest-date { color: var(--text2); font-size: 12px; margin-left: auto; font-variant-numeric: tabular-nums; }
+.latest-price { display: flex; align-items: baseline; gap: 14px; margin-bottom: 16px; }
+.latest-price .big-price { font-size: 30px; }
+.latest-price .chg-box { flex-direction: row; gap: 10px; }
+.latest-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; }
+.latest-grid .acct-item { border: 1px solid var(--border); }
+.latest-grid .acct-item b { font-size: 14px; }
+.latest-up { color: var(--text2); font-size: 11px; font-weight: 400; }
+.latest-loading { text-align: center; color: var(--text2); padding: 32px 0; }
+.latest-empty { text-align: center; padding: 26px 0 14px; }
+.latest-empty-icon { font-size: 42px; margin-bottom: 12px; }
+.latest-empty-title { font-size: 15px; color: var(--text); font-weight: 600; margin-bottom: 8px; }
+.latest-empty-tip { font-size: 12px; color: var(--text2); line-height: 1.8; }
 
 @media (max-width: 1100px) {
     .game-layout { grid-template-columns: 1fr; }

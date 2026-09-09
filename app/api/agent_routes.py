@@ -82,12 +82,28 @@ def upload_tick():
     # 更新 agent_status.last_tick_at（无论 day 是否暂缓，agent 活跃状态照常维护）
     _touch_agent(agent_name, tick=True)
 
-    # 更新 Redis 最新行情快照（全局 live）；昨收取 game_days 维护值
+    # 更新 Redis 最新行情快照（全局 live）+ 最新一条上传记录；昨收取 game_days 维护值
     cache = get_cache()
+    last_close_val = engine.day_last_close(code, trade_date, "qmt")
     cache.save_quote("live", {
         "code": code, "time_key": time_key,
         "close": data.get("close", 0),
-        "last_close": engine.day_last_close(code, trade_date, "qmt"),
+        "last_close": last_close_val,
+    })
+    # 最新一条上传记录（QMT 在线时点击页面徽标查看），25 小时过期
+    cache.save_latest_upload({
+        "agent_name": agent_name,
+        "code": code,
+        "trade_date": trade_date,
+        "time_key": time_key,
+        "open": data.get("open", 0),
+        "high": data.get("high", 0),
+        "low": data.get("low", 0),
+        "close": data.get("close", 0),
+        "volume": data.get("volume", 0),
+        "amount": data.get("amount", 0),
+        "last_close": last_close_val,
+        "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     })
 
     if not day_ok:
@@ -159,6 +175,14 @@ def agent_status():
             "redis_heartbeat_ts": cache.get_heartbeat(r.agent_name),
         })
     return jsonify({"code": 0, "data": result})
+
+
+@agent_bp.route("/latest", methods=["GET"])
+def latest_upload():
+    """查询最新一条上传记录（来自 Redis，25 小时过期；无则 data 为 None）"""
+    cache = get_cache()
+    record = cache.load_latest_upload()
+    return jsonify({"code": 0, "data": record})
 
 
 def _touch_agent(agent_name: str, tick: bool = False):
