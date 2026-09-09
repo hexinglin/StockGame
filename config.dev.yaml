@@ -35,3 +35,12 @@ game:
   initial_cash: 500000
   fee_rate: 0.0001
   tick_sec: 3
+  # 网格表默认参数（可在配置页覆盖，写 Redis 优先于此处）
+  grid:
+    grid_spacing: 0.005     # 网格间隔（绝对价格）
+    init_value: 0.003       # 买点线初始值（x=0 时买点价）
+    offset: 0.001           # off 值（卖点线偏移）
+    interval: 2             # 间隔（下拉 1/2/4/6）：买卖格号偏移 = interval - 1
+    grid_up: 8              # 锚点上方网格行数
+    grid_down: 8            # 锚点下方网格行数
+    hit_tolerance: 0.001    # 成交触发命中容差（绝对价格 ±）
