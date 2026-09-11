@@ -20,6 +20,7 @@ from ..dbdata.models import (GameRound, GameOrder, GameTrade, GameDay,
                              TickData, TickDataSim)
 from ..messaging.cache import get_cache
 from ..utils.config import Config
+from ..utils.timeutil import now_cn
 from .account import MockAccount
 from .grid_math import (normalize_params, build_grid_rows, mark_grid_status,
                         derive_gradient_rows)
@@ -879,7 +880,7 @@ class GameEngine:
                 return True, "轮次已到尾端，自动结算完成"
 
             r.status = ST_RUNNING
-            r.started_at = r.started_at or datetime.now()
+            r.started_at = r.started_at or now_cn()
             self._attach_account_json(r, ctx)   # 初始/恢复后的账户随行落库
             db.session.commit()
             self._save_snapshot(ctx)
@@ -1337,7 +1338,7 @@ class GameEngine:
                 final = 0
             r.final_assets = round(final, 2)
             r.status = ST_FINISHED
-            r.finished_at = datetime.now()
+            r.finished_at = now_cn()
             if ctx:
                 # 同步内存态（时钟据此停止推进）
                 ctx.round.status = ST_FINISHED

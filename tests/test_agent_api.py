@@ -8,36 +8,39 @@ import pytest
 from app.dbdata.database import db
 from app.dbdata.models import (TickData, AgentStatus, GameDay)
 from app.messaging.cache import get_cache
+from app.utils.timeutil import ts_from_cn
 
 # 测试写入使用的 agent 名 / 标的（与真实数据隔离，测试后统一清理）
 _API_CODE = "API588000"
-_AGENTS = ("test_agent", "hb_test")
+_AGENTS = ("test_agent", "hb_test", "role_test", "del_test")
 
 
 @pytest.fixture(scope="module", autouse=True)
 def _cleanup_agent_test_data(app):
-    """模块级清理：测试写入的行情/日记录/agent 状态/Redis 心跳不留库
+    """模块级清理：测试写入的行情/日记录/agent 状态/Redis 心跳/上传记录不留库
 
     setup 清历史遗留（防影响断言），teardown 清本次用例写入（tick 接口会
-    派生 game_days、覆盖 live 行情快照，需一并恢复）。
+    派生 game_days、覆盖 live 行情快照与上传记录，需一并恢复）。
     """
-    with app.app_context():
-        TickData.query.filter_by(code=_API_CODE).delete()
-        GameDay.query.filter_by(code=_API_CODE).delete()
-        for name in _AGENTS:
-            AgentStatus.query.filter_by(agent_name=name).delete()
-        db.session.commit()
+    _cleanup_agent_data(app)
     yield
+    _cleanup_agent_data(app)
+
+
+def _cleanup_agent_data(app):
     with app.app_context():
         TickData.query.filter_by(code=_API_CODE).delete()
         GameDay.query.filter_by(code=_API_CODE).delete()
         for name in _AGENTS:
             AgentStatus.query.filter_by(agent_name=name).delete()
         db.session.commit()
-        for name in _AGENTS:
-            get_cache().delete_heartbeat(name)
-        # tick 上传会覆盖全局实时行情快照，测试后清除（真实 agent 下次上报自动重建）
-        get_cache().delete_quote("live")
+    cache = get_cache()
+    for name in _AGENTS:
+        cache.delete_heartbeat(name)
+        cache.delete_latest_upload(name)   # 按 Agent 分键的上传记录
+    # tick 上传会覆盖全局实时行情快照与全局上传记录，测试后清除（真实 agent 下次上报自动重建）
+    cache.delete_quote("live")
+    cache.delete_latest_upload()
 
 
 class TestTickAPI:
@@ -137,7 +140,8 @@ class TestHeartbeatAPI:
             st = AgentStatus.query.filter_by(agent_name="hb_test").first()
             assert st is not None
             assert st.is_alive is True
-            assert abs(st.last_heartbeat_at.timestamp() - ts) < 2
+            # 库内为北京时间墙钟 → 显式按东八区反解（与进程时区无关）
+            assert abs(ts_from_cn(st.last_heartbeat_at) - ts) < 2
         assert abs(get_cache().get_heartbeat("hb_test") - ts) < 2
 
     def test_heartbeat_missing_name(self, client):
@@ -150,3 +154,73 @@ class TestHeartbeatAPI:
         data = resp.get_json()["data"]
         names = [x["agent_name"] for x in data]
         assert "hb_test" in names
+
+
+class TestMultiAgentStatus:
+    def test_heartbeat_with_role_enriches_status(self, client):
+        """心跳携带 role：状态查询返回角色/心跳年龄/上传标记"""
+        resp = client.post("/api/v1/agent/heartbeat", json={
+            "agent_name": "role_test", "role": "行情采集",
+            "timestamp": time.time()})
+        assert resp.get_json()["code"] == 0
+        data = client.get("/api/v1/agent/status").get_json()["data"]
+        me = [x for x in data if x["agent_name"] == "role_test"]
+        assert len(me) == 1
+        assert me[0]["role"] == "行情采集"
+        assert me[0]["is_alive"] is True
+        assert me[0]["age_sec"] is not None and me[0]["age_sec"] < 60
+        assert me[0]["has_latest_upload"] is False
+
+    def test_status_offline_first_order(self, client, app):
+        """多 Agent 状态：离线优先排序（先暴露问题）"""
+        now = time.time()
+        for name in ("role_test", "hb_test"):
+            client.post("/api/v1/agent/heartbeat",
+                        json={"agent_name": name, "timestamp": now})
+        with app.app_context():
+            st = AgentStatus.query.filter_by(agent_name="hb_test").first()
+            st.is_alive = False
+            db.session.commit()
+        data = client.get("/api/v1/agent/status").get_json()["data"]
+        names = [x["agent_name"] for x in data
+                 if x["agent_name"] in ("role_test", "hb_test")]
+        assert names == ["hb_test", "role_test"]   # 离线在前
+
+    def test_per_agent_latest_upload(self, client):
+        """/latest?agent= 返回该 Agent 最近一条；缺省返回全局最近一条"""
+        payload = {
+            "agent_name": "test_agent", "code": "API588000",
+            "trade_date": "2099-02-01", "time_key": "2099-02-01 09:30:00",
+            "open": 1.0, "high": 1.01, "low": 0.99, "close": 1.005,
+            "volume": 1000, "amount": 1005, "last_close": 1.0,
+        }
+        assert client.post("/api/v1/agent/tick", json=payload).get_json()["code"] == 0
+        me = client.get("/api/v1/agent/latest?agent=test_agent").get_json()["data"]
+        assert me and me["agent_name"] == "test_agent"
+        assert me["time_key"] == "2099-02-01 09:30:00"
+        glob = client.get("/api/v1/agent/latest").get_json()["data"]
+        assert glob and glob["agent_name"] == "test_agent"
+        # 状态查询附 has_latest_upload 标记（监控面板据此显示入口）
+        data = client.get("/api/v1/agent/status").get_json()["data"]
+        row = [x for x in data if x["agent_name"] == "test_agent"][0]
+        assert row["has_latest_upload"] is True
+        # 未上报的 Agent → 无分键记录
+        assert client.get("/api/v1/agent/latest?agent=role_test").get_json()["data"] is None
+
+
+class TestAgentRemoval:
+    def test_delete_requires_offline(self, client, app):
+        """Agent 移除：在线拒绝；离线可删（连带清理心跳，再删 404）"""
+        client.post("/api/v1/agent/heartbeat", json={
+            "agent_name": "del_test", "timestamp": time.time()})
+        resp = client.delete("/api/v1/agent/status/del_test")
+        assert resp.status_code == 400          # 在线拒绝
+        with app.app_context():
+            AgentStatus.query.filter_by(agent_name="del_test").first().is_alive = False
+            db.session.commit()
+        resp = client.delete("/api/v1/agent/status/del_test")
+        assert resp.get_json()["code"] == 0
+        with app.app_context():
+            assert AgentStatus.query.filter_by(agent_name="del_test").first() is None
+        assert get_cache().get_heartbeat("del_test") == 0
+        assert client.delete("/api/v1/agent/status/del_test").status_code == 404

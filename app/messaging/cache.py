@@ -25,6 +25,11 @@ QUOTE_ROUND_PREFIX = "game:quote"
 CFG_KEY_PREFIX = "game:cfg"
 # 最新上传记录（QMT 上传的最近一条行情快照）
 AGENT_LATEST_KEY = "agent:latest_upload"
+# QMT 交易记录拉取：命令单命令槽（TTL 到期自动失效）
+# 结果数据不在此缓存 — 持久化在 PostgreSQL（engine/trade_store.py）
+TRADE_CMD_KEY = "agent:trade_fetch_cmd"
+# 命令有效期：下发后 2 分钟自动失效（Redis TTL 到期即删除）
+TRADE_CMD_TTL_SEC = 2 * 60
 
 _TTL_ACCT = 86400 * 30       # 账户 30 天
 _TTL_QUOTE = 86400 * 7       # 行情快照 7 天
@@ -233,28 +238,114 @@ class RedisCache:
         except Exception as e:
             logger.warning("行情快照删除失败: %s", e)
 
-    # ── 最新上传记录 ──
+    # ── 最新上传记录（按 Agent 分键 + 全局最新） ──
 
     def save_latest_upload(self, record: dict):
-        """保存 QMT 最新上传的行情快照记录（25 小时过期）"""
+        """保存 QMT 最新上传的行情快照记录（25 小时过期）
+
+        record 需携带 agent_name：按 Agent 存 agent:latest_upload:{name}
+        （供监控面板查看各 Agent 的最近上传），同时覆盖全局键（保留
+        "最近一次上传"语义，兼容旧查询）。
+        """
         if not self.available:
             return
         try:
-            self._client.setex(AGENT_LATEST_KEY, _TTL_LATEST, json.dumps(record))
+            raw = json.dumps(record)
+            name = str(record.get("agent_name") or "").strip()
+            if name:
+                self._client.setex(f"{AGENT_LATEST_KEY}:{name}",
+                                   _TTL_LATEST, raw)
+            self._client.setex(AGENT_LATEST_KEY, _TTL_LATEST, raw)
         except Exception as e:
             logger.warning("最新上传记录保存失败: %s", e)
 
-    def load_latest_upload(self):
-        """读取最新上传记录，无则返回 None"""
+    def load_latest_upload(self, agent_name: str = None):
+        """读取最新上传记录：指定 agent_name → 该 Agent 最近一条；
+        否则全局最近一条（任何 Agent 的最后一次上传）；无则 None"""
         if not self.available:
             return None
         try:
-            raw = self._client.get(AGENT_LATEST_KEY)
+            key = f"{AGENT_LATEST_KEY}:{agent_name}" if agent_name else AGENT_LATEST_KEY
+            raw = self._client.get(key)
             if raw:
                 return json.loads(raw)
         except Exception as e:
             logger.warning("最新上传记录读取失败: %s", e)
         return None
+
+    def has_latest_upload(self, agent_name: str) -> bool:
+        """该 Agent 是否有最近上传记录（监控面板据此显示"上传记录"入口）"""
+        if not self.available:
+            return False
+        try:
+            return bool(self._client.exists(f"{AGENT_LATEST_KEY}:{agent_name}"))
+        except Exception as e:
+            logger.warning("最新上传记录检查失败: %s", e)
+            return False
+
+    def delete_latest_upload(self, agent_name: str = None):
+        """删除上传记录：指定 agent_name → 删该 Agent 分键；缺省删全局键
+        （删除 Agent / 测试清理用）"""
+        if not self.available:
+            return
+        try:
+            key = f"{AGENT_LATEST_KEY}:{agent_name}" if agent_name else AGENT_LATEST_KEY
+            self._client.delete(key)
+        except Exception as e:
+            logger.warning("最新上传记录删除失败: %s", e)
+
+    # ── QMT 交易记录拉取命令（结果落库，见 engine/trade_store.py） ──
+
+    def save_trade_fetch_cmd(self, cmd: dict):
+        """写入交易记录拉取命令（单命令槽，TTL 2 分钟自动失效）
+
+        再次下发直接覆盖旧命令；Agent 每 10s 直读该键；结果上报后由
+        delete_trade_fetch_cmd 删除；超时未执行则 Redis TTL 到期自动消失。
+        """
+        if not self.available:
+            return
+        try:
+            cmd.setdefault("ts", time.time())
+            self._client.setex(TRADE_CMD_KEY, TRADE_CMD_TTL_SEC,
+                               json.dumps(cmd, ensure_ascii=False))
+        except Exception as e:
+            logger.warning("交易拉取命令写入失败: %s", e)
+
+    def load_trade_fetch_cmd(self):
+        """读取当前命令（直读 Redis 单键），无则 None"""
+        if not self.available:
+            return None
+        try:
+            raw = self._client.get(TRADE_CMD_KEY)
+            if raw:
+                return json.loads(raw)
+        except Exception as e:
+            logger.warning("交易拉取命令读取失败: %s", e)
+        return None
+
+    def delete_trade_fetch_cmd(self, cmd_id: str = ""):
+        """删除命令（结果上报后调用）；cmd_id 匹配时才删，
+        防止误删上报期间用户重新下发、已覆盖的新命令
+        """
+        if not self.available:
+            return
+        try:
+            if cmd_id:
+                cmd = self.load_trade_fetch_cmd()
+                if cmd and cmd.get("cmd_id") != cmd_id:
+                    return
+            self._client.delete(TRADE_CMD_KEY)
+        except Exception as e:
+            logger.warning("交易拉取命令删除失败: %s", e)
+
+    def reset_trade_fetch_commands(self):
+        """清空命令（测试/维护辅助）"""
+        if not self.available:
+            return
+        try:
+            self._client.delete(TRADE_CMD_KEY)
+        except Exception as e:
+            logger.warning("交易拉取命令重置失败: %s", e)
 
     # ── 用户配置（可写覆盖） ──
 

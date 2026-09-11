@@ -1,10 +1,9 @@
 """
 游戏轮次 ORM 模型
 """
-from datetime import datetime
-
 from sqlalchemy import Column, String, Integer, Float, DateTime, Text
 from ..database import Base
+from ...utils.timeutil import now_cn
 
 
 class GameRound(Base):
@@ -16,7 +15,7 @@ class GameRound(Base):
     status = Column(String(20), default="ready")  # ready/running/paused/finished/aborted
     speed = Column(Integer, default=1)            # 1/5/10/60
     data_source = Column(String(10), default="qmt")  # 行情数据源: qmt(实盘)/sim(转换模拟)
-    created_at = Column(DateTime, default=datetime.now)
+    created_at = Column(DateTime, default=now_cn)
     started_at = Column(DateTime)
     finished_at = Column(DateTime)
     initial_cash = Column(Float, default=0)

@@ -2,10 +2,9 @@
 转换模拟快照行情 ORM 模型 — stockkline 1min → 3s 等间隔快照流
 （QMT 无该日数据时的兑底数据源；结构同 tick_data，均为当日快照口径）
 """
-from datetime import datetime
-
 from sqlalchemy import Column, String, Float, BigInteger, DateTime, UniqueConstraint
 from ..database import Base
+from ...utils.timeutil import now_cn
 
 
 class TickDataSim(Base):
@@ -23,4 +22,4 @@ class TickDataSim(Base):
     close = Column(Float)            # 最新价
     volume = Column(BigInteger, default=0)     # 当日累计成交量
     amount = Column(Float, default=0)          # 当日累计成交额
-    created_at = Column(DateTime, default=datetime.now)
+    created_at = Column(DateTime, default=now_cn)

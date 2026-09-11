@@ -16,11 +16,10 @@
   数据（昨收/今开/OHLC）均查本表（is_complete 完整日标记），tick 表仅在游戏
   运行时读取。
 """
-from datetime import datetime
-
 from sqlalchemy import (BigInteger, Boolean, Column, DateTime, Float, Integer,
                         String, UniqueConstraint)
 from ..database import Base
+from ...utils.timeutil import now_cn
 
 
 class GameDay(Base):
@@ -48,8 +47,8 @@ class GameDay(Base):
     first_time_key = Column(String(19), default="")  # 首条快照时间
     last_time_key = Column(String(19), default="")   # 末条快照时间
     is_complete = Column(Boolean, default=False)     # 完整交易日（末条快照 >= 15:00:00）
-    created_at = Column(DateTime, default=datetime.now)
-    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+    created_at = Column(DateTime, default=now_cn)
+    updated_at = Column(DateTime, default=now_cn, onupdate=now_cn)
 
     def to_dict(self) -> dict:
         return {

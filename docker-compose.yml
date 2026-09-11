@@ -14,6 +14,8 @@ services:
     environment:
       # 容器内通过 host.docker.internal 访问宿主机中间件
       STOCKGAME_CONFIG: /app/config.dev.yaml
+      # 统一时区：北京时间（与应用时间口径一致；容器默认 UTC 会偏 8 小时）
+      TZ: Asia/Shanghai
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:

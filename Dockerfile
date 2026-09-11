@@ -16,8 +16,13 @@ RUN if [ -f /etc/apt/sources.list.d/debian.sources ]; then \
 # pip 国内源（pip 原生读取该环境变量）
 ENV PIP_INDEX_URL="${PIP_INDEX_URL}"
 
+# 统一时区：北京时间（容器默认 UTC 会导致日志等 naive 时间偏差 8 小时；
+# 应用层时间已由 app/utils/timeutil.py 统一为东八区，此处让系统时钟/日志一致）
+ENV TZ=Asia/Shanghai
+
 # 安装系统依赖
-RUN apt-get update && apt-get install -y --no-install-recommends gcc && \
+RUN apt-get update && apt-get install -y --no-install-recommends gcc tzdata && \
+    ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone && \
     rm -rf /var/lib/apt/lists/*
 
 # 安装 Python 依赖

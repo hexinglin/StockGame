@@ -39,6 +39,7 @@ _stock_code = "588000.SH"
 _QUOTE_PERIOD = "tick"                  # 订阅周期：tick=分笔（快照变化即推送）
 BACKEND_URL = "http://192.168.1.5:16000"   # StockGame 后端地址（部署后按实际修改）
 AGENT_NAME = "qmt_live"
+AGENT_ROLE = "行情采集"                    # 角色（心跳上报，监控面板展示）
 HEARTBEAT_INTERVAL = 60                   # 心跳周期（秒）
 SYNC_TIMEOUT = 10
 
@@ -214,6 +215,7 @@ def heartbeat(ContextInfo):
     """run_time 定时回调 — 每 60s 上报一次心跳，与行情上传解耦"""
     _http_post("/api/v1/agent/heartbeat", {
         "agent_name": AGENT_NAME,
+        "role": AGENT_ROLE,
         "timestamp": time.time(),
     })
 

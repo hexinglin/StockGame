@@ -2,13 +2,14 @@
 模块名称: engine/heartbeat.py
 说明:    心跳维护 — 按配置周期检查（默认 15s），离线则飞书告警（防抖 30 分钟），
          恢复发送恢复通知；状态变化经 socket 广播，主页面实时展示 agent 在线状态
+         时间口径：统一北京时间（utils/timeutil，与进程/容器时区解耦）
 """
 import logging
 import time
-from datetime import datetime
 
 from ..utils.config import Config
 from ..utils import feishu
+from ..utils.timeutil import fmt_cn, from_ts_cn, ts_from_cn
 from ..messaging.cache import get_cache
 
 logger = logging.getLogger(__name__)
@@ -17,17 +18,14 @@ logger = logging.getLogger(__name__)
 _checker_started = False
 
 
-def _fmt(dt):
-    """datetime → 展示字符串，空值返回 None"""
-    return dt.strftime("%Y-%m-%d %H:%M:%S") if dt else None
-
-
-def _notify_status(agent_name, is_alive, last_heartbeat_at, last_tick_at):
-    """socket 广播 agent 状态变化（主页面实时刷新 Agent 徽标）"""
+def _notify_status(agent_name, is_alive, last_heartbeat_at, last_tick_at,
+                   role=""):
+    """socket 广播 agent 状态变化（主页面 Agent 徽标/监控面板实时刷新）"""
     try:
         from ..engine.game_engine import get_engine
         get_engine().emit("agent:status", {
             "agent_name": agent_name,
+            "role": role or "",
             "is_alive": is_alive,
             "last_heartbeat_at": last_heartbeat_at,
             "last_tick_at": last_tick_at,
@@ -66,15 +64,16 @@ def check_heartbeats(app):
         now = time.time()
         for agent in agents:
             name = agent.agent_name
-            # 优先 Redis（实时），Redis 不可用或没有值则用数据库
+            # 优先 Redis（实时，unix 时间戳），Redis 不可用或没有值则用数据库
+            # （库内为北京时间墙钟，显式按东八区反解，避免依赖进程时区）
             last_ts = cache.get_heartbeat(name)
             last_str = None
             if last_ts <= 0:
                 if agent.last_heartbeat_at:
-                    last_ts = agent.last_heartbeat_at.timestamp()
-                    last_str = agent.last_heartbeat_at.strftime("%Y-%m-%d %H:%M:%S")
+                    last_ts = ts_from_cn(agent.last_heartbeat_at)
+                    last_str = fmt_cn(agent.last_heartbeat_at)
             else:
-                last_str = datetime.fromtimestamp(last_ts).strftime("%Y-%m-%d %H:%M:%S")
+                last_str = fmt_cn(from_ts_cn(last_ts))
 
             offline = last_ts <= 0 or (now - last_ts) > timeout_sec
 
@@ -91,7 +90,7 @@ def check_heartbeats(app):
                     agent.is_alive = False
                     db.session.commit()
                     _notify_status(name, False, last_str,
-                                   _fmt(agent.last_tick_at))
+                                   fmt_cn(agent.last_tick_at), agent.role or "")
             else:
                 if feishu_enabled and cache.has_alert(name):
                     logger.info("心跳恢复: %s", name)
@@ -101,7 +100,7 @@ def check_heartbeats(app):
                     agent.is_alive = True
                     db.session.commit()
                     _notify_status(name, True, last_str,
-                                   _fmt(agent.last_tick_at))
+                                   fmt_cn(agent.last_tick_at), agent.role or "")
 
 
 def register_heartbeat_checker(scheduler, app):

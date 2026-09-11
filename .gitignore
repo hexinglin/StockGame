@@ -216,3 +216,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# 检查/测试辅助（QMT 探测脚本、验证截图、诊断脚本等，不入库）
+checks/

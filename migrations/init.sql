@@ -78,13 +78,47 @@ CREATE TABLE IF NOT EXISTS game_days (
 CREATE INDEX IF NOT EXISTS ix_game_days_code_date ON game_days (code, trade_date);
 CREATE INDEX IF NOT EXISTS ix_game_days_complete ON game_days (is_complete);
 
--- QMT 心跳状态
+-- QMT 心跳状态（多 Agent 注册表：行情采集/交易记录等共存；role 为心跳自报的角色）
 CREATE TABLE IF NOT EXISTS agent_status (
   id SERIAL PRIMARY KEY,
   agent_name VARCHAR(50) UNIQUE NOT NULL,
+  role VARCHAR(50) DEFAULT '',
   last_heartbeat_at TIMESTAMP,
   last_tick_at TIMESTAMP,
   is_alive BOOLEAN DEFAULT true,
+  updated_at TIMESTAMP DEFAULT now()
+);
+-- 存量库补列（幂等；全新建库由上方 CREATE 直接包含）
+ALTER TABLE agent_status ADD COLUMN IF NOT EXISTS role VARCHAR(50) DEFAULT '';
+
+-- QMT 成交明细（每日整日替换写入；source: agent=当日采集 / import=导出导入）
+-- 同一日期每次采集/导入先清空再整批写入（整日快照语义，天然幂等）
+CREATE TABLE IF NOT EXISTS trade_records (
+  id BIGSERIAL PRIMARY KEY,
+  trade_date VARCHAR(10) NOT NULL,     -- 'YYYY-MM-DD'
+  code VARCHAR(20) DEFAULT '',
+  name VARCHAR(50) DEFAULT '',
+  direction VARCHAR(10) DEFAULT '',    -- buy/sell/unknown
+  price REAL DEFAULT 0,
+  volume BIGINT DEFAULT 0,
+  amount DOUBLE PRECISION DEFAULT 0,
+  trade_time VARCHAR(19) DEFAULT '',   -- 'YYYY-MM-DD HH:MM:SS'
+  trade_id VARCHAR(50) DEFAULT '',
+  order_id VARCHAR(50) DEFAULT '',
+  source VARCHAR(10) DEFAULT '',
+  created_at TIMESTAMP DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS ix_trade_records_date ON trade_records (trade_date);
+
+-- 每日采集状态（成功/失败；成功即不再自动重发命令，失败进入补采）
+CREATE TABLE IF NOT EXISTS trade_fetch_days (
+  trade_date VARCHAR(10) PRIMARY KEY,  -- 'YYYY-MM-DD'
+  source VARCHAR(10) DEFAULT '',       -- agent/import
+  status VARCHAR(10) DEFAULT '',       -- success/failed
+  record_count INT DEFAULT 0,
+  cmd_id VARCHAR(50) DEFAULT '',
+  error TEXT DEFAULT '',
+  fetched_at TIMESTAMP,
   updated_at TIMESTAMP DEFAULT now()
 );
 

@@ -99,8 +99,10 @@ def create_app(config_path: str = None, enable_scheduler: bool = True) -> Flask:
 
         from .engine.heartbeat import register_heartbeat_checker
         from .engine.game_engine import register_game_clock
+        from .engine.trade_collector import register_trade_collector
         register_heartbeat_checker(scheduler, app)
         register_game_clock(scheduler)
+        register_trade_collector(scheduler, app)
 
     # 后端重启恢复：running → paused（进度在 Redis，可手动继续）
     _recover_running_rounds(app)

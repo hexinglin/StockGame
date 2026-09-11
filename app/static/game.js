@@ -226,7 +226,7 @@ function pickDate(v) {
     closeDateDropdown();
 }
 
-// Agent 在线状态：HTTP 全量（loadAll）+ socket 增量（agent:status）合并渲染
+// Agent 在线状态：HTTP 全量（loadAll/监控面板）+ socket 增量（agent:status）合并渲染
 let AGENTS = [];
 
 function renderAgentStatus(agent) {
@@ -235,28 +235,41 @@ function renderAgentStatus(agent) {
 }
 
 function onAgentStatus(a) {
-    // 后端推送单条状态变化（首次上线/离线恢复/超时离线）
+    // 后端推送单条状态变化（首次上线/离线恢复/超时离线/角色变更）
     if (!a || !a.agent_name) return;
     const i = AGENTS.findIndex(x => x.agent_name === a.agent_name);
     if (i >= 0) Object.assign(AGENTS[i], a);
     else AGENTS.push(Object.assign({}, a));
     renderAgentBadge();
+    if (agentPanelOpen()) refreshAgentPanel();   // 面板打开时同步（补全 age/上传标记）
 }
 
+function onAgentRemoved(d) {
+    // 后端推送 Agent 被移除（离线清理）
+    if (!d || !d.agent_name) return;
+    AGENTS = AGENTS.filter(x => x.agent_name !== d.agent_name);
+    renderAgentBadge();
+    if (agentPanelOpen()) refreshAgentPanel();
+}
+
+// 徽标：多 Agent 概要 n/m 在线——全部在线绿 / 部分离线橙 / 全部离线红
 function renderAgentBadge() {
     const badge = document.getElementById("agentStatusBadge");
     if (!badge) return;
     if (!AGENTS.length) {
         badge.textContent = "Agent: 无";
         badge.className = "mode-badge";
+        badge.title = "Agent 监控：暂无已注册 Agent（点击打开）";
         return;
     }
-    badge.textContent = "Agent: " + AGENTS
-        .map(a => `${a.agent_name} ${a.is_alive ? "在线" : "离线"}`)
-        .join(" / ");
-    // 任一 agent 离线即整体警示（红色），全部在线为绿色
+    const alive = AGENTS.filter(a => a.is_alive).length;
+    const total = AGENTS.length;
+    badge.textContent = `Agent: ${alive}/${total} 在线`;
     badge.className = "mode-badge " +
-        (AGENTS.some(a => !a.is_alive) ? "dead" : "alive");
+        (alive === total ? "alive" : (alive === 0 ? "dead" : "warn"));
+    badge.title = "Agent 监控（点击打开）：\n" + AGENTS.map(a =>
+        `${a.is_alive ? "●" : "○"} ${a.agent_name}${a.role ? "（" + a.role + "）" : ""} ${a.is_alive ? "在线" : "离线"}`
+    ).join("\n");
 }
 
 function statusText(s) {
@@ -489,8 +502,9 @@ function initSocket() {
         // socket.io 会自动重连，重连成功后上方 connect 回调恢复"已连接"
         setWsStatus("● 连接失败", "err");
     });
-    // 公共事件：agent 上线/离线实时推送（轮次管理页顶栏徽标）
+    // 公共事件：agent 上线/离线/移除实时推送（顶栏徽标 + 监控面板）
     ws.on("agent:status", onAgentStatus);
+    ws.on("agent:removed", onAgentRemoved);
     // 游戏事件：常驻注册，进入游戏后 join_round 即收到本轮次推送
     ws.on("game:quote", onQuote);
     ws.on("game:order_update", onOrderUpdate);
@@ -1328,30 +1342,158 @@ async function saveGridConfig() {
     if (ov) ov.addEventListener("click", closeConfig);
 })();
 
-// ───────────── 最新上传记录浮层 ─────────────
-async function openLatestUpload() {
-    const overlay = document.getElementById("latestOverlay");
-    const content = document.getElementById("latestContent");
-    if (!overlay || !content) return;
-    overlay.style.display = "flex";
-    content.innerHTML = '<div class="latest-loading">⏳ 加载中…</div>';
+// ───────────── Agent 监控面板 ─────────────
+// 点击顶栏 Agent 徽标打开：多 Agent 在线状态/心跳/最近行情/上传记录，离线可移除
+let AGENT_PANEL_DATA = [];       // 最近一次 /status 数据（相对时间本地推算）
+let AGENT_PANEL_TICKER = null;   // 相对时间刷新定时器（1s）
+
+function agentPanelOpen() {
+    const ov = document.getElementById("agentOverlay");
+    return !!ov && ov.style.display !== "none";
+}
+
+function openAgentPanel() {
+    const ov = document.getElementById("agentOverlay");
+    if (!ov) return;
+    ov.style.display = "flex";
+    backToAgentList();      // 每次打开回到列表视图
+    refreshAgentPanel();
+    if (!AGENT_PANEL_TICKER) AGENT_PANEL_TICKER = setInterval(updateAgentAges, 1000);
+}
+
+function closeAgentPanel() {
+    const ov = document.getElementById("agentOverlay");
+    if (ov) ov.style.display = "none";
+    if (AGENT_PANEL_TICKER) { clearInterval(AGENT_PANEL_TICKER); AGENT_PANEL_TICKER = null; }
+}
+
+async function refreshAgentPanel() {
+    if (!agentPanelOpen()) return;
     try {
-        const resp = await api("/api/v1/agent/latest");
-        if (resp.data) renderLatest(content, resp.data);
-        else renderLatestEmpty(content);
+        const resp = await api("/api/v1/agent/status");
+        AGENT_PANEL_DATA = (resp.data || []).map(a => {
+            a._recvAt = Date.now();     // 本地接收时刻：相对时间在此基准上继续走
+            return a;
+        });
+        AGENTS = AGENT_PANEL_DATA.map(a => Object.assign({}, a));
+        renderAgentBadge();
+        renderAgentSummary();
+        renderAgentList();
+    } catch (e) { toast(e.message, "error"); }
+}
+
+// 心跳相对时间：服务端 age_sec + 本地流逝时间
+function agentAgeSec(a) {
+    if (a.age_sec === null || a.age_sec === undefined) return null;
+    return a.age_sec + (Date.now() - (a._recvAt || Date.now())) / 1000;
+}
+
+function fmtAgo(sec) {
+    if (sec === null || sec === undefined) return "--";
+    sec = Math.max(0, Math.round(sec));
+    if (sec < 60) return sec + " 秒前";
+    if (sec < 3600) return Math.floor(sec / 60) + " 分钟前";
+    return Math.floor(sec / 3600) + " 小时前";
+}
+
+function updateAgentAges() {
+    if (!agentPanelOpen()) return;
+    AGENT_PANEL_DATA.forEach(a => {
+        const el = document.getElementById("agAge_" + a.agent_name);
+        if (el) el.textContent = fmtAgo(agentAgeSec(a));
+    });
+}
+
+function renderAgentSummary() {
+    const el = document.getElementById("agentSummary");
+    if (!el) return;
+    const total = AGENT_PANEL_DATA.length;
+    const alive = AGENT_PANEL_DATA.filter(a => a.is_alive).length;
+    if (!total) {
+        el.innerHTML = '<span class="ag-state">暂无 Agent</span>' +
+            '<span class="ag-note">QMT 脚本上报心跳后自动注册</span>' +
+            '<button class="btn-sm" onclick="refreshAgentPanel()">⟳ 刷新</button>';
+        return;
+    }
+    const cls = alive === total ? "ok" : (alive === 0 ? "bad" : "warn");
+    const note = alive === total ? "全部运行正常"
+        : (alive === 0 ? "全部离线，请检查脚本" : "存在离线 Agent，请检查");
+    el.innerHTML = `<span class="ag-state ${cls}">${alive}/${total} 在线</span>` +
+        `<span class="ag-note">${note}</span>` +
+        '<button class="btn-sm" onclick="refreshAgentPanel()">⟳ 刷新</button>';
+}
+
+function renderAgentList() {
+    const list = document.getElementById("agentList");
+    if (!list) return;
+    list.innerHTML = AGENT_PANEL_DATA.map(a => `
+        <div class="agent-row ${a.is_alive ? "" : "offline"}">
+            <span class="agent-dot ${a.is_alive ? "on" : "off"}"></span>
+            <div class="agent-main">
+                <div class="agent-name-line">
+                    <b>${a.agent_name}</b>
+                    ${a.role ? `<span class="agent-role">${a.role}</span>` : ""}
+                </div>
+                <div class="agent-meta">
+                    心跳 <span class="agent-age" id="agAge_${a.agent_name}">${fmtAgo(agentAgeSec(a))}</span>
+                    · ${a.last_heartbeat_at || "无记录"}
+                    ${a.last_tick_at ? ` · 最近行情 ${a.last_tick_at}` : ""}
+                </div>
+            </div>
+            <div class="agent-actions">
+                ${a.has_latest_upload ? `<button class="btn-sm" onclick="showAgentLatest('${a.agent_name}')">上传记录</button>` : ""}
+                ${a.is_alive ? "" : `<button class="btn-sm btn-danger" onclick="deleteAgent('${a.agent_name}')">移除</button>`}
+            </div>
+        </div>`).join("");
+}
+
+// 详情子视图：某 Agent 的最近一次行情上传（Redis 保留 25 小时）
+async function showAgentLatest(name) {
+    document.getElementById("agentSummary").style.display = "none";
+    document.getElementById("agentList").style.display = "none";
+    const d = document.getElementById("agentDetail");
+    d.style.display = "block";
+    d.innerHTML = '<div class="latest-loading">⏳ 加载中…</div>';
+    try {
+        const resp = await api("/api/v1/agent/latest?agent=" + encodeURIComponent(name));
+        renderAgentLatest(d, name, resp.data, "");
     } catch (e) {
-        content.innerHTML = '<div class="latest-empty"><div class="latest-empty-icon">😕</div>' +
-            '<p class="latest-empty-title">加载失败</p><p class="latest-empty-tip">' +
-            (e.message || "请求出错") + '</p></div>';
+        renderAgentLatest(d, name, null, e.message || "请求出错");
     }
 }
 
-function closeLatest() {
-    const overlay = document.getElementById("latestOverlay");
-    if (overlay) overlay.style.display = "none";
+function backToAgentList() {
+    const d = document.getElementById("agentDetail");
+    if (d) { d.style.display = "none"; d.innerHTML = ""; }
+    const s = document.getElementById("agentSummary");
+    if (s) s.style.display = "";
+    const l = document.getElementById("agentList");
+    if (l) l.style.display = "";
 }
 
-function renderLatest(el, d) {
+async function deleteAgent(name) {
+    if (!confirm(`确定移除 Agent「${name}」的注册记录？\n（仅离线可删；其心跳与上传记录一并清理，脚本重跑会自动重新注册）`)) return;
+    try {
+        await api("/api/v1/agent/status/" + encodeURIComponent(name), "DELETE");
+        toast(`已移除 ${name}`, "success");
+        refreshAgentPanel();
+    } catch (e) { toast(e.message, "error"); }
+}
+
+function renderAgentLatest(el, name, d, errMsg) {
+    const head = `<div class="agent-detail-head">
+        <button class="btn-sm" onclick="backToAgentList()">← 返回列表</button>
+        <b>${name}</b>
+        <span class="agent-desc">最近一次行情上传（Redis 保留 25 小时）</span>
+    </div>`;
+    if (!d) {
+        el.innerHTML = head + `<div class="latest-empty">
+            <div class="latest-empty-icon">${errMsg ? "😕" : "📭"}</div>
+            <p class="latest-empty-title">${errMsg ? "加载失败" : "暂无上传数据"}</p>
+            <p class="latest-empty-tip">${errMsg || "该 Agent 尚未上传行情；上报后即可在此查看。"}</p>
+        </div>`;
+        return;
+    }
     const close = Number(d.close) || 0;
     const lastClose = Number(d.last_close) || 0;
     const up = close >= lastClose;
@@ -1363,7 +1505,7 @@ function renderLatest(el, d) {
     // 行情时间显示到秒（time_key 为 "YYYY-MM-DD HH:MM:SS"），缺秒时回退到分
     const hhmmss = (d.time_key || "").length >= 19 ? d.time_key.slice(11, 19)
         : ((d.time_key || "").length >= 16 ? d.time_key.slice(11, 16) : (d.time_key || "--:--"));
-    el.innerHTML = `
+    el.innerHTML = head + `
         <div class="latest-stock">
             <span class="rc-code">${d.code || "--"}</span>
             <span class="src-tag qmt">QMT</span>
@@ -1388,20 +1530,327 @@ function renderLatest(el, d) {
         </div>`;
 }
 
-function renderLatestEmpty(el) {
-    el.innerHTML = `
-        <div class="latest-empty">
-            <div class="latest-empty-icon">📭</div>
-            <p class="latest-empty-title">暂无上传数据</p>
-            <p class="latest-empty-tip">QMT Agent 上传行情后即可在此查看；<br>数据保存在 Redis，保留 25 小时。</p>
-        </div>`;
-}
-
 // 点击浮层外关闭
 (function () {
-    const ov = document.getElementById("latestOverlay");
-    if (ov) ov.addEventListener("click", closeLatest);
+    const ov = document.getElementById("agentOverlay");
+    if (ov) ov.addEventListener("click", closeAgentPanel);
 })();
+
+// ───────────── QMT 交易记录视图 ─────────────
+// 流程：页面选日期 → 命令直写 Redis（TTL 2 分钟）→ QMT Agent 10s 轮询
+// 直读并查询上报 → 服务器删命令 + 整日替换落库 PostgreSQL（trade_records）
+// → 页面轮询展示（成交价倒序）；历史日期可经「导入」通道补齐（客户端导出文本）
+let TR_POLL_TIMER = null;
+const TR_POLL_MS = 3000;      // 命令进度轮询周期（页面侧）
+let TR_CMD_TTL_MIN = 2;       // 命令有效期（分钟，取后端 command_ttl_sec）
+let TR_CMD_SEEN = null;       // 本页最近观察到的命令 {date, cmd_id}（失效提示用）
+
+function todayStr() {
+    const d = new Date();
+    const p = n => String(n).padStart(2, "0");
+    return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+}
+
+function trIsToday(date) {
+    return date === todayStr();
+}
+
+function openTradeRecords() {
+    document.getElementById("view-rounds").style.display = "none";
+    document.getElementById("view-traderec").style.display = "block";
+    document.title = "StockGame QMT 交易记录";
+    const di = document.getElementById("trDate");
+    if (di && !di.value) di.value = todayStr();
+    loadTradeRecords();
+}
+
+function backFromTradeRecords() {
+    stopTrPoll();
+    document.getElementById("view-traderec").style.display = "none";
+    document.getElementById("view-rounds").style.display = "block";
+    document.title = "StockGame 股票模拟交易游戏";
+    loadAll();
+}
+
+function stopTrPoll() {
+    if (TR_POLL_TIMER) { clearInterval(TR_POLL_TIMER); TR_POLL_TIMER = null; }
+}
+
+function startTrPoll() {
+    stopTrPoll();
+    // 轮询回调动态读取当前选中日期（切换日期后自动生效）
+    TR_POLL_TIMER = setInterval(() => loadTradeRecords(null, true), TR_POLL_MS);
+}
+
+async function fetchTradeRecords() {
+    const date = document.getElementById("trDate").value;
+    if (!date) { toast("请先选择日期", "warn"); return; }
+    if (!trIsToday(date)) {
+        // 历史日期：不发命令，直接读取数据库（补齐用导入通道）
+        await loadTradeRecords();
+        toast(`${date}：历史数据来自数据库；如需补齐请用「📥 导入历史」`, "success");
+        return;
+    }
+    try {
+        const resp = await api("/api/v1/agent/trade_fetch", "POST", { date });
+        TR_CMD_SEEN = { date, cmd_id: (resp.data || {}).cmd_id || "" };
+        toast(`${date} 命令已下发（${TR_CMD_TTL_MIN} 分钟内有效），等待 QMT 执行…`, "success");
+        setTrStatus("pending", `⏳ ${date} 命令已下发（${TR_CMD_TTL_MIN} 分钟内有效），等待 QMT Agent 执行…`);
+        startTrPoll();
+    } catch (e) { toast(e.message, "error"); }
+}
+
+// ── 导入通道：QMT 客户端导出成交文本 → 解析入库（补齐历史日期） ──
+function toggleTrImport(show) {
+    const p = document.getElementById("trImportPanel");
+    if (!p) return;
+    const open = show !== undefined ? show : p.style.display === "none";
+    p.style.display = open ? "block" : "none";
+    if (open) {
+        const t = document.getElementById("trImportText");
+        if (t) t.focus();
+    }
+}
+
+function onTrImportFile(input) {
+    const f = input.files && input.files[0];
+    if (!f) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+        const t = document.getElementById("trImportText");
+        if (t) t.value = String(reader.result || "");
+        toast(`已读取文件 ${f.name}，点击"解析并导入"入库`, "success");
+    };
+    reader.readAsText(f, "utf-8");
+}
+
+async function submitTrImport() {
+    const date = document.getElementById("trDate").value;
+    if (!date) { toast("请先选择日期", "warn"); return; }
+    const textEl = document.getElementById("trImportText");
+    const text = ((textEl && textEl.value) || "").trim();
+    if (!text) { toast("请粘贴成交记录文本或选择导出文件", "warn"); return; }
+    const btn = document.getElementById("btnTrImport");
+    if (btn) btn.disabled = true;
+    try {
+        const resp = await api("/api/v1/agent/trade_records/import", "POST", { date, text });
+        toast(resp.message || "导入成功", "success");
+        toggleTrImport(false);
+        setTrStatus("done", `✅ ${date} 导入成功：${resp.count} 笔（来源：导入）`);
+        stopTrPoll();
+        await loadTradeRecords();
+    } catch (e) {
+        toast(e.message, "error");
+    } finally {
+        if (btn) btn.disabled = false;
+    }
+}
+
+function setTrStatus(state, text) {
+    const el = document.getElementById("trStatus");
+    if (!el) return;
+    el.textContent = text;
+    el.className = "tr-status " + state;
+}
+
+// 按钮状态随日期/命令同步：today=命令采集；历史日期=纯数据库刷新（不发命令）
+function syncTrFetchBtn(date, hasCmd) {
+    const btn = document.getElementById("btnFetchTr");
+    if (!btn) return;
+    if (trIsToday(date)) {
+        btn.textContent = "获取交易记录";
+        btn.title = "向 QMT 下发命令采集当日成交（命令 2 分钟内有效）";
+        btn.disabled = !!hasCmd;
+    } else {
+        btn.textContent = "🔄 刷新（数据库）";
+        btn.title = "历史日期数据读取自数据库；如需补齐请用「📥 导入历史」";
+        btn.disabled = false;
+    }
+}
+
+// 命令存在即"等待执行"（命令有效期内禁点，TTL 到期命令消失后按钮自动恢复）
+function renderTrCommand(date, cmd) {
+    syncTrFetchBtn(date, !!cmd);
+    if (!cmd) return;
+    TR_CMD_SEEN = { date, cmd_id: cmd.cmd_id || "" };
+    setTrStatus("pending", `⏳ ${date} 命令已下发（${cmd.created_at || ""}，${TR_CMD_TTL_MIN} 分钟内有效），等待 QMT Agent 执行…`);
+}
+
+// 结果状态提示（成功/失败）
+function finishTrStatus(r) {
+    if (!r) return;
+    if (r.success === false) {
+        setTrStatus("failed", `❌ 获取失败：${r.error || "未知错误"}（${r.fetched_at || ""}）`);
+    } else {
+        setTrStatus("done", `✅ 获取成功：${r.count} 笔（${r.fetched_at || ""}）`);
+    }
+}
+
+async function loadTradeRecords(date, polling) {
+    if (!date) date = document.getElementById("trDate").value;
+    if (!date) return;
+    try {
+        const resp = await api(`/api/v1/agent/trade_fetch?date=${encodeURIComponent(date)}`);
+        const dd = resp.data || {};
+        if (dd.command_ttl_sec) TR_CMD_TTL_MIN = Math.round(dd.command_ttl_sec / 60);
+        renderTrCommand(date, dd.command);
+        if (dd.command) {
+            // 命令仍在：有结果先展示（旧数据），本次命令的结果未到则继续轮询
+            if (dd.result) renderTradeResult(dd.result);
+            const fresh = dd.result && dd.result.cmd_id === dd.command.cmd_id;
+            if (fresh) {
+                finishTrStatus(dd.result);
+                stopTrPoll();
+            } else if (!TR_POLL_TIMER) {
+                startTrPoll();
+            }
+        } else {
+            // 无命令：已被上报删除（有结果）或 TTL 到期失效（无对应结果）
+            const seen = TR_CMD_SEEN && TR_CMD_SEEN.date === date;
+            // 结果无 cmd_id（导入/旧数据）时视为匹配，避免误报"命令已失效"
+            const matched = !!dd.result && (!seen || !dd.result.cmd_id
+                || dd.result.cmd_id === TR_CMD_SEEN.cmd_id);
+            if (dd.result) {
+                renderTradeResult(dd.result);      // 有结果先展示（可能是上一次的旧数据）
+            } else {
+                renderTrEmpty(date);
+            }
+            if (matched) {
+                finishTrStatus(dd.result);
+            } else if (seen) {
+                setTrStatus("failed", `⌛ 命令已失效（超过 ${TR_CMD_TTL_MIN} 分钟未执行），请重新获取`);
+            } else if (!dd.result) {
+                setTrStatus("", trIsToday(date)
+                    ? `选择日期后点击"获取交易记录"（命令 ${TR_CMD_TTL_MIN} 分钟内有效）`
+                    : `历史日期（${date}）暂无数据：点击"📥 导入历史"从 QMT 客户端导出补齐`);
+            }
+            stopTrPoll();
+        }
+    } catch (e) {
+        if (!polling) toast(e.message, "error");
+    }
+}
+
+function dirText(d) {
+    return d === "buy" ? "买入" : (d === "sell" ? "卖出" : "未知");
+}
+function dirCls(d) {
+    return d === "buy" ? "st-buy" : (d === "sell" ? "st-sell" : "");
+}
+function trSourceText(src) {
+    if (src === "import") return "来源：导入";
+    if (src === "agent") return "来源：QMT 当日采集";
+    return "来源：--";
+}
+
+function renderTradeResult(r) {
+    const box = document.getElementById("trSummary");
+    if (!r.success) {
+        box.innerHTML = `<div class="tr-empty tr-error">❌ ${r.date || ""} 获取失败：`
+            + `${r.error || "未知错误"}<br>可选择日期后重新点击"获取交易记录"重试</div>`;
+        clearTrTables();
+        return;
+    }
+    const s = r.summary || {};
+    const netCls = Number(s.net_profit) >= 0 ? "up" : "down";
+    box.innerHTML = `
+        <div class="acct-grid">
+            <div class="acct-item"><span>成交笔数</span><b>${s.count || 0}</b><i>买 ${s.buy_count || 0} / 卖 ${s.sell_count || 0}</i></div>
+            <div class="acct-item"><span>买入金额</span><b>${fmt(s.buy_amount)}</b><i>买手续费 ${fmt(s.buy_fee)}</i></div>
+            <div class="acct-item"><span>卖出金额</span><b>${fmt(s.sell_amount)}</b><i>卖手续费 ${fmt(s.sell_fee)}</i></div>
+            <div class="acct-item"><span>配对毛收益</span><b>${fmt(s.gross_profit)}</b><i>配对数 ${s.matched_count || 0}</i></div>
+            <div class="acct-item"><span>手续费合计</span><b>${fmt(s.total_fee)}</b><i>已配对 ${fmt(s.matched_fee)}</i></div>
+            <div class="acct-item"><span>当日实际收益</span><b class="${netCls}">${fmt(s.net_profit)}</b><i>已配对净收益（扣双边手续费）</i></div>
+            <div class="acct-item"><span>无法匹配</span><b>${s.unmatched_count || 0} 笔</b><i>留仓买入 / 卖出昨仓</i></div>
+            <div class="acct-item"><span>数据时间</span><b class="tr-small">${r.fetched_at || "--"}</b><i>${trSourceText(r.source)} · 已入库</i></div>
+        </div>
+        <div class="tr-fee-note">手续费口径：单笔 max(成交金额 × 万分之0.85, 5 元)，买卖双边各计（不免 5）；当日实际收益 = 配对毛收益 − 已配对手续费。</div>`;
+    renderTrTrades(r.trades || []);
+    renderTrPairs(r.pairs || []);
+    renderTrUnmatched(r.unmatched || []);
+}
+
+// 交易明细：按成交价格倒序展示
+function renderTrTrades(trades) {
+    const tb = document.querySelector("#trTradesTable tbody");
+    if (!trades.length) {
+        tb.innerHTML = '<tr><td colspan="7" class="empty-cell">当日无成交记录</td></tr>';
+        return;
+    }
+    const rows = trades.slice().sort((a, b) => (Number(b.price) || 0) - (Number(a.price) || 0));
+    tb.innerHTML = rows.map(t => `
+        <tr>
+            <td>${t.time || "--"}</td>
+            <td class="${dirCls(t.direction)}">${dirText(t.direction)}</td>
+            <td>${fmt(t.price, 3)}</td>
+            <td>${fmtWan(t.volume)}</td>
+            <td>${fmt(t.amount)}</td>
+            <td>${fmt(t.fee)}</td>
+            <td>${t.trade_id || "--"}</td>
+        </tr>`).join("");
+}
+
+function renderTrPairs(pairs) {
+    const tb = document.querySelector("#trPairsTable tbody");
+    if (!pairs.length) {
+        tb.innerHTML = '<tr><td colspan="8" class="empty-cell">无配对记录</td></tr>';
+        return;
+    }
+    tb.innerHTML = pairs.map(p => `
+        <tr>
+            <td>${p.buy_time || "--"}</td>
+            <td>${fmt(p.buy_price, 3)}</td>
+            <td>${p.sell_time || "--"}</td>
+            <td>${fmt(p.sell_price, 3)}</td>
+            <td>${fmtWan(p.qty)}</td>
+            <td>${fmt(p.gross_profit)}</td>
+            <td>${fmt((p.buy_fee || 0) + (p.sell_fee || 0))}</td>
+            <td class="${Number(p.net_profit) >= 0 ? "up" : "down"}">${fmt(p.net_profit)}</td>
+        </tr>`).join("");
+}
+
+function renderTrUnmatched(items) {
+    const tb = document.querySelector("#trUnmatchedTable tbody");
+    if (!items.length) {
+        tb.innerHTML = '<tr><td colspan="6" class="empty-cell">全部成交均已配对</td></tr>';
+        return;
+    }
+    tb.innerHTML = items.map(u => `
+        <tr>
+            <td>${u.time || "--"}</td>
+            <td class="${dirCls(u.direction)}">${dirText(u.direction)}</td>
+            <td>${fmt(u.price, 3)}</td>
+            <td>${fmtWan(u.volume)}</td>
+            <td>${fmtWan(u.unmatched_volume)}</td>
+            <td class="tr-reason">${u.reason || "--"}</td>
+        </tr>`).join("");
+}
+
+function renderTrEmpty(date, text) {
+    document.getElementById("trSummary").innerHTML =
+        `<div class="tr-empty">${text || `暂无 ${date} 的交易记录：点击"获取交易记录"下发命令（${TR_CMD_TTL_MIN} 分钟内有效），QMT Agent 每 10 秒轮询并回传，结果保留 6 小时`}</div>`;
+    clearTrTables();
+}
+
+function clearTrTables() {
+    document.querySelector("#trTradesTable tbody").innerHTML =
+        '<tr><td colspan="7" class="empty-cell">暂无数据</td></tr>';
+    document.querySelector("#trPairsTable tbody").innerHTML =
+        '<tr><td colspan="8" class="empty-cell">暂无数据</td></tr>';
+    document.querySelector("#trUnmatchedTable tbody").innerHTML =
+        '<tr><td colspan="6" class="empty-cell">暂无数据</td></tr>';
+}
+
+function switchTrTab(tab) {
+    document.querySelectorAll("[data-trtab]").forEach(b =>
+        b.classList.toggle("active", b.dataset.trtab === tab));
+    document.getElementById("trTradesTable").style.display = tab === "trades" ? "" : "none";
+    document.getElementById("trPairsTable").style.display = tab === "pairs" ? "" : "none";
+    document.getElementById("trUnmatchedTable").style.display = tab === "unmatched" ? "" : "none";
+}
+
+// 切换日期后自动加载该日结果/命令进度
+document.getElementById("trDate").addEventListener("change", () => loadTradeRecords());
 
 // ───────────── 快捷键帮助浮层 ─────────────
 function toggleHelp() {

@@ -535,7 +535,8 @@ def run_live(cfg, code: str, date: str, sleep: float):
         if now - last_hb >= 60:
             try:
                 requests.post(f"{backend}/api/v1/agent/heartbeat",
-                              json={"agent_name": "mock_agent", "timestamp": now},
+                              json={"agent_name": "mock_agent",
+                                    "role": "模拟行情", "timestamp": now},
                               timeout=5)
                 log("心跳上报 OK")
             except Exception as e:

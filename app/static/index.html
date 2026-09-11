@@ -15,11 +15,12 @@
     <header id="top-bar">
         <div class="top-left">
             <h1>StockGame <span class="sub">股票模拟交易游戏</span></h1>
-            <span class="mode-badge" id="agentStatusBadge" title="行情采集 Agent 实时在线状态（socket 推送，离线约 3 分钟无心跳判定）；点击查看最新上传记录" onclick="openLatestUpload()">Agent: --</span>
+            <span class="mode-badge" id="agentStatusBadge" title="Agent 监控：查看所有 Agent 在线状态与心跳（点击打开监控面板）" onclick="openAgentPanel()">Agent: --</span>
         </div>
         <div class="top-right">
             <span class="ws-status" id="wsStatus" title="与后端的实时推送连接状态（打开页面即建立）">● 未连接</span>
             <span class="data-time" id="dataTime"></span>
+            <button class="btn-config" onclick="openTradeRecords()" title="获取并查看 QMT 实盘某日交易记录明细（含配对收益分析，数据持久化入库；历史日期可用导入通道补齐）">📋 交易记录</button>
             <button class="btn-config" onclick="openConfig('grid')" title="功能配置入口（网格参数等）">⚙ 配置</button>
             <button class="btn-refresh" onclick="loadAll()" title="刷新">⟳</button>
         </div>
@@ -179,6 +180,68 @@
     </div>
 </div>
 
+<!-- ═══════════ 视图三：QMT 交易记录 ═══════════ -->
+<div id="view-traderec" class="view" style="display:none;">
+    <header id="tr-top-bar">
+        <button class="btn-back" onclick="backFromTradeRecords()">← 返回</button>
+        <div class="tr-title">
+            <span class="g-code">QMT 交易记录</span>
+            <span class="src-tag qmt">实盘</span>
+        </div>
+        <div class="tr-controls">
+            <label class="tr-label">日期</label>
+            <input type="date" id="trDate" class="tr-date">
+            <button class="btn-primary" id="btnFetchTr" onclick="fetchTradeRecords()">获取交易记录</button>
+            <button class="btn-back" id="btnTrImportToggle" onclick="toggleTrImport()">📥 导入历史</button>
+        </div>
+        <span class="tr-status" id="trStatus">选择日期后点击"获取交易记录"（命令 2 分钟内有效）</span>
+    </header>
+
+    <!-- 导入面板：QMT 客户端导出成交文本 → 粘贴/选文件 → 解析入库（补齐历史日期） -->
+    <div class="tr-import" id="trImportPanel" style="display:none;">
+        <div class="tr-import-head">
+            <b>导入所选日期的成交记录（日期取上方选择器）</b>
+            <span class="tr-import-tip">QMT 客户端：交易 → 历史成交 → 选中数据右键复制后粘贴；或导出 CSV 选择文件</span>
+        </div>
+        <div class="tr-import-row">
+            <input type="file" id="trImportFile" class="tr-file" accept=".csv,.txt" onchange="onTrImportFile(this)">
+        </div>
+        <textarea id="trImportText" class="tr-import-text" rows="6" placeholder="在此粘贴成交明细（自动识别表头：成交时间/证券代码/买卖/成交价格/成交数量/成交金额…）"></textarea>
+        <div class="tr-import-actions">
+            <span class="tr-import-note">导入将整日覆盖所选日期的数据（来源=导入）</span>
+            <button class="btn-primary" id="btnTrImport" onclick="submitTrImport()">解析并导入</button>
+            <button class="btn-back" onclick="toggleTrImport(false)">取消</button>
+        </div>
+    </div>
+
+    <div class="tr-layout">
+        <div class="tr-summary" id="trSummary">
+            <div class="tr-empty">暂无数据：选择日期后点击"获取交易记录"，QMT Agent 每 10 秒轮询领取命令（2 分钟内有效）并回传当日成交明细（数据持久化入库）；历史日期可用「📥 导入历史」通道补齐</div>
+        </div>
+        <div class="records-panel tr-records">
+            <nav class="records-tabs">
+                <button class="rec-tab active" data-trtab="trades" onclick="switchTrTab('trades')">交易明细</button>
+                <button class="rec-tab" data-trtab="pairs" onclick="switchTrTab('pairs')">配对明细</button>
+                <button class="rec-tab" data-trtab="unmatched" onclick="switchTrTab('unmatched')">无法匹配</button>
+            </nav>
+            <div class="records-body">
+                <table id="trTradesTable" class="rec-table">
+                    <thead><tr><th>成交时间</th><th>方向</th><th>成交价</th><th>数量(万股)</th><th>成交金额</th><th>手续费</th><th>成交编号</th></tr></thead>
+                    <tbody></tbody>
+                </table>
+                <table id="trPairsTable" class="rec-table" style="display:none">
+                    <thead><tr><th>买入时间</th><th>买入价</th><th>卖出时间</th><th>卖出价</th><th>数量(万股)</th><th>毛收益</th><th>手续费</th><th>净收益</th></tr></thead>
+                    <tbody></tbody>
+                </table>
+                <table id="trUnmatchedTable" class="rec-table" style="display:none">
+                    <thead><tr><th>时间</th><th>方向</th><th>成交价</th><th>数量(万股)</th><th>未匹配数量(万股)</th><th>原因</th></tr></thead>
+                    <tbody></tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+</div>
+
 <!-- 配置浮层（网格等参数） -->
 <div class="help-overlay" id="configOverlay" style="display:none;">
     <div class="config-panel" onclick="event.stopPropagation()">
@@ -224,15 +287,17 @@
     </div>
 </div>
 
-<!-- 最新上传记录浮层（点击 Agent 徽标查看） -->
-<div class="help-overlay" id="latestOverlay" style="display:none;">
-    <div class="latest-panel" onclick="event.stopPropagation()">
+<!-- Agent 监控浮层（点击 Agent 徽标打开：多 Agent 在线状态/心跳/上传记录） -->
+<div class="help-overlay" id="agentOverlay" style="display:none;">
+    <div class="agent-panel" onclick="event.stopPropagation()">
         <div class="config-head">
-            <h3>📡 最新上传记录</h3>
-            <button class="config-close" onclick="closeLatest()">✕</button>
+            <h3>📡 Agent 监控</h3>
+            <button class="config-close" onclick="closeAgentPanel()">✕</button>
         </div>
-        <div class="config-desc">QMT Agent 上传的最近一条行情快照（数据保存于 Redis，保留 25 小时）</div>
-        <div id="latestContent"></div>
+        <div class="agent-summary" id="agentSummary">加载中…</div>
+        <div class="agent-list" id="agentList"></div>
+        <div id="agentDetail" style="display:none;"></div>
+        <div class="agent-tip">心跳周期 60s，超过 3 分钟无心跳判定离线；离线 Agent 可点"移除"清理（脚本重新运行会自动注册）。</div>
     </div>
 </div>
 

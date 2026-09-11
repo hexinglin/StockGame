@@ -51,8 +51,10 @@ body {
 }
 .mode-badge.alive { background: rgba(35,178,109,.15); color: var(--ok); }
 .mode-badge.dead { background: rgba(212,61,61,.15); color: var(--danger); }
+.mode-badge.warn { background: rgba(230,162,60,.15); color: var(--warn); }
 .mode-badge.alive:hover { background: rgba(35,178,109,.3); color: #fff; }
 .mode-badge.dead:hover { background: rgba(212,61,61,.3); color: #fff; }
+.mode-badge.warn:hover { background: rgba(230,162,60,.3); color: #fff; }
 
 .ws-status { font-size: 12px; color: var(--text2); }
 .ws-status.ok { color: var(--ok); }
@@ -471,6 +473,107 @@ body {
 .latest-empty-icon { font-size: 42px; margin-bottom: 12px; }
 .latest-empty-title { font-size: 15px; color: var(--text); font-weight: 600; margin-bottom: 8px; }
 .latest-empty-tip { font-size: 12px; color: var(--text2); line-height: 1.8; }
+
+/* ── Agent 监控面板（多 Agent 在线状态/心跳/上传） ── */
+.agent-panel {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+    padding: 20px 24px; min-width: 640px; max-width: 760px;
+    max-height: 82vh; overflow-y: auto;
+}
+.agent-summary {
+    display: flex; align-items: center; gap: 10px;
+    margin-bottom: 12px; font-size: 12px; color: var(--text2);
+}
+.agent-summary .ag-state {
+    font-size: 13px; font-weight: 700; padding: 3px 10px;
+    border-radius: 10px; background: #2a3454; color: var(--text2);
+}
+.agent-summary .ag-state.ok { color: var(--ok); background: rgba(35,178,109,.15); }
+.agent-summary .ag-state.warn { color: var(--warn); background: rgba(230,162,60,.15); }
+.agent-summary .ag-state.bad { color: var(--danger); background: rgba(212,61,61,.15); }
+.agent-summary .btn-sm { margin-left: auto; }
+.agent-list { display: flex; flex-direction: column; gap: 8px; }
+.agent-row {
+    display: flex; align-items: center; gap: 12px;
+    padding: 10px 12px;
+    background: var(--bg2); border: 1px solid var(--border); border-radius: 8px;
+}
+.agent-row.offline { border-color: rgba(212,61,61,.35); }
+.agent-dot { width: 9px; height: 9px; border-radius: 50%; flex: none; }
+.agent-dot.on { background: var(--ok); box-shadow: 0 0 6px rgba(35,178,109,.8); }
+.agent-dot.off { background: #5a6280; }
+.agent-main { flex: 1; min-width: 0; }
+.agent-name-line { display: flex; align-items: center; gap: 8px; margin-bottom: 3px; }
+.agent-name-line b { color: #fff; font-size: 13px; }
+.agent-role {
+    font-size: 10px; color: #6f96ff; background: rgba(59,110,246,.15);
+    padding: 1px 8px; border-radius: 8px; white-space: nowrap;
+}
+.agent-meta { font-size: 11px; color: var(--text2); font-variant-numeric: tabular-nums; }
+.agent-actions { display: flex; gap: 6px; flex: none; }
+.agent-tip { margin-top: 12px; font-size: 11px; color: #5a6280; line-height: 1.7; }
+.agent-detail-head { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }
+.agent-detail-head b { color: #fff; font-size: 14px; }
+.agent-desc { font-size: 11px; color: var(--text2); margin-left: auto; }
+
+/* ═══════════ QMT 交易记录视图 ═══════════ */
+#tr-top-bar {
+    display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+    padding: 10px 18px;
+    background: linear-gradient(180deg, #161d33, #101527);
+    border-bottom: 1px solid var(--border);
+    position: sticky; top: 0; z-index: 50;
+}
+.tr-title { display: flex; align-items: center; gap: 10px; }
+.tr-controls { display: flex; align-items: center; gap: 8px; }
+.tr-label { font-size: 12px; color: var(--text2); }
+.tr-date {
+    padding: 7px 10px;
+    background: var(--bg2); border: 1px solid var(--border); border-radius: 6px;
+    color: var(--text); font-size: 13px; outline: none;
+    font-variant-numeric: tabular-nums; color-scheme: dark;
+}
+.tr-date:focus { border-color: var(--primary); }
+.tr-status { font-size: 12px; color: var(--text2); }
+.tr-status.pending { color: var(--warn); }
+.tr-status.done { color: var(--ok); }
+.tr-status.failed { color: var(--danger); }
+
+/* 导入面板（QMT 客户端导出成交文本 → 解析入库） */
+.tr-import {
+    max-width: 1500px; margin: 10px auto 0; padding: 12px 16px;
+    background: var(--bg2); border: 1px solid var(--border); border-radius: 8px;
+}
+.tr-import-head { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+.tr-import-head b { font-size: 13px; color: var(--text); }
+.tr-import-tip { font-size: 11px; color: var(--text2); }
+.tr-import-row { margin: 8px 0; }
+.tr-file { font-size: 12px; color: var(--text2); }
+.tr-import-text {
+    width: 100%; box-sizing: border-box;
+    background: var(--bg1, var(--bg2)); border: 1px solid var(--border); border-radius: 6px;
+    color: var(--text); font-size: 12px; font-family: Consolas, monospace;
+    padding: 8px 10px; outline: none; resize: vertical;
+}
+.tr-import-text:focus { border-color: var(--primary); }
+.tr-import-actions {
+    display: flex; align-items: center; gap: 10px; margin-top: 8px;
+}
+.tr-import-note { font-size: 11px; color: var(--warn); margin-right: auto; }
+
+.tr-layout { max-width: 1500px; margin: 0 auto; padding: 14px 18px; }
+.tr-summary { margin-bottom: 14px; }
+.tr-summary .acct-item b { font-size: 15px; }
+.acct-item i { display: block; margin-top: 5px; font-size: 10px; color: var(--text2); font-style: normal; }
+.acct-item b.tr-small { font-size: 12px; color: var(--text2); }
+.tr-fee-note { margin-top: 10px; font-size: 11px; color: var(--text2); line-height: 1.7; }
+.tr-empty {
+    background: var(--panel); border: 1px dashed var(--border); border-radius: 10px;
+    padding: 32px 20px; text-align: center; color: var(--text2); font-size: 13px; line-height: 1.9;
+}
+.tr-empty.tr-error { color: var(--danger); border-color: rgba(212,61,61,.4); }
+.tr-records { padding: 0; max-width: none; margin: 0; }
+.tr-reason { color: var(--text2); }
 
 @media (max-width: 1100px) {
     .game-layout { grid-template-columns: 1fr; }

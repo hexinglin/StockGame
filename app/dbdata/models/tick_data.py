@@ -8,10 +8,9 @@
 本表仅存逐点行情，只在游戏运行时读取，页面日期管理不触碰本表
 （天维度行情 + 日期选择的唯一权威表是 game_days，见 game_day.py）
 """
-from datetime import datetime
-
 from sqlalchemy import Column, String, Float, BigInteger, DateTime, UniqueConstraint
 from ..database import Base
+from ...utils.timeutil import now_cn
 
 
 class TickData(Base):
@@ -29,4 +28,4 @@ class TickData(Base):
     close = Column(Float)            # 最新价
     volume = Column(BigInteger, default=0)     # 当日累计成交量
     amount = Column(Float, default=0)          # 当日累计成交额
-    created_at = Column(DateTime, default=datetime.now)
+    created_at = Column(DateTime, default=now_cn)
