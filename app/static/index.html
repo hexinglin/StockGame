@@ -148,8 +148,8 @@
                     </div>
                 </div>
                 <div class="estimate-row">
-                    <span>预估金额 <b id="estAmount">--</b></span>
-                    <span>手续费 <b id="estFee">--</b></span>
+                    <span>预估金额(万元) <b id="estAmount">--</b></span>
+                    <span>手续费(元) <b id="estFee">--</b></span>
                 </div>
                 <button class="order-submit buy" id="btnSubmit" onclick="submitOrder()">买入</button>
                 <div class="order-tip">快捷键：↑/↓ 调价，Enter 下单</div>
@@ -171,7 +171,7 @@
                 <tbody></tbody>
             </table>
             <table id="tradesTable" class="rec-table" style="display:none">
-                <thead><tr><th>成交时间</th><th>方向</th><th>价格</th><th>数量(万股)</th><th>手续费</th></tr></thead>
+                <thead><tr><th>成交时间</th><th>方向</th><th>价格</th><th>数量(万股)</th><th>手续费(元)</th></tr></thead>
                 <tbody></tbody>
             </table>
             <div id="accountBox"></div>
@@ -223,14 +223,15 @@
                 <button class="rec-tab active" data-trtab="trades" onclick="switchTrTab('trades')">交易明细</button>
                 <button class="rec-tab" data-trtab="pairs" onclick="switchTrTab('pairs')">配对明细</button>
                 <button class="rec-tab" data-trtab="unmatched" onclick="switchTrTab('unmatched')">无法匹配</button>
+                <button class="legend-toggle tr-agg-toggle" id="btnTrAgg" onclick="toggleTrAgg()" title="按委托编号合并同一笔委托的拆分成交：成交价取数量加权均价，数量/成交金额/手续费逐笔合计">按委托聚合</button>
             </nav>
             <div class="records-body">
                 <table id="trTradesTable" class="rec-table">
-                    <thead><tr><th>成交时间</th><th>方向</th><th>成交价</th><th>数量(万股)</th><th>成交金额</th><th>手续费</th><th>成交编号</th></tr></thead>
+                    <thead><tr><th>成交时间</th><th>方向</th><th>成交价</th><th>数量(万股)</th><th>成交金额(万元)</th><th>手续费(元)</th><th>成交编号</th></tr></thead>
                     <tbody></tbody>
                 </table>
                 <table id="trPairsTable" class="rec-table" style="display:none">
-                    <thead><tr><th>买入时间</th><th>买入价</th><th>卖出时间</th><th>卖出价</th><th>数量(万股)</th><th>毛收益</th><th>手续费</th><th>净收益</th></tr></thead>
+                    <thead><tr><th>买入时间</th><th>买入价</th><th>卖出时间</th><th>卖出价</th><th>数量(万股)</th><th>毛收益(元)</th><th>手续费(元)</th><th>净收益(元)</th></tr></thead>
                     <tbody></tbody>
                 </table>
                 <table id="trUnmatchedTable" class="rec-table" style="display:none">

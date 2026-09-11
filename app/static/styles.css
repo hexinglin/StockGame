@@ -254,6 +254,8 @@ body {
 .legend-toggle:hover { color: #fff; border-color: #7aa2f7; }
 .legend-toggle.active { color: #fff; background: rgba(122,162,247,.22); border-color: #7aa2f7; }
 .legend-note { margin-left: auto; color: #5a6280; }
+/* 交易明细「按委托聚合」开关（复用图例开关样式，右对齐到 tab 栏） */
+.tr-agg-toggle { margin-left: auto; align-self: center; }
 
 /* ── 交易面板 ── */
 .trade-panel { display: flex; flex-direction: column; gap: 12px; }
@@ -567,6 +569,8 @@ body {
 .acct-item i { display: block; margin-top: 5px; font-size: 10px; color: var(--text2); font-style: normal; }
 .acct-item b.tr-small { font-size: 12px; color: var(--text2); }
 .tr-fee-note { margin-top: 10px; font-size: 11px; color: var(--text2); line-height: 1.7; }
+/* 配对明细：时间列下挂的委托编号小字 */
+.pair-oid { font-size: 10px; color: var(--text2); }
 .tr-empty {
     background: var(--panel); border: 1px dashed var(--border); border-radius: 10px;
     padding: 32px 20px; text-align: center; color: var(--text2); font-size: 13px; line-height: 1.9;

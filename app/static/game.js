@@ -70,6 +70,24 @@ function toShares(wan) {
     return isNaN(v) ? 0 : Math.round(v * SHARES_PER_WAN);
 }
 
+function fmtFee(yuan) {
+    // 手续费展示：小额（<1 元，如委托费用均摊值）保留 4 位小数，避免逐笔加总
+    // 与委托总额出现舍入尾差；≥1 元仍按 2 位展示
+    if (yuan === null || yuan === undefined || isNaN(yuan)) return "--";
+    return fmt(yuan, Math.abs(Number(yuan)) < 1 ? 4 : 2);
+}
+
+// 金额对外（展示）统一用「万元」，计算与接口传输一律用「元」（在此集中换算）；
+// 收益/盈亏类与手续费除外，仍按「元」原样展示（金额小、需精确到元）
+function fmtAmtWan(yuan, d = 2) {
+    // 元 → 万元显示：100 元 = 0.01 万元，默认 2 位小数（=百元精度）；
+    // 非整百金额（如持仓市值）回退 4 位（=元精度）
+    if (yuan === null || yuan === undefined || isNaN(yuan)) return "--";
+    const wan = Number(yuan) / 10000;
+    const nd = Math.abs(wan - Number(wan.toFixed(d))) < 1e-9 ? d : Math.max(d, 4);
+    return wan.toLocaleString("zh-CN", { minimumFractionDigits: nd, maximumFractionDigits: nd });
+}
+
 // ───────────── Toast ─────────────
 function toast(msg, type = "info") {
     const wrap = document.getElementById("toastWrap");
@@ -293,10 +311,10 @@ function renderRoundList(rounds) {
             </div>
             <div class="rc-progress"><div class="progress-fill" style="width:${r.progress || 0}%"></div></div>
             <div class="rc-meta">
-                <span>期初资产 <b>${fmt(r.initial_assets)}</b></span>
-                <span>期末资产 <b>${fmt(r.final_assets)}</b></span>
-                <span>已实现盈亏 <b class="${(r.realized_pnl || 0) >= 0 ? "up" : "down"}">${fmt(r.realized_pnl)}</b></span>
-                <span>手续费 <b>${fmt(r.fee_total)}</b></span>
+                <span>期初资产(万元) <b>${fmtAmtWan(r.initial_assets)}</b></span>
+                <span>期末资产(万元) <b>${fmtAmtWan(r.final_assets)}</b></span>
+                <span>已实现盈亏(元) <b class="${(r.realized_pnl || 0) >= 0 ? "up" : "down"}">${fmt(r.realized_pnl)}</b></span>
+                <span>手续费(元) <b>${fmt(r.fee_total)}</b></span>
             </div>
             <div class="rc-actions">
                 <button class="btn-sm btn-primary" onclick="enterGame(${r.id})">进入游戏</button>
@@ -431,7 +449,7 @@ async function enterGame(roundId) {
 
         // 若已结束，显示结算信息
         if (state.round.status === "finished") {
-            toast(`本轮已结算：期末资产 ${fmt(state.round.final_assets)}，盈亏 ${fmt(state.round.realized_pnl)}`, "info");
+            toast(`本轮已结算：期末资产 ${fmtAmtWan(state.round.final_assets)}万元，盈亏 ${fmt(state.round.realized_pnl)}元`, "info");
         }
     } catch (e) {
         toast(e.message, "error");
@@ -599,7 +617,7 @@ function onGameStatus(s) {
         state.round.status = s.status;
         renderGameHeader();
         if (s.status === "finished") {
-            toast(`本轮已结束${s.final_assets ? "，期末资产 " + fmt(s.final_assets) : ""}`, "success");
+            toast(`本轮已结束${s.final_assets ? "，期末资产 " + fmtAmtWan(s.final_assets) + "万元" : ""}`, "success");
             loadAll();
             loadAccount();   // 节流后补偿：结束时 force 刷新账户卡，市值/盈亏定格最终价
         }
@@ -977,7 +995,7 @@ function recalcEstimate() {
     const shares = toShares(document.getElementById("orderShares").value);   // 万股 → 股
     const amount = price * shares;
     const fee = amount * FEE_RATE;
-    document.getElementById("estAmount").textContent = amount ? fmt(amount) : "--";
+    document.getElementById("estAmount").textContent = amount ? fmtAmtWan(amount) : "--";
     document.getElementById("estFee").textContent = amount ? fmt(fee) : "--";
 }
 
@@ -1146,15 +1164,15 @@ function renderAccount(a, force) {
             <div class="acct-item"><span>持仓量(万股)</span><b>${fmtWan(a.volume || 0)}</b></div>
             <div class="acct-item"><span>可卖(万股)</span><b>${fmtWan(sellable)}</b></div>
             <div class="acct-item"><span>成本价</span><b>${fmt(a.avg_price || 0, 3)}</b></div>
-            <div class="acct-item"><span>浮动盈亏</span><b class="${floatPnl >= 0 ? 'up' : 'down'}">${fmt(floatPnl)}</b></div>
-            <div class="acct-item"><span>可用现金</span><b>${fmt(a.available_cash)}</b></div>
-            <div class="acct-item"><span>冻结资金</span><b>${fmt(a.frozen_cash)}</b></div>
-            <div class="acct-item"><span>持仓市值</span><b>${fmt(marketValue)}</b></div>
-            <div class="acct-item"><span>总资产</span><b>${fmt(total)}</b></div>
-            <div class="acct-item"><span>期初资产</span><b>${fmt(initAssets)}</b></div>
-            <div class="acct-item"><span>总盈亏</span><b class="${totalPnl >= 0 ? 'up' : 'down'}">${fmt(totalPnl)}</b></div>
-            <div class="acct-item"><span>已实现盈亏</span><b class="${(a.realized_pnl || 0) >= 0 ? 'up' : 'down'}">${fmt(a.realized_pnl)}</b></div>
-            <div class="acct-item"><span>累计手续费</span><b>${fmt(a.fee_total)}</b></div>
+            <div class="acct-item"><span>浮动盈亏(元)</span><b class="${floatPnl >= 0 ? 'up' : 'down'}">${fmt(floatPnl)}</b></div>
+            <div class="acct-item"><span>可用现金(万元)</span><b>${fmtAmtWan(a.available_cash)}</b></div>
+            <div class="acct-item"><span>冻结资金(万元)</span><b>${fmtAmtWan(a.frozen_cash)}</b></div>
+            <div class="acct-item"><span>持仓市值(万元)</span><b>${fmtAmtWan(marketValue)}</b></div>
+            <div class="acct-item"><span>总资产(万元)</span><b>${fmtAmtWan(total)}</b></div>
+            <div class="acct-item"><span>期初资产(万元)</span><b>${fmtAmtWan(initAssets)}</b></div>
+            <div class="acct-item"><span>总盈亏(元)</span><b class="${totalPnl >= 0 ? 'up' : 'down'}">${fmt(totalPnl)}</b></div>
+            <div class="acct-item"><span>已实现盈亏(元)</span><b class="${(a.realized_pnl || 0) >= 0 ? 'up' : 'down'}">${fmt(a.realized_pnl)}</b></div>
+            <div class="acct-item"><span>累计手续费(元)</span><b>${fmt(a.fee_total)}</b></div>
         </div>`;
 }
 
@@ -1544,6 +1562,8 @@ let TR_POLL_TIMER = null;
 const TR_POLL_MS = 3000;      // 命令进度轮询周期（页面侧）
 let TR_CMD_TTL_MIN = 2;       // 命令有效期（分钟，取后端 command_ttl_sec）
 let TR_CMD_SEEN = null;       // 本页最近观察到的命令 {date, cmd_id}（失效提示用）
+let TR_AGG = false;           // 交易明细「按委托聚合」开关（同一委托的拆分成交合并展示）
+let TR_LAST_TRADES = [];      // 最近一次交易明细（本地切换聚合视图用，避免重复请求）
 
 function todayStr() {
     const d = new Date();
@@ -1756,38 +1776,126 @@ function renderTradeResult(r) {
     box.innerHTML = `
         <div class="acct-grid">
             <div class="acct-item"><span>成交笔数</span><b>${s.count || 0}</b><i>买 ${s.buy_count || 0} / 卖 ${s.sell_count || 0}</i></div>
-            <div class="acct-item"><span>买入金额</span><b>${fmt(s.buy_amount)}</b><i>买手续费 ${fmt(s.buy_fee)}</i></div>
-            <div class="acct-item"><span>卖出金额</span><b>${fmt(s.sell_amount)}</b><i>卖手续费 ${fmt(s.sell_fee)}</i></div>
-            <div class="acct-item"><span>配对毛收益</span><b>${fmt(s.gross_profit)}</b><i>配对数 ${s.matched_count || 0}</i></div>
-            <div class="acct-item"><span>手续费合计</span><b>${fmt(s.total_fee)}</b><i>已配对 ${fmt(s.matched_fee)}</i></div>
-            <div class="acct-item"><span>当日实际收益</span><b class="${netCls}">${fmt(s.net_profit)}</b><i>已配对净收益（扣双边手续费）</i></div>
+            <div class="acct-item"><span>买入金额(万元)</span><b>${fmtAmtWan(s.buy_amount)}</b><i>买手续费 ${fmt(s.buy_fee)}元</i></div>
+            <div class="acct-item"><span>卖出金额(万元)</span><b>${fmtAmtWan(s.sell_amount)}</b><i>卖手续费 ${fmt(s.sell_fee)}元</i></div>
+            <div class="acct-item"><span>配对毛收益(元)</span><b>${fmt(s.gross_profit)}</b><i>配对数 ${s.matched_count || 0}</i></div>
+            <div class="acct-item"><span>手续费合计(元)</span><b>${fmt(s.total_fee)}</b><i>已配对 ${fmt(s.matched_fee)}元</i></div>
+            <div class="acct-item"><span>当日实际收益(元)</span><b class="${netCls}">${fmt(s.net_profit)}</b><i>已配对净收益（扣双边手续费）</i></div>
             <div class="acct-item"><span>无法匹配</span><b>${s.unmatched_count || 0} 笔</b><i>留仓买入 / 卖出昨仓</i></div>
             <div class="acct-item"><span>数据时间</span><b class="tr-small">${r.fetched_at || "--"}</b><i>${trSourceText(r.source)} · 已入库</i></div>
         </div>
-        <div class="tr-fee-note">手续费口径：单笔 max(成交金额 × 万分之0.85, 5 元)，买卖双边各计（不免 5）；当日实际收益 = 配对毛收益 − 已配对手续费。</div>`;
+        <div class="tr-fee-note">手续费口径：按委托计一次 max(委托合计成交金额 × 万分之0.85, 5 元)，平均分摊到该委托的每笔成交（买卖各计，不免 5）；当日实际收益 = 配对毛收益 − 已配对手续费。</div>`;
     renderTrTrades(r.trades || []);
     renderTrPairs(r.pairs || []);
     renderTrUnmatched(r.unmatched || []);
 }
 
-// 交易明细：按成交价格倒序展示
+// 交易明细「按委托聚合」开关：同委托编号（order_id）的拆分成交合并为一行；
+// 明细模式末列=成交编号，聚合模式末列=委托编号（列头随模式切换）
+function toggleTrAgg() {
+    TR_AGG = !TR_AGG;
+    const btn = document.getElementById("btnTrAgg");
+    if (btn) btn.classList.toggle("active", TR_AGG);
+    const th = document.querySelector("#trTradesTable thead tr th:last-child");
+    if (th) th.textContent = TR_AGG ? "委托编号" : "成交编号";
+    if (TR_LAST_TRADES.length) renderTrTrades(TR_LAST_TRADES);
+}
+
+// 按委托编号聚合：成交价=数量加权均价，数量/金额/手续费逐笔合计；
+// 无委托编号的记录（旧导入数据）各自独立成行
+function aggTradesByOrder(trades) {
+    const groups = [], map = new Map();
+    trades.forEach((t, i) => {
+        const key = t.order_id || ("#solo#" + i);
+        let g = map.get(key);
+        if (!g) {
+            g = { order_id: t.order_id || "", trade_id: t.trade_id || "",
+                  direction: t.direction, time: t.time || "", endTime: t.time || "",
+                  volume: 0, amount: 0, fee: 0, _pv: 0, count: 0, price: 0 };
+            map.set(key, g);
+            groups.push(g);
+        }
+        const vol = Number(t.volume) || 0;
+        g.volume += vol;
+        g.amount += Number(t.amount) || 0;
+        g.fee += Number(t.fee) || 0;
+        g._pv += (Number(t.price) || 0) * vol;
+        g.count += 1;
+        if (t.time && (!g.time || t.time < g.time)) g.time = t.time;
+        if (t.time && (!g.endTime || t.time > g.endTime)) g.endTime = t.time;
+    });
+    groups.forEach(g => { g.price = g.volume > 0 ? g._pv / g.volume : 0; });
+    return groups;
+}
+
+// 交易明细：明细按成交价倒序；聚合模式合并同委托后按（加权）价倒序
 function renderTrTrades(trades) {
+    TR_LAST_TRADES = trades;
     const tb = document.querySelector("#trTradesTable tbody");
     if (!trades.length) {
         tb.innerHTML = '<tr><td colspan="7" class="empty-cell">当日无成交记录</td></tr>';
         return;
     }
-    const rows = trades.slice().sort((a, b) => (Number(b.price) || 0) - (Number(a.price) || 0));
-    tb.innerHTML = rows.map(t => `
+    const rows = (TR_AGG ? aggTradesByOrder(trades) : trades.slice())
+        .sort((a, b) => (Number(b.price) || 0) - (Number(a.price) || 0));
+    tb.innerHTML = rows.map(t => {
+        // 聚合行时间：首笔~末笔（同日省略重复日期）；编号列=委托编号（多笔附笔数）
+        const timeTxt = (TR_AGG && t.endTime && t.endTime !== t.time)
+            ? `${t.time} ~ ${t.endTime.slice(11)}` : (t.time || "--");
+        const idTxt = (TR_AGG && t.order_id)
+            ? `${t.order_id}${t.count > 1 ? ` (${t.count}笔)` : ""}` : (t.trade_id || "--");
+        return `
         <tr>
-            <td>${t.time || "--"}</td>
+            <td>${timeTxt}</td>
             <td class="${dirCls(t.direction)}">${dirText(t.direction)}</td>
             <td>${fmt(t.price, 3)}</td>
             <td>${fmtWan(t.volume)}</td>
-            <td>${fmt(t.amount)}</td>
-            <td>${fmt(t.fee)}</td>
-            <td>${t.trade_id || "--"}</td>
-        </tr>`).join("");
+            <td>${fmtAmtWan(t.amount)}</td>
+            <td>${fmtFee(t.fee)}</td>
+            <td>${idTxt}</td>
+        </tr>`;
+    }).join("");
+}
+
+// 配对明细按「委托对」聚合展示：同一（买委托×卖委托）的多笔配对合并为一行，
+// 大委托拆单配给多个对手时对应多行；每行两侧均为单边委托（含委托编号）
+function aggPairsByOrder(pairs) {
+    const groups = [], map = new Map();
+    pairs.forEach((p, i) => {
+        const key = (p.buy_order_id || ("#b#" + i)) + "|" + (p.sell_order_id || ("#s#" + i));
+        let g = map.get(key);
+        if (!g) {
+            g = { buy_order_id: p.buy_order_id || "", sell_order_id: p.sell_order_id || "",
+                  buy_time: p.buy_time || "", buy_end: p.buy_time || "",
+                  sell_time: p.sell_time || "", sell_end: p.sell_time || "",
+                  qty: 0, buy_amount: 0, sell_amount: 0,
+                  buy_fee: 0, sell_fee: 0, gross_profit: 0, net_profit: 0 };
+            map.set(key, g);
+            groups.push(g);
+        }
+        g.qty += Number(p.qty) || 0;
+        g.buy_amount += Number(p.buy_amount) || 0;
+        g.sell_amount += Number(p.sell_amount) || 0;
+        g.buy_fee += Number(p.buy_fee) || 0;
+        g.sell_fee += Number(p.sell_fee) || 0;
+        g.gross_profit += Number(p.gross_profit) || 0;
+        g.net_profit += Number(p.net_profit) || 0;
+        if (p.buy_time && (!g.buy_time || p.buy_time < g.buy_time)) g.buy_time = p.buy_time;
+        if (p.buy_time && (!g.buy_end || p.buy_time > g.buy_end)) g.buy_end = p.buy_time;
+        if (p.sell_time && (!g.sell_time || p.sell_time < g.sell_time)) g.sell_time = p.sell_time;
+        if (p.sell_time && (!g.sell_end || p.sell_time > g.sell_end)) g.sell_end = p.sell_time;
+    });
+    groups.forEach(g => {
+        g.buy_price = g.qty > 0 ? g.buy_amount / g.qty : 0;     // 数量加权均价
+        g.sell_price = g.qty > 0 ? g.sell_amount / g.qty : 0;
+    });
+    return groups;
+}
+
+// 时间显示：单点或“首 ~ 末”（跨秒时省略重复日期）
+function pairTimeTxt(t, end) {
+    if (!t) return "--";
+    return (end && end !== t) ? `${t} ~ ${end.slice(11)}` : t;
 }
 
 function renderTrPairs(pairs) {
@@ -1796,16 +1904,17 @@ function renderTrPairs(pairs) {
         tb.innerHTML = '<tr><td colspan="8" class="empty-cell">无配对记录</td></tr>';
         return;
     }
-    tb.innerHTML = pairs.map(p => `
+    const rows = aggPairsByOrder(pairs);
+    tb.innerHTML = rows.map(p => `
         <tr>
-            <td>${p.buy_time || "--"}</td>
+            <td>${pairTimeTxt(p.buy_time, p.buy_end)}${p.buy_order_id ? `<br><span class="pair-oid" title="买入委托编号">${p.buy_order_id}</span>` : ""}</td>
             <td>${fmt(p.buy_price, 3)}</td>
-            <td>${p.sell_time || "--"}</td>
+            <td>${pairTimeTxt(p.sell_time, p.sell_end)}${p.sell_order_id ? `<br><span class="pair-oid" title="卖出委托编号">${p.sell_order_id}</span>` : ""}</td>
             <td>${fmt(p.sell_price, 3)}</td>
             <td>${fmtWan(p.qty)}</td>
             <td>${fmt(p.gross_profit)}</td>
-            <td>${fmt((p.buy_fee || 0) + (p.sell_fee || 0))}</td>
-            <td class="${Number(p.net_profit) >= 0 ? "up" : "down"}">${fmt(p.net_profit)}</td>
+            <td>${fmt(p.buy_fee + p.sell_fee)}</td>
+            <td class="${p.net_profit >= 0 ? "up" : "down"}">${fmt(p.net_profit)}</td>
         </tr>`).join("");
 }
 
@@ -1833,6 +1942,7 @@ function renderTrEmpty(date, text) {
 }
 
 function clearTrTables() {
+    TR_LAST_TRADES = [];
     document.querySelector("#trTradesTable tbody").innerHTML =
         '<tr><td colspan="7" class="empty-cell">暂无数据</td></tr>';
     document.querySelector("#trPairsTable tbody").innerHTML =
