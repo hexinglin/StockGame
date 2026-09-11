@@ -55,6 +55,21 @@ function fmtVol(n) {
     return String(n);
 }
 
+// 数量对外（操作/展示）统一用「万股」，计算与接口传输一律用「股」（在此集中换算）
+const SHARES_PER_WAN = 10000;
+function fmtWan(shares, d = 2) {
+    // 股 → 万股显示：100 股 = 0.01 万股，默认 2 位小数即精确；非整百数量（如成本底仓）回退 4 位
+    if (shares === null || shares === undefined || isNaN(shares)) return "--";
+    const wan = Number(shares) / SHARES_PER_WAN;
+    const nd = Math.abs(wan - Number(wan.toFixed(d))) < 1e-9 ? d : Math.max(d, 4);
+    return wan.toLocaleString("zh-CN", { minimumFractionDigits: nd, maximumFractionDigits: nd });
+}
+function toShares(wan) {
+    // 万股输入 → 股（四舍五入到整数股，消除浮点误差）
+    const v = parseFloat(wan);
+    return isNaN(v) ? 0 : Math.round(v * SHARES_PER_WAN);
+}
+
 // ───────────── Toast ─────────────
 function toast(msg, type = "info") {
     const wrap = document.getElementById("toastWrap");
@@ -945,7 +960,7 @@ function quickPriceByValue(v) {
 
 function recalcEstimate() {
     const price = parseFloat(document.getElementById("orderPrice").value) || 0;
-    const shares = parseInt(document.getElementById("orderShares").value) || 0;
+    const shares = toShares(document.getElementById("orderShares").value);   // 万股 → 股
     const amount = price * shares;
     const fee = amount * FEE_RATE;
     document.getElementById("estAmount").textContent = amount ? fmt(amount) : "--";
@@ -954,9 +969,9 @@ function recalcEstimate() {
 
 async function submitOrder() {
     const price = parseFloat(document.getElementById("orderPrice").value) || 0;
-    const shares = parseInt(document.getElementById("orderShares").value) || 0;
+    const shares = toShares(document.getElementById("orderShares").value);   // 万股 → 股
     if (price <= 0) { toast("请输入有效委托价格", "warn"); return; }
-    if (shares <= 0 || shares % 100 !== 0) { toast("委托数量必须为 100 的整数倍", "warn"); return; }
+    if (shares <= 0 || shares % 100 !== 0) { toast("委托数量须为 0.01 万股（100 股）的整数倍", "warn"); return; }
     // 防连点
     const sb = document.getElementById("btnSubmit");
     sb.disabled = true;
@@ -1045,7 +1060,7 @@ async function loadOrders() {
                 <td>${o.order_type === "limit" ? "限价" : "市价"}</td>
                 <td>${fmt(o.price, 3)}</td>
                 <td>${o.status === "filled" ? fmt(o.filled_price, 3) : "--"}</td>
-                <td>${fmt(o.shares)}</td>
+                <td>${fmtWan(o.shares)}</td>
                 <td>${o.status === "pending" ? '<span class="st-pending">已报</span>'
                     : o.status === "filled" ? '<span class="st-filled">已成</span>'
                     : o.status === "cancelled" ? '<span class="st-cancelled">已撤</span>'
@@ -1078,7 +1093,7 @@ async function loadTrades() {
                 <td>${t.trade_time || ""}</td>
                 <td class="${t.direction === "buy" ? "up" : "down"}">${t.direction === "buy" ? "买入" : "卖出"}</td>
                 <td>${fmt(t.price, 3)}</td>
-                <td>${fmt(t.shares)}</td>
+                <td>${fmtWan(t.shares)}</td>
                 <td>${fmt(t.fee)}</td>
             </tr>`).join("");
     } catch (e) { /* 忽略 */ }
@@ -1114,8 +1129,8 @@ function renderAccount(a, force) {
     const sellable = Math.max(0, (a.volume || 0) - (a.frozen_volume || 0) - (a.today_bought || 0));
     box.innerHTML = `
         <div class="acct-grid">
-            <div class="acct-item"><span>持仓量</span><b>${fmt(a.volume || 0)}</b></div>
-            <div class="acct-item"><span>可卖</span><b>${fmt(sellable)}</b></div>
+            <div class="acct-item"><span>持仓量(万股)</span><b>${fmtWan(a.volume || 0)}</b></div>
+            <div class="acct-item"><span>可卖(万股)</span><b>${fmtWan(sellable)}</b></div>
             <div class="acct-item"><span>成本价</span><b>${fmt(a.avg_price || 0, 3)}</b></div>
             <div class="acct-item"><span>浮动盈亏</span><b class="${floatPnl >= 0 ? 'up' : 'down'}">${fmt(floatPnl)}</b></div>
             <div class="acct-item"><span>可用现金</span><b>${fmt(a.available_cash)}</b></div>
@@ -1216,7 +1231,7 @@ function renderGrid() {
         <div class="grid-meta">
             <span>锚点 <b>${fmt(g.anchor_price, 3)}</b></span>
             <span>最新价 <b class="${(g.last_price >= g.anchor_price) ? "up" : "down"}">${fmt(g.last_price, 3)}</b></span>
-            <span>总持仓 <b>${fmt(g.total_shares)}</b></span>
+            <span>总持仓(万股) <b>${fmtWan(g.total_shares)}</b></span>
             <span>间隔 <b>${p.interval}</b>(偏${p.interval - 1}格，可逐行调整)</span>
         </div>`;
     // 价格行高亮：当前最新价所在区间（前档买点 ≥ 现价 ≥ 后档买点）
@@ -1246,14 +1261,16 @@ function renderGrid() {
                 <td class="${dirCls}">${dirText}</td>
                 <td class="${buyCls} up">${fmt(r.buy_price, 3)}</td>
                 <td class="${sellCls} down">${fmt(r.sell_price, 3)}</td>
-                <td>${fmt(r.shares)}</td>
+                <td class="${r.buy_fill_price != null ? "up" : ""}">${fmt(r.buy_fill_price, 3)}</td>
+                <td class="${r.sell_fill_price != null ? "down" : ""}">${fmt(r.sell_fill_price, 3)}</td>
+                <td>${fmtWan(r.shares)}</td>
                 <td><span class="${st.cls}">${st.text}</span></td>
             </tr>`;
     }).join("");
     box.innerHTML = `
         ${meta}
         <table class="rec-table grid-table">
-            <thead><tr><th>序号</th><th>买格号</th><th>卖格号</th><th>间隔</th><th>方向</th><th>买点</th><th>卖点</th><th>配持仓</th><th>状态</th></tr></thead>
+            <thead><tr><th>序号</th><th>买格号</th><th>卖格号</th><th>间隔</th><th>方向</th><th>买点</th><th>卖点</th><th title="该行买入侧真实成交价（多次成交取加权均价，未成交显示 --）">买成交价</th><th title="该行卖出侧真实成交价（多次成交取加权均价，未成交显示 --）">卖成交价</th><th>配持仓(万股)</th><th>状态</th></tr></thead>
             <tbody>${trs}</tbody>
         </table>`;
 }

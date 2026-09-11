@@ -16,6 +16,18 @@
     状态推导（成交触发）: 遍历该轮次成交记录，用 hit_tolerance 容差判定某笔成交是否命中某行
       的买点/卖点；买、卖均命中 → done（已完成），单个命中 → buy/sell（部分完成），否则 pending。
     本模块为纯函数，不读写 DB/Redis，调用方（game_engine.get_grid）负责取数。
+
+    梯度推导（建梯度 / 消梯度，参考 AutoTrade T0 网格匹配思想）:
+      - 初始化不再全量建梯子（build_grid_rows 停用保留）；梯度仅由成交产生，
+        derive_gradient_rows 按成交时序逐笔重放（买卖各一个价格匹配函数，卖侧含偏移值）。
+      - 消梯度（先判）: 成交价命中某未消完梯度的对侧网格线（买成交→该行买点线、卖成交→
+        该行卖点线含偏移值；容差判定）即消该梯度；数量不足只消部分（行保留剩余数量继续
+        等待），取价格最近者，一笔最多消一个。
+      - 建梯度: 消无可消、或消费后有多的部分，按成交价就近网格线新建（买→买入向行、
+        卖→卖出向行）；同方向同格号已有未消完行 → 数量合并。
+      - 消完的行保留并标记 done（已完成），不做删除。
+      - 行内记录两侧真实成交价（buy_fill_price / sell_fill_price，多次成交取加权均价；
+        未成交侧为 None），供前端与网格价（买点/卖点）对照展示。
 """
 
 # 网格默认参数（config.yaml game.grid 可覆盖）
@@ -178,4 +190,179 @@ def mark_grid_status(rows: list, trades: list, params: dict) -> list:
             r["status"] = "sell"     # 已卖出，待回补
         else:
             r["status"] = "pending"  # 未触发
+    return rows
+
+
+# ── 梯度推导（建梯度 / 消梯度）──
+
+def buy_grid_index_of(price: float, init_value: float, grid_spacing: float,
+                      hit_tolerance: float = DEFAULT_GRID_PARAMS["hit_tolerance"]):
+    """买入网格匹配函数（参考 AutoTrade T0）: 返回 (买格号, 买点价)；价格在死区返回 (None, None)
+
+    价格取最近的买点线（四舍五入）；命中判定 |price - 买点价| <= hit_tolerance。
+    """
+    if grid_spacing <= 0:
+        return None, None
+    idx = grid_level_of(price, init_value, grid_spacing)
+    line = buy_grid_price(idx, init_value, grid_spacing)
+    if not is_hit(price, line, hit_tolerance):
+        return None, None
+    return idx, line
+
+
+def sell_grid_index_of(price: float, init_value: float, grid_spacing: float,
+                       offset: float,
+                       hit_tolerance: float = DEFAULT_GRID_PARAMS["hit_tolerance"]):
+    """卖出网格匹配函数（带偏移值 offset，参考 AutoTrade T0）: 返回 (卖格号, 卖点价)；死区返回 (None, None)
+
+    价格取最近的卖点线（四舍五入，卖点线含 offset）；命中判定 |price - 卖点价| <= hit_tolerance。
+    """
+    if grid_spacing <= 0:
+        return None, None
+    idx = int(round((price - init_value - offset) / grid_spacing - _GRID_EPS))
+    line = sell_grid_price(idx, init_value, grid_spacing, offset)
+    if not is_hit(price, line, hit_tolerance):
+        return None, None
+    return idx, line
+
+
+def derive_gradient_rows(trades: list, params: dict, interval_map: dict = None) -> list:
+    """由成交记录推导梯度行（建梯度 / 消梯度）— 初始化不再全量建梯子
+
+    按成交时序（旧→新）逐笔重放，每笔先消、消无可消或数量有多的再建：
+      1. 消: 成交价命中某未消完梯度的对侧网格线（买成交→该行买点线、卖成交→该行卖点线含
+         偏移值）即消该梯度；数量不足只消部分（行保留剩余数量继续等待），取最近者，
+         一笔最多消一个。
+      2. 建: 按成交价就近网格线新建（买成交→买入向行、卖成交→卖出向行）；同方向同格号
+         已有未消完行 → 数量合并；消完的行保留并标记 done。
+
+    Args:
+        trades: 该轮次成交记录 [{direction, price, shares}, ...]（list_trades 输出，新→旧）
+        params: 归一化后的网格参数（normalize_params 输出）
+        interval_map: 可选行级间隔 {主格号idx(int): interval}
+
+    Returns:
+        list[dict]: 梯度行（字段同 build_grid_rows 输出 + buy_fill_price/sell_fill_price
+                    两侧真实成交价加权均价，未成交侧为 None），按主格号升序
+    """
+    p = params
+    spacing = float(p["grid_spacing"])
+    init_value = float(p["init_value"])
+    offset = float(p["offset"])
+    default_interval = int(p.get("interval", 2))
+    tol = float(p.get("hit_tolerance", DEFAULT_GRID_PARAMS["hit_tolerance"]))
+    imap = {}
+    if interval_map:
+        for k, v in interval_map.items():
+            try:
+                imap[int(k)] = int(v)
+            except (TypeError, ValueError):
+                continue
+    if spacing <= 0:
+        return []
+
+    rows = []
+
+    def _interval_of(idx):
+        return max(imap.get(idx, default_interval), 1)
+
+    def _add_fill(row, side, price, shares):
+        """累计某侧真实成交（两侧成交价取加权均价用，side: buy/sell）"""
+        row["_fill_amt_" + side] += float(price) * int(shares)
+        row["_fill_sh_" + side] += int(shares)
+
+    def _new_row(idx, direction, shares, price):
+        interval = _interval_of(idx)
+        off_grid = max(interval - 1, 0)
+        if direction == "sell":
+            sell_idx, buy_idx = idx, idx - off_grid
+        else:
+            buy_idx, sell_idx = idx, idx + off_grid
+        row = {
+            "idx": idx,
+            "direction": direction,
+            "buy_idx": buy_idx,
+            "sell_idx": sell_idx,
+            "interval": interval,
+            "buy_price": buy_grid_price(buy_idx, init_value, spacing),
+            "sell_price": sell_grid_price(sell_idx, init_value, spacing, offset),
+            "shares": int(shares),
+            "status": "sell" if direction == "sell" else "buy",
+            "buy_hit": direction == "buy",
+            "sell_hit": direction == "sell",
+            # 两侧真实成交价（加权均价，未成交为 None；推导结束后统一填充）
+            "buy_fill_price": None,
+            "sell_fill_price": None,
+            "_fill_amt_buy": 0.0, "_fill_sh_buy": 0,
+            "_fill_amt_sell": 0.0, "_fill_sh_sell": 0,
+        }
+        rows.append(row)
+        _add_fill(row, direction, price, shares)
+        return row
+
+    def _open_row(direction, main_idx):
+        """同方向同主格号未消完行（建梯度数量合并用）"""
+        for r in rows:
+            if r["direction"] == direction and r["idx"] == main_idx and r["status"] != "done":
+                return r
+        return None
+
+    def _build(direction, price, shares):
+        """建梯度：就近网格线；同方向同格号未消完 → 数量合并"""
+        if direction == "sell":
+            idx = int(round((price - init_value - offset) / spacing - _GRID_EPS))
+        else:
+            idx = grid_level_of(price, init_value, spacing)
+        row = _open_row(direction, idx)
+        if row is not None:
+            row["shares"] += int(shares)
+            _add_fill(row, direction, price, shares)
+            return row
+        return _new_row(idx, direction, shares, price)
+
+    def _consume(row, shares, price, side):
+        """消梯度（部分/全部），返回未消完的剩余数量；side = 成交方向（累计真实成交价）"""
+        x = min(int(shares), int(row["shares"]))
+        row["shares"] -= x
+        _add_fill(row, side, price, x)
+        if row["shares"] <= 0:
+            row["buy_hit"] = row["sell_hit"] = True
+            row["status"] = "done"
+        return int(shares) - x
+
+    for t in reversed(trades or []):
+        price = t.get("price")
+        shares = int(t.get("shares") or 0)
+        direction = t.get("direction")
+        if not price or price <= 0 or shares <= 0:
+            continue
+        leftover = shares
+        if direction == "sell":
+            idx, _ = sell_grid_index_of(price, init_value, spacing, offset, tol)
+            if idx is not None:
+                cand = [r for r in rows if r["direction"] == "buy"
+                        and r["status"] != "done" and r["sell_idx"] == idx]
+                if cand:
+                    row = min(cand, key=lambda r: abs(price - r["sell_price"]))
+                    leftover = _consume(row, shares, price, "sell")
+        elif direction == "buy":
+            idx, _ = buy_grid_index_of(price, init_value, spacing, tol)
+            if idx is not None:
+                cand = [r for r in rows if r["direction"] == "sell"
+                        and r["status"] != "done" and r["buy_idx"] == idx]
+                if cand:
+                    row = min(cand, key=lambda r: abs(price - r["buy_price"]))
+                    leftover = _consume(row, shares, price, "buy")
+        if leftover > 0:
+            _build(direction, price, leftover)
+
+    # 填充两侧真实成交价（加权均价，未成交侧为 None），并清理累计字段
+    for r in rows:
+        for side in ("buy", "sell"):
+            sh = r.pop("_fill_sh_" + side)
+            amt = r.pop("_fill_amt_" + side)
+            if sh > 0:
+                r[side + "_fill_price"] = round(amt / sh, 4)
+
+    rows.sort(key=lambda r: r["idx"])
     return rows

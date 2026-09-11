@@ -21,7 +21,8 @@ from ..dbdata.models import (GameRound, GameOrder, GameTrade, GameDay,
 from ..messaging.cache import get_cache
 from ..utils.config import Config
 from .account import MockAccount
-from .grid_math import (normalize_params, build_grid_rows, mark_grid_status)
+from .grid_math import (normalize_params, build_grid_rows, mark_grid_status,
+                        derive_gradient_rows)
 
 logger = logging.getLogger(__name__)
 
@@ -486,10 +487,15 @@ class GameEngine:
 
     @_ensure_ctx
     def get_grid(self, round_id: int) -> dict:
-        """网格表数据：网格行 + 触发状态（结单/成交推导），供前端「网格表」tab 渲染
+        """网格表数据：梯度行 + 状态（由成交记录推导：建梯度/消梯度），供前端「网格表」tab 渲染
 
-        锚点价确定链：昨收（day_last_close）> 最新成交价 > 引擎首根快照 close；
-        持仓量取账户 volume（底仓 + 买卖，均分到每格）。网格参数取自 config game.grid。
+        初始化不再全量建梯子（原锚点展开逻辑暂停用，保留实现）：梯度仅随成交产生——
+        每笔成交先消（命中未消完梯度的对侧网格线，买/卖两个匹配函数，卖侧含偏移值/容差）、
+        消无可消或数量有多的再建（按成交价就近网格线新建，同方向同格号数量合并）。
+        每行附带两侧真实成交价（buy_fill_price / sell_fill_price，多次成交取加权均价；
+        未成交侧为 null），供前端与网格价（买点/卖点）对照。
+        锚点价仍用于页面展示：昨收（day_last_close）> 最新成交价 > 引擎首根快照 close。
+        网格参数取自 config game.grid。
         """
         r = GameRound.query.get(round_id)
         if not r:
@@ -519,10 +525,13 @@ class GameEngine:
         # 行级间隔持久化：读取该轮次的间隔覆盖 {主格号idx: interval}
         interval_map = get_cache().load_config(f"grid_int:{round_id}") or {}
 
-        # 成交记录（触发状态推导）
+        # 成交记录（梯度推导）
         trades = self.list_trades(round_id)
-        rows = build_grid_rows(anchor, volume, params, interval_map)
-        mark_grid_status(rows, trades, params)
+        # 初始化全量建梯度已停用（保留原实现，暂注释）：改为仅由成交记录推导梯度
+        # （建梯度 / 消梯度，先消后建），详见 grid_math.derive_gradient_rows
+        # rows = build_grid_rows(anchor, volume, params, interval_map)
+        # mark_grid_status(rows, trades, params)
+        rows = derive_gradient_rows(trades, params, interval_map)
 
         return {
             "round_id": round_id,
@@ -539,6 +548,8 @@ class GameEngine:
                     "interval": x["interval"],
                     "buy_price": x["buy_price"],
                     "sell_price": x["sell_price"],
+                    "buy_fill_price": x.get("buy_fill_price"),
+                    "sell_fill_price": x.get("sell_fill_price"),
                     "shares": x["shares"],
                     "status": x["status"],
                     "buy_hit": x["buy_hit"],
@@ -952,7 +963,7 @@ class GameEngine:
         if order_type not in ("limit", "market"):
             return False, None, "order_type 仅支持 limit/market"
         if shares <= 0 or shares % 100 != 0:
-            return False, None, "数量必须为 100 的整数倍"
+            return False, None, "数量必须为 100 股（0.01 万股）的整数倍"
         if order_type == "limit" and (not price or price <= 0):
             return False, None, "限价单价格必须大于 0"
 

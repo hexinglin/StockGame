@@ -142,8 +142,8 @@
                         <input type="number" id="orderPrice" step="0.001" min="0" oninput="recalcEstimate()">
                     </div>
                     <div class="order-field">
-                        <label>委托数量</label>
-                        <input type="number" id="orderShares" step="10000" value="10000" oninput="recalcEstimate()">
+                        <label>委托数量(万股)</label>
+                        <input type="number" id="orderShares" step="1" min="0" value="1" oninput="recalcEstimate()">
                     </div>
                 </div>
                 <div class="estimate-row">
@@ -166,11 +166,11 @@
         </nav>
         <div class="records-body">
             <table id="ordersTable" class="rec-table" style="display:none">
-                <thead><tr><th>时间</th><th>方向</th><th>类型</th><th>委托价</th><th>成交价</th><th>数量</th><th>状态</th><th>操作</th></tr></thead>
+                <thead><tr><th>时间</th><th>方向</th><th>类型</th><th>委托价</th><th>成交价</th><th>数量(万股)</th><th>状态</th><th>操作</th></tr></thead>
                 <tbody></tbody>
             </table>
             <table id="tradesTable" class="rec-table" style="display:none">
-                <thead><tr><th>成交时间</th><th>方向</th><th>价格</th><th>数量</th><th>手续费</th></tr></thead>
+                <thead><tr><th>成交时间</th><th>方向</th><th>价格</th><th>数量(万股)</th><th>手续费</th></tr></thead>
                 <tbody></tbody>
             </table>
             <div id="accountBox"></div>

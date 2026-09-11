@@ -1,0 +1,18 @@
+# 版本控制与 IDE
+.git
+.gitignore
+.idea
+
+# Python 缓存与测试产物
+__pycache__
+*.pyc
+.pytest_cache
+
+# 本地运行产物（logs 由 compose 挂载进容器，无需打入镜像）
+logs
+
+# 无需进容器：QMT 端脚本 / 数据工具脚本 / 测试（各自独立运行或仅在宿主机使用）
+qmt
+qmt_agent
+scripts
+tests
