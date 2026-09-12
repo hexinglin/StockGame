@@ -1,48 +1,38 @@
 """
 模块名称: engine/game_engine.py
-说明:    游戏核心 — 轮次管理 / 时钟推进 / 3s 数据复核撮合 / 结算
-         一个轮次 = 一个交易日的完整游戏周期，账户按轮次独立跟踪
+说明:    游戏核心编排 — 轮次生命周期 / 时钟推进 / 撮合调度 / 结算。
+         一个轮次 = 一个交易日的完整游戏周期，账户按轮次独立跟踪。
+
+         纯逻辑与数据访问已拆分至：
+         - matching.py     交易时段判定 + 成交判定（纯函数）
+         - day_meta.py     game_days 天维度行情维护 / 昨收确定链
+         - serializers.py  ORM → API/推送字典统一出口
+         本模块只保留轮次状态机与上下文编排（加载/恢复/推进/落库）。
 """
 import functools
 import json
 import logging
 import random
 import threading
-import time
 import uuid
 from contextlib import contextmanager
 from datetime import datetime
 
-from sqlalchemy import text
-
 from ..dbdata.database import db
-from ..dbdata.models import (GameRound, GameOrder, GameTrade, GameDay,
-                             TickData, TickDataSim)
+from ..dbdata.models import (GameRound, GameOrder, GameTrade, GameDay)
 from ..messaging.cache import get_cache
 from ..utils.config import Config
 from ..utils.timeutil import now_cn
 from .account import MockAccount
-from .grid_math import (normalize_params, build_grid_rows, mark_grid_status,
-                        derive_gradient_rows)
+from . import day_meta, matching, serializers
+from .grid_math import (normalize_params, derive_gradient_rows,
+                        apply_idx_override)
 
 logger = logging.getLogger(__name__)
 
-
-def _parse_game_time(time_key: str):
-    """行情 time_key（游戏时间 'YYYY-MM-DD HH:MM:SS'）→ datetime
-
-    委托/成交时间一律记游戏时间（行情时间轴），绝不使用真实时间——行情为
-    历史交易日时订单同样按历史日期落库，与前端分时图时间轴保持一致；
-    time_key 缺失/格式异常时返回 None（调用方自行兜底）。
-    """
-    if not time_key:
-        return None
-    try:
-        return datetime.strptime(time_key, "%Y-%m-%d %H:%M:%S")
-    except ValueError:
-        logger.warning("解析游戏时间失败: %r，订单时间记 None", time_key)
-        return None
-
+# 时段常量向后兼容再导出（game_routes 引用 _SESSION_DAY_END）
+_SESSION_DAY_END = matching.SESSION_DAY_END
+_session_of = matching.session_of
 
 # 轮次状态
 ST_READY = "ready"
@@ -61,102 +51,26 @@ O_REJECTED = "rejected"
 _TICK_SEC = 1.0          # 1x 速度每秒推送一根 tick
 _CLOCK_INTERVAL = 0.1    # 时钟推进周期（秒）
 
-# ── 交易时段划分（盘前集合竞价 / 盘中连续 / 收盘集合竞价 / 盘后）──
-# A 股交易日结构：09:15-09:25 开盘集合竞价（09:25 出竞价价），09:25-09:30
-# 竞价等待段，09:30-11:30/13:00-14:57 连续竞价，14:57-15:00 收盘集合竞价
-# （只挂不撤），15:00 收盘。盘后（>15:00，如固定价交易）不进入游戏。
-_SESSION_PRE_FILL = "09:25:00"        # 开盘集合竞价撮合时点（出竞价价）
-_SESSION_CLOSING_START = "14:57:00"   # 收盘集合竞价开始（此后只挂不撤）
-_SESSION_DAY_END = "15:00:00"         # 交易日收盘（最后一根 tick）
 
+def _parse_game_time(time_key: str):
+    """行情 time_key（游戏时间 'YYYY-MM-DD HH:MM:SS'）→ datetime
 
-def _time_hms(time_key: str) -> str:
-    """取 time_key 的 HH:MM:SS 部分（格式异常时原样返回，供字符串比较）"""
-    return time_key[11:19] if len(time_key) >= 19 else time_key
-
-
-def _session_of(time_key: str) -> str:
-    """按 time_key 判定当前所属交易时段: pre / intraday / closing / post
-
-    - pre      盘前集合竞价（< 09:30:00，含 09:25 出竞价价）
-    - intraday 盘中连续竞价（09:30:00 ~ 14:56:59）
-    - closing  收盘集合竞价（14:57:00 ~ 15:00:00，只挂不撤）
-    - post     盘后（> 15:00:00，应被上层过滤，正常情况下不会到达）
+    委托/成交时间一律记游戏时间（行情时间轴），绝不使用真实时间——行情为
+    历史交易日时订单同样按历史日期落库，与前端分时图时间轴保持一致；
+    time_key 缺失/格式异常时返回 None（调用方自行兜底）。
     """
-    hms = _time_hms(time_key)
-    if hms < "09:30:00":
-        return "pre"
-    if hms >= _SESSION_CLOSING_START:
-        return "closing" if hms <= _SESSION_DAY_END else "post"
-    return "intraday"
-
-
-def _is_auction_point(time_key: str) -> bool:
-    """当前 tick 是否为（开盘/收盘）集合竞价撮合点
-
-    返回 True 表示该 tick 时刻已到竞价撮合时点（盘前 09:25 后、收盘 15:00），
-    应以其最新价作为竞价价集中撮合；False 表示竞价等待期（只挂不撮）。
-    """
-    hms = _time_hms(time_key)
-    if hms < "09:30:00":
-        return hms >= _SESSION_PRE_FILL
-    if hms >= _SESSION_CLOSING_START:
-        return hms >= _SESSION_DAY_END
-    return False  # 盘中连续竞价，逐 tick 以最新价触及即成交（非竞价口径）
-
-# 按 tick 表现存快照聚合 upsert 到 game_days（天维度真实行情，与 tick 表
-# 对齐的日期管理唯一权威表）的模板（表名白名单拼接）。快照口径：
-# volume/amount 为当日累计值，取末条快照（array_agg DESC [1]）而非 sum；
-# high/low=max/min 各快照滚动极值；open（今开）为当日常量：hint 有效则写
-# hint，否则保留库内旧值（INSERT 时以首条快照 close 兑底）。last_close 维护
-# 链见 refresh_day 注释
-_GAME_DAY_UPSERT_SQL = """
-INSERT INTO game_days (code, trade_date, data_source, open, high, low, close,
-                       volume, amount, last_close, tick_count, first_time_key,
-                       last_time_key, is_complete)
-SELECT :code, :trade_date, :data_source,
-       COALESCE(NULLIF(:open_hint, 0), (array_agg(close ORDER BY time_key))[1]),
-       max(high), min(low),
-       (array_agg(close ORDER BY time_key DESC))[1],
-       (array_agg(volume ORDER BY time_key DESC))[1],
-       (array_agg(amount ORDER BY time_key DESC))[1],
-       :last_close,
-       count(*), min(time_key), max(time_key),
-       (max(time_key) >= :date_end)
-FROM {table}
-WHERE code = :code AND trade_date = :trade_date
-ON CONFLICT (code, trade_date, data_source) DO UPDATE SET
-  open = CASE WHEN :open_hint > 0 THEN :open_hint ELSE game_days.open END,
-  high = EXCLUDED.high, low = EXCLUDED.low, close = EXCLUDED.close,
-  volume = EXCLUDED.volume, amount = EXCLUDED.amount,
-  tick_count = EXCLUDED.tick_count,
-  first_time_key = EXCLUDED.first_time_key,
-  last_time_key = EXCLUDED.last_time_key,
-  is_complete = EXCLUDED.is_complete,
-  last_close = CASE WHEN EXCLUDED.last_close > 0 THEN EXCLUDED.last_close
-                    ELSE game_days.last_close END,
-  updated_at = now()
-"""
+    if not time_key:
+        return None
+    try:
+        return datetime.strptime(time_key, "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        logger.warning("解析游戏时间失败: %r，订单时间记 None", time_key)
+        return None
 
 
 def _valid_price(v) -> bool:
-    """有效价格：非空、>0 且非 NaN（NaN 为 truthy 且比较异常，需显式过滤）"""
-    return v is not None and v > 0 and v == v
-
-
-def _parse_dsn(dsn: str) -> dict:
-    """解析 postgresql://user:pass@host:port/dbname 连接串"""
-    prefix = "postgresql://"
-    if dsn.startswith(prefix):
-        dsn = dsn[len(prefix):]
-    userinfo, _, rest = dsn.partition("@")
-    user, _, password = userinfo.partition(":")
-    host, _, port_db = rest.partition(":")
-    if "/" in port_db:
-        port, _, dbname = port_db.partition("/")
-    else:
-        port, dbname = port_db, "postgres"
-    return {"user": user, "password": password, "host": host, "port": port, "dbname": dbname}
+    """有效价格：非空、>0 且非 NaN"""
+    return day_meta._valid_price(v)
 
 
 class RoundContext:
@@ -168,8 +82,10 @@ class RoundContext:
         self.index = 0           # 当前 tick 索引
         self.fraction = 0.0      # 时钟推进余数（支持变速）
         self.acct = None         # MockAccount
-        self.pending = {}        # order_id -> GameOrder（pending 订单，按创建时间排序）
+        self.pending = {}        # order_id -> GameOrder（pending 订单）
         self.lock = threading.RLock()
+        self.cum_amount = 0.0    # 当日累计成交额（差分累加）
+        self.cum_volume = 0      # 当日累计成交量
 
 
 class GameEngine:
@@ -214,6 +130,8 @@ class GameEngine:
             except Exception as e:
                 logger.warning("socket 推送失败 %s: %s", event, e)
 
+    # ── 配置 ──
+
     def _cfg(self):
         cfg = Config.get_instance()
         return {
@@ -239,75 +157,66 @@ class GameEngine:
         return norm
 
     def save_grid_interval(self, round_id: int, idx: int, interval: int) -> dict:
-        """保存某轮次某行的行级间隔（写 Redis，随轮次持久化），返回该轮次全部间隔映射"""
+        """保存某轮次某行的行级间隔（写 Redis，随轮次持久化），返回该轮次全部间隔映射
+
+        idx 为行稳定标识（key_idx，非显示格号），故行位置微调后间隔仍归属同一行。
+        """
         ns = f"grid_int:{round_id}"
         imap = dict(get_cache().load_config(ns) or {})
-        imap[str(int(idx))] = max(int(interval), 1)
+        # 间隔合法域与前端下拉一致：1-6
+        imap[str(int(idx))] = min(max(int(interval), 1), 6)
         get_cache().save_config(ns, imap)
         return imap
 
-    # ── 可用交易日（基于 game_days 天维度记录，不扫 tick 表）──
+    @_ensure_ctx
+    def save_grid_idx(self, round_id: int, key_idx: int, new_idx: int) -> (bool, str, dict):
+        """保存某轮次某行的格号覆盖（人工微调行位置），返回 (ok, msg, 覆盖映射)
+
+        key_idx 为行稳定标识（由成交流水推导出的原格号）：连续微调沿用同一键，
+        不会因显示格号变化而丢失关联。该行已有未成交委托时拒绝——委托价挂在
+        调整前的网格线上，移动行会让委托与实际价位脱节（前端同时置灰输入框）。
+        """
+        if int(new_idx) < 0:
+            return False, "格号不能为负", {}
+        grid = self.get_grid(round_id)
+        if grid is None:
+            return False, "轮次不存在", {}
+        row = next((x for x in grid["rows"] if x.get("key_idx") == int(key_idx)), None)
+        if row is None:
+            return False, f"网格行 {key_idx} 不存在", {}
+        if row.get("pending_order_id"):
+            return False, "该行已有未成交委托，请先撤单再调整", {}
+        ns = f"grid_idx:{round_id}"
+        imap = dict(get_cache().load_config(ns) or {})
+        imap[str(int(key_idx))] = int(new_idx)
+        get_cache().save_config(ns, imap)
+        return True, "", imap
+
+    # ── 可用交易日（委托 day_meta，保持原引擎接口）──
 
     def _tick_model(self, data_source: str):
-        """按数据源返回行情模型：qmt → tick_data(实盘)，sim → tick_data_sim(转换模拟)"""
-        return TickDataSim if data_source == "sim" else TickData
-
-    @_ensure_ctx
-    def _day_map(self, code: str) -> dict:
-        """标的可开局交易日来源映射（仅完整交易日，权威源：game_days）
-
-        返回 {trade_date: {"qmt": bool, "sim": bool}}；game_days 为天维度真实
-        行情表（与 tick 表对齐，行情入库时维护刷新），is_complete=true 即该日
-        末根 tick >= 15:00:00。日期选择/管理一律以 game_days 为准（tick 表仅
-        在游戏运行时读取）。
-        """
-        result = {}
-        rows = (db.session.query(GameDay.trade_date, GameDay.data_source)
-                .filter(GameDay.code == code, GameDay.is_complete.is_(True))
-                .all())
-        for trade_date, data_source in rows:
-            key = "qmt" if (data_source or "qmt") == "qmt" else "sim"
-            result.setdefault(trade_date, {})[key] = True
-        return result
+        """按数据源返回行情模型（day_meta.tick_model 兼容出口）"""
+        return day_meta.tick_model(data_source)
 
     @_ensure_ctx
     def available_dates(self, code: str, allow_sim: bool = False) -> list:
-        """可用交易日列表（按 code 过滤，数据完整：最后一根 tick >= 15:00:00）
-
-        allow_sim=True 时并入仅有转换模拟数据完整的日期（QMT 数据仍优先）。
-        """
-        return sorted(self._date_items(code, allow_sim).keys())
+        """可用交易日列表（数据完整：最后一根 tick >= 15:00:00）"""
+        return sorted(day_meta.date_items(code, allow_sim).keys())
 
     @_ensure_ctx
     def date_sources(self, code: str, allow_sim: bool = False) -> list:
-        """可用交易日 + 数据来源标记（QMT 优先）
-
-        返回 [{trade_date, source}]；同日 qmt 与 sim 并存时 source=qmt
-        （游戏数据源优先级：QMT 实盘 > 转换模拟）。
-        """
-        items = self._date_items(code, allow_sim)
+        """可用交易日 + 数据来源标记（QMT 优先）: [{trade_date, source}]"""
+        items = day_meta.date_items(code, allow_sim)
         return [{"trade_date": d, "source": s} for d, s in items.items()]
-
-    @_ensure_ctx
-    def _date_items(self, code: str, allow_sim: bool) -> dict:
-        """可用日期 → 实际数据源（qmt 优先）的映射（内部，调用方须处于 app context）"""
-        items = {}
-        for date, src in self._day_map(code).items():
-            if src.get("qmt"):
-                items[date] = "qmt"
-            elif allow_sim and src.get("sim"):
-                items[date] = "sim"
-        return items
 
     @_ensure_ctx
     def date_details(self, code: str, allow_sim: bool = False) -> list:
         """可运行交易日 + 天维度原始行情（选择/开局界面用，QMT 优先）
 
         可开局判定与行情元数据（tick_count/OHLC/last_close 等）均来自
-        game_days（权威源：与 tick 对齐的天维度真实行情，is_complete 完整日
-        标记），不触碰 tick 行情表。
+        game_days（权威源），不触碰 tick 行情表。
         """
-        items = self._date_items(code, allow_sim)
+        items = day_meta.date_items(code, allow_sim)
         if not items:
             return []
         klines = (GameDay.query.filter(
@@ -325,6 +234,20 @@ class GameEngine:
             result.append(item)
         return result
 
+    def day_last_close(self, code: str, trade_date: str, data_source: str) -> float:
+        """当日昨收（day_meta 委托；调用方须处于 app context）"""
+        return day_meta.day_last_close(code, trade_date, data_source)
+
+    def refresh_day(self, code: str, trade_date: str, data_source: str,
+                    last_close_hint: float = 0.0, open_hint: float = 0.0) -> bool:
+        """快照入库后同步维护 game_days（day_meta 委托；调用方须处于 app context）"""
+        return day_meta.refresh_day(code, trade_date, data_source,
+                                    last_close_hint, open_hint)
+
+    def refresh_all_days(self, code: str = None, trade_date: str = None) -> int:
+        """全量重建 game_days（day_meta 委托；调用方须处于 app context）"""
+        return day_meta.refresh_all_days(code, trade_date)
+
     # ── 轮次管理 ──
 
     @_ensure_ctx
@@ -339,8 +262,7 @@ class GameEngine:
         p = self._cfg()
         code = code or p["stock_code"]
 
-        # 可用交易日（allow_sim=False 时仅 QMT 数据日期）
-        dates = self._date_items(code, allow_sim)
+        dates = day_meta.date_items(code, allow_sim)
         if not dates:
             return None, f"标的 {code} 暂无完整交易日数据，请先上传行情"
         if trade_date:
@@ -383,47 +305,29 @@ class GameEngine:
                 return False, "轮次不存在"
             if r.status == ST_RUNNING:
                 return False, "运行中的轮次不可删除，请先暂停或结束"
-            ctx = self._rounds.pop(round_id, None)
+            self._rounds.pop(round_id, None)
 
             # 手动级联删除（SQLAlchemy 不自动级联）：委托/成交/轮次行全部物理删除
             GameOrder.query.filter_by(round_id=round_id).delete()
             GameTrade.query.filter_by(round_id=round_id).delete()
             db.session.delete(r)
             db.session.commit()
-
-            # 清理 Redis（账户/进度/行情快照）
-            cache = get_cache()
-            cache.delete_account(round_id)
-            cache.delete_progress(round_id)
-            cache.delete_quote(str(round_id))
+            self._cleanup_round_cache(round_id)
             return True, ""
+
+    @staticmethod
+    def _cleanup_round_cache(round_id: int):
+        """清理轮次相关 Redis（账户/进度/行情快照）"""
+        cache = get_cache()
+        cache.delete_account(round_id)
+        cache.delete_progress(round_id)
+        cache.delete_quote(str(round_id))
 
     @_ensure_ctx
     def list_rounds(self) -> list:
         """轮次列表（含进度）"""
         rows = GameRound.query.order_by(GameRound.created_at.desc()).all()
-        result = []
-        for r in rows:
-            progress = self._progress_of(r)
-            result.append({
-                "id": r.id,
-                "code": r.code,
-                "trade_date": r.trade_date,
-                "status": r.status,
-                "speed": r.speed,
-                "data_source": r.data_source or "qmt",
-                "created_at": r.created_at.strftime("%Y-%m-%d %H:%M:%S") if r.created_at else "",
-                "initial_cash": r.initial_cash,
-                "base_shares": r.base_shares,
-                "initial_assets": round(r.initial_assets or 0, 2),
-                "final_assets": round(r.final_assets or 0, 2),
-                "realized_pnl": round(r.realized_pnl or 0, 2),
-                "fee_total": round(r.fee_total or 0, 2),
-                "last_price": r.last_price,
-                "last_time_key": r.last_time_key,
-                "progress": progress,
-            })
-        return result
+        return [serializers.round_brief(r, self._progress_of(r)) for r in rows]
 
     @_ensure_ctx
     def get_round(self, round_id: int):
@@ -432,71 +336,49 @@ class GameEngine:
         if not r:
             return None
         ctx = self._rounds.get(round_id)
-        acct = None
+        acct = self._round_account(r, ctx)
+        acct = serializers.with_round_totals(acct, r)
+        cum_amount, cum_volume = self._cum_totals(r, ctx)
+        return serializers.round_detail(r, acct, cum_amount, cum_volume)
+
+    def _round_account(self, r, ctx):
+        """轮次账户字典：内存 ctx 优先，其次 Redis 快照，最后 DB JSON 兜底
+
+        finished 轮次同样可从 Redis 快照恢复结算后账户（未删除轮次）。
+        """
         if ctx and ctx.acct:
-            acct = ctx.acct.to_dict()
-        elif r.status in (ST_RUNNING, ST_PAUSED, ST_FINISHED):
-            # finished 轮次同样可从 Redis 快照恢复结算后账户（未删除轮次）；
-            # Redis 缺失时以 DB 账户 JSON 兜底
-            acct = get_cache().load_account(round_id)
-            if not acct:
-                acct = self._account_from_json(r.account_json)
+            return ctx.acct.to_dict()
+        if r.status not in (ST_RUNNING, ST_PAUSED, ST_FINISHED):
+            return None
+        acct = get_cache().load_account(r.id)
+        return acct if acct else self._account_from_json(r.account_json)
 
-        # 累计成交额/量（前端分时图恢复用；重启后按已推进区间重算）
-        cum_amount, cum_volume = 0.0, 0
-        if ctx and hasattr(ctx, "cum_amount"):
-            cum_amount, cum_volume = ctx.cum_amount, ctx.cum_volume
-        elif r.last_time_key:
-            # 快照口径：当日累计量额 = <= last_time_key 的末条快照值
-            # （volume/amount 在 tick 表为当日累计值，不可再逐点求和）
-            m = self._tick_model(r.data_source)
-            row = (db.session.query(m.amount, m.volume)
-                   .filter(m.code == r.code,
-                           m.trade_date == r.trade_date,
-                           m.time_key <= r.last_time_key)
-                   .order_by(m.time_key.desc()).first())
-            if row:
-                cum_amount, cum_volume = row[0] or 0, row[1] or 0
+    def _cum_totals(self, r, ctx):
+        """累计成交额/量（前端分时图恢复用；重启后按已推进区间重算）
 
-        # 账户字典补充轮次级已实现盈亏/手续费（与 game:account 推送同口径），
-        # 使 REST /account 与 socket 推送字段一致，前端统一读 a.realized_pnl/a.fee_total
-        if acct is not None:
-            acct["realized_pnl"] = round(r.realized_pnl or 0, 2)
-            acct["fee_total"] = round(r.fee_total or 0, 2)
-        return {
-            "id": r.id,
-            "code": r.code,
-            "trade_date": r.trade_date,
-            "status": r.status,
-            "speed": r.speed,
-            "data_source": r.data_source or "qmt",
-            "created_at": r.created_at.strftime("%Y-%m-%d %H:%M:%S") if r.created_at else "",
-            "started_at": r.started_at.strftime("%Y-%m-%d %H:%M:%S") if r.started_at else None,
-            "finished_at": r.finished_at.strftime("%Y-%m-%d %H:%M:%S") if r.finished_at else None,
-            "initial_cash": r.initial_cash,
-            "base_shares": r.base_shares,
-            "initial_assets": round(r.initial_assets or 0, 2),
-            "final_assets": round(r.final_assets or 0, 2),
-            "realized_pnl": round(r.realized_pnl or 0, 2),
-            "fee_total": round(r.fee_total or 0, 2),
-            "last_price": r.last_price,
-            "last_time_key": r.last_time_key,
-            "cum_amount": round(cum_amount, 2),
-            "cum_volume": cum_volume,
-            "account": acct,
-        }
+        快照口径：当日累计量额 = <= last_time_key 的末条快照值
+        （volume/amount 在 tick 表为当日累计值，不可再逐点求和）。
+        """
+        if ctx:
+            return ctx.cum_amount, ctx.cum_volume
+        if not r.last_time_key:
+            return 0.0, 0
+        m = self._tick_model(r.data_source)
+        row = (db.session.query(m.amount, m.volume)
+               .filter(m.code == r.code,
+                       m.trade_date == r.trade_date,
+                       m.time_key <= r.last_time_key)
+               .order_by(m.time_key.desc()).first())
+        return (row[0] or 0, row[1] or 0) if row else (0.0, 0)
 
     @_ensure_ctx
     def get_grid(self, round_id: int) -> dict:
         """网格表数据：梯度行 + 状态（由成交记录推导：建梯度/消梯度），供前端「网格表」tab 渲染
 
-        初始化不再全量建梯子（原锚点展开逻辑暂停用，保留实现）：梯度仅随成交产生——
-        每笔成交先消（命中未消完梯度的对侧网格线，买/卖两个匹配函数，卖侧含偏移值/容差）、
-        消无可消或数量有多的再建（按成交价就近网格线新建，同方向同格号数量合并）。
-        每行附带两侧真实成交价（buy_fill_price / sell_fill_price，多次成交取加权均价；
-        未成交侧为 null），供前端与网格价（买点/卖点）对照。
-        锚点价仍用于页面展示：昨收（day_last_close）> 最新成交价 > 引擎首根快照 close。
-        网格参数取自 config game.grid。
+        初始化不再全量建梯子：梯度仅随成交产生——每笔成交先消（命中未消完
+        梯度的对侧网格线）、消无可消或数量有多的再建（按成交价就近网格线
+        新建，同方向同格号数量合并）。每行附带两侧真实成交价供前端对照。
+        锚点价仍用于页面展示：昨收 > 最新成交价 > 引擎首根快照 close。
         """
         r = GameRound.query.get(round_id)
         if not r:
@@ -504,35 +386,27 @@ class GameEngine:
 
         params = self._cfg()["grid"]
         ctx = self._rounds.get(round_id)
-        acct = None
-        if ctx and ctx.acct:
-            acct = ctx.acct
-        elif r.status in (ST_RUNNING, ST_PAUSED, ST_FINISHED):
-            acct_dict = get_cache().load_account(round_id)
-            acct = MockAccount.from_dict(acct_dict) if acct_dict else None
-
-        # 锚点价（昨收优先）
-        anchor = self.day_last_close(r.code, r.trade_date, r.data_source or "qmt")
-        if not _valid_price(anchor):
-            anchor = r.last_price or 0
-        if not _valid_price(anchor) and ctx and ctx.ticks:
-            anchor = float(ctx.ticks[ctx.index]["close"] or 0)
-        if not _valid_price(anchor) and acct and _valid_price(acct.last_price):
-            anchor = float(acct.last_price)
-        anchor = round(float(anchor), 3)
-
+        acct = self._grid_account(r, ctx)
+        anchor = self._grid_anchor(r, ctx, acct)
         volume = int(acct.volume) if acct else int(r.base_shares or 0)
-
-        # 行级间隔持久化：读取该轮次的间隔覆盖 {主格号idx: interval}
         interval_map = get_cache().load_config(f"grid_int:{round_id}") or {}
-
-        # 成交记录（梯度推导）
-        trades = self.list_trades(round_id)
-        # 初始化全量建梯度已停用（保留原实现，暂注释）：改为仅由成交记录推导梯度
-        # （建梯度 / 消梯度，先消后建），详见 grid_math.derive_gradient_rows
-        # rows = build_grid_rows(anchor, volume, params, interval_map)
-        # mark_grid_status(rows, trades, params)
-        rows = derive_gradient_rows(trades, params, interval_map)
+        rows = derive_gradient_rows(self.list_trades(round_id), params, interval_map)
+        # 行级格号覆盖（人工微调行位置）：在推导之后应用，只改显示格号与买卖点价，
+        # 成交价与间隔不动（见 grid_math.apply_idx_override）
+        rows = apply_idx_override(
+            rows, get_cache().load_config(f"grid_idx:{round_id}") or {}, params)
+        # 行 ↔ 未成交委托关联（一键下单记 grid_idx）：已挂单的行前端按钮置灰，
+        # 委托撤单/成交/拒单后脱离 pending，行自动恢复可下单。
+        # 匹配键 (grid_idx, 出场方向)：同格号可同时存在买卖两行，方向区分归属。
+        pending_map = {}
+        for o in GameOrder.query.filter_by(round_id=round_id,
+                                           status=O_PENDING).all():
+            if o.grid_idx is not None:
+                pending_map[(o.grid_idx, o.direction)] = o.order_id
+        for x in rows:
+            # 出场腿方向与行方向相反：买入方向行（已购）→ 卖出；卖出方向行（已售）→ 买入
+            out_dir = "sell" if x["direction"] == "buy" else "buy"
+            x["pending_order_id"] = pending_map.get((x["idx"], out_dir))
 
         return {
             "round_id": round_id,
@@ -540,25 +414,29 @@ class GameEngine:
             "last_price": r.last_price,
             "total_shares": volume,
             "params": params,
-            "rows": [
-                {
-                    "idx": x["idx"],
-                    "direction": x["direction"],
-                    "buy_idx": x["buy_idx"],
-                    "sell_idx": x["sell_idx"],
-                    "interval": x["interval"],
-                    "buy_price": x["buy_price"],
-                    "sell_price": x["sell_price"],
-                    "buy_fill_price": x.get("buy_fill_price"),
-                    "sell_fill_price": x.get("sell_fill_price"),
-                    "shares": x["shares"],
-                    "status": x["status"],
-                    "buy_hit": x["buy_hit"],
-                    "sell_hit": x["sell_hit"],
-                }
-                for x in rows
-            ],
+            "rows": [serializers.grid_row_to_dict(x) for x in rows],
         }
+
+    def _grid_account(self, r, ctx):
+        """网格推导用账户（内存 ctx 或 Redis 快照重建；仅取持仓量）"""
+        if ctx and ctx.acct:
+            return ctx.acct
+        if r.status in (ST_RUNNING, ST_PAUSED, ST_FINISHED):
+            acct_dict = get_cache().load_account(r.id)
+            if acct_dict:
+                return MockAccount.from_dict(acct_dict)
+        return None
+
+    def _grid_anchor(self, r, ctx, acct) -> float:
+        """网格锚点价（昨收优先，其次最新成交价/首根快照/账户最新价）"""
+        anchor = self.day_last_close(r.code, r.trade_date, r.data_source or "qmt")
+        if not _valid_price(anchor):
+            anchor = r.last_price or 0
+        if not _valid_price(anchor) and ctx and ctx.ticks:
+            anchor = float(ctx.ticks[ctx.index]["close"] or 0)
+        if not _valid_price(anchor) and acct and _valid_price(acct.last_price):
+            anchor = float(acct.last_price)
+        return round(float(anchor), 3)
 
     # ── 启动 / 暂停 / 变速 ──
 
@@ -575,10 +453,37 @@ class GameEngine:
             return None, "轮次不存在"
 
         ctx = RoundContext(r)
-        # 加载该日 tick（按轮次数据源: qmt → tick_data，sim → tick_data_sim）。
-        # 过滤盘后数据（> 15:00:00，如固定价交易尾巴）：游戏只播盘前集合竞价 /
-        # 盘中连续 / 收盘集合竞价（末根为 15:00:00 收盘价，is_last 据此结算），
-        # 盘后不计入游戏、不到盘后结束才结算（避免虚拟盘后被当作持续推进）。
+        ticks, msg = self._load_ticks(r)
+        if not ticks:
+            return None, msg
+        ctx.ticks = ticks
+        self._restore_progress(ctx)
+        self._restore_cum(ctx)
+        self._restore_account(ctx)
+        self._restore_pending(ctx)
+        return ctx, ""
+
+    @staticmethod
+    def _restore_cum(ctx: RoundContext):
+        """当日累计量额恢复：对已推进区间的差分序列求和（与前端 REST 恢复
+        rebuildMinuteSeries 的差分累加、以及末条快照累计值三者同口径）
+
+        上下文重载（后端重启 / 暂停后继续 / 从非零进度开局）时若从 0 起算，
+        实时推送的累计量额会小于当日真实值——表现为进场后数字突然回落。
+        """
+        upto = ctx.ticks[:ctx.index]
+        ctx.cum_amount = sum(t.get("amount") or 0 for t in upto)
+        ctx.cum_volume = sum(t.get("volume") or 0 for t in upto)
+
+    def _load_ticks(self, r) -> (list, str):
+        """加载该日 tick 并转为播放序列（差分口径），失败返回 ([], 原因)
+
+        过滤盘后数据（> 15:00:00，如固定价交易尾巴）：游戏只播盘前集合
+        竞价 / 盘中连续 / 收盘集合竞价（末根为 15:00:00 收盘价）。
+        DB 存当日累计量额（单调不减），逐点预转为与上一快照的差分（首条=
+        原值），供 _process_tick 差分累加回当日累计（cum）；high/low 为
+        快照滚动极值、close 为最新价，原样保留。
+        """
         m = self._tick_model(r.data_source)
         day_end = f"{r.trade_date} {_SESSION_DAY_END}"
         ticks = (
@@ -589,65 +494,67 @@ class GameEngine:
             .all()
         )
         if not ticks:
-            return None, f"交易日 {r.trade_date} 无 {r.code} 行情数据"
-        # 快照 → 引擎播放序列：DB 存当日累计量额（单调不减），逐点预转为与上一
-        # 快照的差分（首条=原值），供 _process_tick 差分累加回当日累计（cum）；
-        # high/low 为快照滚动极值、close 为最新价，原样保留；open（今开）
-        # 当日常量由 normalize_day_constants 填充
-        ctx.ticks = []
+            return [], f"交易日 {r.trade_date} 无 {r.code} 行情数据"
+        # 当日常量（昨收 + 今开）统一写入每根 tick，保证推送给前端的昨收/
+        # 今开恒为有效数值（与 REST ticks 恢复接口同口径）
+        return self.normalize_day_constants(
+            self._diff_ticks(ticks), r.code, r.trade_date, r.data_source), ""
+
+    @staticmethod
+    def _diff_ticks(ticks) -> list:
+        """快照 ORM 列表 → 差分播放序列（volume/amount 转为与上一快照之差）"""
+        result = []
         prev_v = prev_a = 0
         for t in ticks:
             v = t.volume or 0
             a = t.amount or 0
-            ctx.ticks.append({
+            result.append({
                 "time_key": t.time_key,
                 "high": t.high, "low": t.low, "close": t.close,
                 "volume": max(0, v - prev_v),
                 "amount": max(0, a - prev_a),
             })
             prev_v, prev_a = v, a
+        return result
 
-        # 当日常量填充（昨收 + 今开）：来自 game_days 天维度真实行情（快照入库
-        # 时维护，缺失时昨收从 stock_kline 回补、今开以首条快照 close 兑底），
-        # 统一写入每根 tick，保证推送给前端的昨收/今开恒为有效数值（与 REST
-        # ticks 恢复接口同口径，详见 normalize_day_constants）
-        self.normalize_day_constants(ctx.ticks, r.code, r.trade_date,
-                                     r.data_source)
-
-        # 进度恢复（后端重启场景）：优先 Redis 快照；Redis 缺失/不可用时
-        # 以 DB last_time_key（每根 tick 落库）反推已推进位置，保证走势
-        # 进度持久化——行情数据本身永久存于 tick 表，进度不丢即可完整恢复
-        cache = get_cache()
-        saved_index = cache.load_progress(round_id)
+    def _restore_progress(self, ctx: RoundContext):
+        """进度恢复：优先 Redis 快照；缺失/不可用时以 DB last_time_key
+        反推已推进位置——行情永久存于 tick 表，进度不丢即可完整恢复"""
+        r = ctx.round
+        saved_index = get_cache().load_progress(r.id)
         if not (0 < saved_index < len(ctx.ticks)):
             keys = [t["time_key"] for t in ctx.ticks]
-            saved_index = (next((i for i, k in enumerate(keys) if k > r.last_time_key),
-                                len(keys)) if r.last_time_key else 0)
+            saved_index = (next((i for i, k in enumerate(keys)
+                                 if k > r.last_time_key), len(keys))
+                           if r.last_time_key else 0)
         ctx.index = saved_index if 0 < saved_index < len(ctx.ticks) else 0
         ctx.fraction = 0.0
 
-        # 账户：优先 Redis 快照，其次 DB 账户 JSON（交易事件随行落库），
-        # 均缺失才按初始参数初始化（与委托/成交记录保持一致的兜底链）
-        acct_dict = cache.load_account(round_id)
+    def _restore_account(self, ctx: RoundContext):
+        """账户恢复：Redis 快照 > DB 账户 JSON（交易事件随行落库），均缺失才
+        按初始参数初始化（与委托/成交记录保持一致的兜底链）"""
+        r = ctx.round
+        acct_dict = get_cache().load_account(r.id)
         if not acct_dict:
             acct_dict = self._account_from_json(r.account_json)
         if acct_dict:
             ctx.acct = MockAccount.from_dict(acct_dict)
-        else:
-            first = ctx.ticks[0]
-            ctx.acct = MockAccount(
-                base_shares=r.base_shares or None,
-                initial_cash=r.initial_cash or None,
-                fee_rate=None,
-                open_price=first["close"],
-            )
-            r.initial_assets = ctx.acct.total_assets(first["close"])
+            return
+        first = ctx.ticks[0]
+        ctx.acct = MockAccount(
+            base_shares=r.base_shares or None,
+            initial_cash=r.initial_cash or None,
+            fee_rate=None,
+            open_price=first["close"],
+        )
+        r.initial_assets = ctx.acct.total_assets(first["close"])
 
-        # 恢复 pending 订单（重启场景）
+    @staticmethod
+    def _restore_pending(ctx: RoundContext):
+        """恢复 pending 订单（重启场景）"""
         pending_orders = GameOrder.query.filter_by(
-            round_id=round_id, status=O_PENDING).all()
+            round_id=ctx.round.id, status=O_PENDING).all()
         ctx.pending = {o.order_id: o for o in pending_orders}
-        return ctx, ""
 
     @staticmethod
     def _account_from_json(raw):
@@ -665,8 +572,7 @@ class GameEngine:
         """账户快照随调用方事务落库（不自行 commit，仅交易事件后低频调用）
 
         Redis 之外的 DB 兜底：Redis 丢失/重启后仍可恢复与委托/成交
-        记录一致的账户状态。round_row 须为当前 session 已 attach 的实例
-        （_try_fill 中为 detached 的 ctx.round，需先 add 再 commit）。
+        记录一致的账户状态。round_row 须为当前 session 已 attach 的实例。
         """
         if ctx and ctx.acct and round_row is not None:
             round_row.account_json = json.dumps(ctx.acct.to_dict())
@@ -680,27 +586,33 @@ class GameEngine:
         if not r.last_time_key:
             return 0.0
         m = self._tick_model(r.data_source or "qmt")
-        total = (db.session.query(db.func.count())
-                 .filter(m.code == r.code, m.trade_date == r.trade_date).scalar() or 0)
+        total = self._count_ticks(m, r)
         if not total:
             return 0.0
-        done = (db.session.query(db.func.count())
-                .filter(m.code == r.code, m.trade_date == r.trade_date,
-                        m.time_key <= r.last_time_key).scalar() or 0)
+        done = self._count_ticks(m, r, upto=r.last_time_key)
         return round(done / total * 100, 1)
+
+    @staticmethod
+    def _count_ticks(m, r, upto: str = None) -> int:
+        """统计轮次当日 tick 总数（upto 给定时统计 <= upto 的条数）"""
+        q = (db.session.query(db.func.count())
+             .filter(m.code == r.code, m.trade_date == r.trade_date))
+        if upto:
+            q = q.filter(m.time_key <= upto)
+        return q.scalar() or 0
 
     def normalize_day_constants(self, ticks: list, code: str, trade_date: str,
                                 data_source: str) -> list:
         """当日常量填充（调用方须处于 app context，勿套 _ensure_ctx）
-    
-        昨收（上一交易日收盘）与今开（当日开盘）为日维度常量，由 game_days 表在
-        行情入库时维护（与 tick 表对齐；tick 表已不再存 last_close/open）。此处
-        读取当日记录值并统一写入每根 tick dict，保证引擎 _load_context 与 REST
-        ticks 恢复接口同口径；当日昨收无有效值时以前一完整交易日的 close 兑底
-        （绝不用当日价格充当基准），今开缺失时以首条快照 close 兑底。
+
+        昨收（上一交易日收盘）与今开（当日开盘）为日维度常量，由 game_days
+        表在行情入库时维护。此处读取当日记录值并统一写入每根 tick dict，
+        保证引擎 _load_context 与 REST ticks 恢复接口同口径；当日昨收无
+        有效值时以前一完整交易日的 close 兑底（绝不用当日价格充当基准），
+        今开缺失时以首条快照 close 兑底。
         """
         base_close = self.day_last_close(code, trade_date, data_source)
-        day = self._day_row(code, trade_date, data_source)
+        day = day_meta.day_row(code, trade_date, data_source)
         day_open = 0.0
         if day is not None and _valid_price(day.open):
             day_open = float(day.open)
@@ -710,150 +622,6 @@ class GameEngine:
             t["last_close"] = base_close
             t["open"] = day_open
         return ticks
-
-    def day_last_close(self, code: str, trade_date: str, data_source: str) -> float:
-        """当日昨收：优先 game_days 记录 last_close（调用方须处于 app context）
-
-        无效（缺失/0/NaN）时以更早完整交易日的 close 兜底（同数据源优先，
-        其次另一数据源），语义即上一交易日收盘价；无更早完整日时返回 0
-        （前端将展示 "--"）。
-        """
-        day = self._day_row(code, trade_date, data_source)
-        if day and _valid_price(day.last_close):
-            return float(day.last_close)
-        other = "sim" if data_source == "qmt" else "qmt"
-        for src in (data_source, other):
-            prev = (GameDay.query.filter(
-                    GameDay.code == code,
-                    GameDay.data_source == src,
-                    GameDay.is_complete.is_(True),
-                    GameDay.trade_date < trade_date)
-                    .order_by(GameDay.trade_date.desc()).first())
-            if prev and _valid_price(prev.close):
-                return float(prev.close)
-        return 0.0
-
-    def _day_row(self, code: str, trade_date: str, data_source: str):
-        """查询某日 game_days 记录（调用方须处于 app context）
-
-        先按指定数据源精确查；查不到时回退同日任意数据源（避免记录缺失时
-        昨收完全不可用）。
-        """
-        day = (GameDay.query.filter_by(code=code, trade_date=trade_date,
-                                       data_source=data_source).first())
-        if day is None:
-            day = (GameDay.query.filter_by(code=code, trade_date=trade_date)
-                   .first())
-        return day
-
-    def refresh_day(self, code: str, trade_date: str, data_source: str,
-                    last_close_hint: float = 0.0, open_hint: float = 0.0) -> bool:
-        """快照入库后同步维护 game_days 天维度真实行情（与 tick 表对齐）
-
-        调用方须处于 app context（行情上传/批量写入后调用，勿套 _ensure_ctx）。
-        昨收写入前确定链：hint（上传/生成方携带）> 库内有效旧值 > stock_kline
-        天维度回补（_kline_last_close）；三者均无效时拒绝写入——last_close
-        无效（空/0）的日行情视为异常数据，不入库，返回 False（调用方应提示
-        错误；已入库的快照行情本身不受影响）。
-        今开（open）为当日常量随 open_hint 维护，缺失时保留库内旧值（全新日以
-        首条快照 close 兑底）。
-        单表 upsert：按 tick 表现存快照聚合当日终值（条数/首末时间/极值/末条
-        累计量额均对账自 tick），昨收取确定链结果；游戏选择与开局数据读取
-        不再扫描 tick 表（tick 表仅游戏运行时使用）。
-        """
-        if data_source not in ("qmt", "sim"):
-            return False
-        table = "tick_data" if data_source == "qmt" else "tick_data_sim"
-        hint = _valid_price(last_close_hint) and float(last_close_hint) or 0.0
-        oh = _valid_price(open_hint) and float(open_hint) or 0.0
-        # 昨收确定链：hint > 库内有效旧值 > stock_kline 天维度（仅生成侧）
-        lc = hint
-        if not _valid_price(lc):
-            old = self._day_row(code, trade_date, data_source)
-            if old is not None and _valid_price(old.last_close):
-                lc = float(old.last_close)
-            else:
-                lc = self._kline_last_close(code, trade_date)
-        if not _valid_price(lc):
-            logger.warning(
-                "刷新 game_days 拒绝: %s %s %s 昨收缺失（last_close hint/库内旧值/"
-                "stock_kline 均无效），异常日行情不入库，请携带有效 last_close 后重试",
-                code, trade_date, data_source)
-            return False
-        params = {"code": code, "trade_date": trade_date,
-                  "data_source": data_source,
-                  "date_end": f"{trade_date} 15:00:00",
-                  "last_close": lc, "open_hint": oh}
-        try:
-            db.session.execute(
-                text(_GAME_DAY_UPSERT_SQL.format(table=table)), params)
-            db.session.commit()
-        except Exception as e:
-            db.session.rollback()
-            logger.warning("刷新 game_days 失败 code=%s date=%s src=%s: %s",
-                           code, trade_date, data_source, e)
-            return False
-        return True
-
-    def refresh_all_days(self, code: str = None, trade_date: str = None) -> int:
-        """全量重建 game_days（迁移/修复用，调用方须处于 app context）
-
-        遍历 tick_data / tick_data_sim 现存日期逐日刷新（单表 upsert），返回
-        处理日期数。
-        """
-        pairs = set()
-        for model, src in ((TickData, "qmt"), (TickDataSim, "sim")):
-            for c, d in (db.session.query(model.code, model.trade_date)
-                         .distinct().all()):
-                pairs.add((c, d, src))
-        n = 0
-        for c, d, src in sorted(pairs):
-            if code and c != code:
-                continue
-            if trade_date and d != trade_date:
-                continue
-            if self.refresh_day(c, d, src):
-                n += 1
-        logger.info("game_days 重建完成: %d 日", n)
-        return n
-
-    def _kline_last_close(self, code: str, trade_date: str) -> float:
-        """从 AutoTrade 库 stock_kline 天维度读取昨收（仅生成时回补）
-
-        优先级：当日 1d 行 last_close > 当日 1m 首根 last_close（口径同
-        load_minutes_from_autotrade）；查不到/连接失败返回 0，不影响主流程。
-        """
-        dsn = Config.get_instance().get("data_source.autotrade_dsn", "")
-        if not dsn:
-            return 0.0
-        try:
-            import psycopg2
-            params = _parse_dsn(dsn)
-            conn = psycopg2.connect(**params)
-            try:
-                cur = conn.cursor()
-                cur.execute(
-                    "SELECT last_close FROM stock_kline "
-                    "WHERE code=%s AND period='1d' AND last_close > 0 "
-                    "AND time_key >= %s::date AND time_key < (%s::date + interval '1 day')",
-                    (code, trade_date, trade_date))
-                row = cur.fetchone()
-                if not row or not _valid_price(row[0]):
-                    cur.execute(
-                        "SELECT last_close FROM stock_kline "
-                        "WHERE code=%s AND period='1m' AND last_close > 0 "
-                        "AND time_key >= %s::date AND time_key < (%s::date + interval '1 day') "
-                        "ORDER BY time_key LIMIT 1",
-                        (code, trade_date, trade_date))
-                    row = cur.fetchone()
-                cur.close()
-                return float(row[0]) if row and _valid_price(row[0]) else 0.0
-            finally:
-                conn.close()
-        except Exception as e:
-            logger.warning("stock_kline 昨收回补失败 code=%s date=%s: %s",
-                           code, trade_date, e)
-            return 0.0
 
     @_ensure_ctx
     def start_round(self, round_id: int) -> (bool, str):
@@ -866,29 +634,46 @@ class GameEngine:
                 return False, "轮次已在运行中"
             if r.status == ST_FINISHED:
                 return False, "轮次已结束"
+            return self._activate_round(round_id, r, "启动")
 
-            ctx = self._rounds.get(round_id)
+    @_ensure_ctx
+    def resume_round(self, round_id: int) -> (bool, str):
+        """继续游戏（暂停 → 运行；后端重启后内存上下文从 DB/Redis 恢复）"""
+        with self._lock:
+            r = GameRound.query.get(round_id)
+            if not r or r.status != ST_PAUSED:
+                return False, "仅暂停的轮次可继续"
+            return self._activate_round(round_id, r, "恢复运行")
+
+    def _activate_round(self, round_id: int, r, action: str) -> (bool, str):
+        """置轮次为运行态（start/resume 共用：加载 ctx → 尾端即结算 → 置 running）"""
+        ctx = self._rounds.get(round_id)
+        if ctx is None:
+            ctx, msg = self._load_context(round_id)
             if ctx is None:
-                ctx, msg = self._load_context(round_id)
-                if ctx is None:
-                    return False, msg
-                self._rounds[round_id] = ctx
+                return False, msg
+            self._rounds[round_id] = ctx
 
-            # 若已到尾端则直接结算（已 finished，不再置 running）
-            if ctx.index >= len(ctx.ticks):
-                self._settle(round_id, reason="已达尾端", auto=True)
-                return True, "轮次已到尾端，自动结算完成"
+        # 若已到尾端则直接结算（已 finished，不再置 running）
+        if ctx.index >= len(ctx.ticks):
+            self._settle(round_id, reason="已达尾端", auto=True)
+            return True, "轮次已到尾端，自动结算完成"
 
-            r.status = ST_RUNNING
-            r.started_at = r.started_at or now_cn()
-            self._attach_account_json(r, ctx)   # 初始/恢复后的账户随行落库
-            db.session.commit()
-            self._save_snapshot(ctx)
-            self.emit("game:status", {"round_id": round_id, "status": ST_RUNNING},
-                      room=f"round_{round_id}")
-            logger.info("轮次 %s 启动 date=%s ticks=%d index=%d",
-                        round_id, r.trade_date, len(ctx.ticks), ctx.index)
-            return True, ""
+        # r 与 ctx.round 跨请求时是不同 ORM 实例（各自 session 的 identity
+        # map）：r 写库，ctx.round 同步内存态（时钟 tick_all 据此推进）
+        # r 与 ctx.round 跨请求时是不同 ORM 实例（各自 session 的 identity
+        # map）：r 写库，ctx.round 同步内存态（时钟 tick_all 据此推进）
+        ctx.round.status = ST_RUNNING
+        r.status = ST_RUNNING
+        r.started_at = r.started_at or now_cn()
+        self._attach_account_json(r, ctx)   # 初始/恢复后的账户随行落库
+        db.session.commit()
+        self._save_snapshot(ctx)
+        self.emit("game:status", {"round_id": round_id, "status": ST_RUNNING},
+                  room=f"round_{round_id}")
+        logger.info("轮次 %s %s date=%s ticks=%d index=%d",
+                    round_id, action, r.trade_date, len(ctx.ticks), ctx.index)
+        return True, ""
 
     @_ensure_ctx
     def pause_round(self, round_id: int) -> (bool, str):
@@ -904,33 +689,6 @@ class GameEngine:
             db.session.commit()
             self.emit("game:status", {"round_id": round_id, "status": ST_PAUSED},
                       room=f"round_{round_id}")
-            return True, ""
-
-    @_ensure_ctx
-    def resume_round(self, round_id: int) -> (bool, str):
-        with self._lock:
-            r = GameRound.query.get(round_id)
-            if not r or r.status != ST_PAUSED:
-                return False, "仅暂停的轮次可继续"
-            ctx = self._rounds.get(round_id)
-            if ctx is None:
-                # 后端重启后内存上下文已丢失，从 DB/Redis 恢复
-                ctx, msg = self._load_context(round_id)
-                if ctx is None:
-                    return False, msg
-                self._rounds[round_id] = ctx
-            # 若已到尾端则直接结算（已 finished，不再置 running）
-            if ctx.index >= len(ctx.ticks):
-                self._settle(round_id, reason="已达尾端", auto=True)
-                return True, "轮次已到尾端，自动结算完成"
-            ctx.round.status = ST_RUNNING  # 同步内存态（时钟据此推进）
-            r.status = ST_RUNNING
-            db.session.commit()
-            self._save_snapshot(ctx)
-            self.emit("game:status", {"round_id": round_id, "status": ST_RUNNING},
-                      room=f"round_{round_id}")
-            logger.info("轮次 %s 恢复运行 date=%s ticks=%d index=%d",
-                        round_id, r.trade_date, len(ctx.ticks), ctx.index)
             return True, ""
 
     @_ensure_ctx
@@ -954,29 +712,21 @@ class GameEngine:
 
     @_ensure_ctx
     def place_order(self, round_id: int, direction: str, order_type: str,
-                    price: float, shares: int) -> (bool, dict, str):
-        """下单（下单即冻结；市价单按最新价预估冻结）
+                    price: float, shares: int,
+                    grid_idx: int = None) -> (bool, dict, str):
+        """下单（下单即冻结；市价单按最新价预估冻结），返回 (ok, order_dict, message)
 
-        返回 (ok, order_dict, message)
+        grid_idx: 网格一键下单时携带的网格行主格号（委托与网格行关联，
+        供 get_grid 推导行级 pending_order_id / 按钮置灰）；普通下单为 None。
         """
-        if direction not in ("buy", "sell"):
-            return False, None, "direction 仅支持 buy/sell"
-        if order_type not in ("limit", "market"):
-            return False, None, "order_type 仅支持 limit/market"
-        if shares <= 0 or shares % 100 != 0:
-            return False, None, "数量必须为 100 股（0.01 万股）的整数倍"
-        if order_type == "limit" and (not price or price <= 0):
-            return False, None, "限价单价格必须大于 0"
+        ok, msg = self._validate_order(direction, order_type, price, shares)
+        if not ok:
+            return False, None, msg
 
         with self._lock:
-            r = GameRound.query.get(round_id)
-            if not r:
-                return False, None, "轮次不存在"
-            if r.status not in (ST_RUNNING, ST_PAUSED):
-                return False, None, "轮次未在运行中（需先开始游戏）"
-            ctx = self._rounds.get(round_id)
-            if ctx is None or ctx.acct is None:
-                return False, None, "轮次上下文未初始化，请重新开始"
+            r, ctx, err = self._orderable_context(round_id)
+            if err:
+                return False, None, err
 
             acct = ctx.acct
             # 市价单用最新价预估
@@ -986,42 +736,112 @@ class GameEngine:
                 price = acct.last_price
 
             # 下单即冻结
-            if direction == "buy":
-                if not acct.freeze_buy(price, shares):
-                    return False, None, "可用资金不足（含手续费）"
-            else:
-                if not acct.freeze_sell(shares):
-                    return False, None, "可卖持仓不足"
+            ok, msg = self._freeze_for(acct, direction, price, shares)
+            if not ok:
+                return False, None, msg
 
-            order_id = "R%d_%s" % (round_id, uuid.uuid4().hex[:12].upper())
-            # 委托时间记游戏时间：最后已播出快照的 time_key（尚未开播时以首根
-            # 快照时间兑底），与行情时间轴一致而非真实时间
-            game_now = ctx.round.last_time_key or ctx.ticks[0]["time_key"]
-            order = GameOrder(
-                order_id=order_id,
-                round_id=round_id,
-                code=r.code,
-                direction=direction,
-                order_type=order_type,
-                price=price,
-                shares=shares,
-                status=O_PENDING,
-                created_at=_parse_game_time(game_now),
-                frozen_amount=acct.frozen_amount(price, shares) if direction == "buy" else 0,
-            )
+            order = self._new_order(ctx, r, direction, order_type, price, shares,
+                                    grid_idx=grid_idx)
             db.session.add(order)
             self._attach_account_json(r, ctx)   # 冻结后的账户落库（DB 兜底）
             db.session.commit()
 
-            ctx.pending[order_id] = order
+            ctx.pending[order.order_id] = order
             self._save_snapshot(ctx)
-            self.emit("game:order_update", self._order_to_dict(order),
+            self.emit("game:order_update", serializers.order_to_dict(order),
                       room=f"round_{round_id}")
-            return True, self._order_to_dict(order), ""
+            return True, serializers.order_to_dict(order), ""
+
+    @staticmethod
+    def _validate_order(direction: str, order_type: str,
+                        price: float, shares: int) -> (bool, str):
+        """下单参数校验"""
+        if direction not in ("buy", "sell"):
+            return False, "direction 仅支持 buy/sell"
+        if order_type not in ("limit", "market"):
+            return False, "order_type 仅支持 limit/market"
+        if shares <= 0 or shares % 100 != 0:
+            return False, "数量必须为 100 股（0.01 万股）的整数倍"
+        if order_type == "limit" and (not price or price <= 0):
+            return False, "限价单价格必须大于 0"
+        return True, ""
+
+    def _orderable_context(self, round_id: int):
+        """取可下单的轮次与上下文（须运行/暂停且账户已初始化）"""
+        r = GameRound.query.get(round_id)
+        if not r:
+            return None, None, "轮次不存在"
+        if r.status not in (ST_RUNNING, ST_PAUSED):
+            return None, None, "轮次未在运行中（需先开始游戏）"
+        ctx = self._rounds.get(round_id)
+        if ctx is None or ctx.acct is None:
+            return None, None, "轮次上下文未初始化，请重新开始"
+        return r, ctx, None
+
+    @staticmethod
+    def _freeze_for(acct, direction: str, price: float, shares: int) -> (bool, str):
+        """下单冻结资金/持仓（买冻结含手续费金额，卖冻结可卖持仓）"""
+        if direction == "buy":
+            if not acct.freeze_buy(price, shares):
+                return False, "可用资金不足（含手续费）"
+        else:
+            if not acct.freeze_sell(shares):
+                return False, "可卖持仓不足"
+        return True, ""
+
+    @staticmethod
+    def _new_order(ctx: RoundContext, r, direction: str, order_type: str,
+                   price: float, shares: int, grid_idx: int = None) -> GameOrder:
+        """构造委托单；委托时间记游戏时间（最后已播出快照的 time_key，
+        尚未开播时以首根快照时间兑底），与行情时间轴一致而非真实时间"""
+        order_id = "R%d_%s" % (r.id, uuid.uuid4().hex[:12].upper())
+        game_now = ctx.round.last_time_key or ctx.ticks[0]["time_key"]
+        # 买单冻结额随单落库（卖单为 0）
+        frozen = ctx.acct.frozen_amount(price, shares) if direction == "buy" else 0
+        return GameOrder(
+            order_id=order_id,
+            round_id=r.id,
+            code=r.code,
+            direction=direction,
+            order_type=order_type,
+            price=price,
+            shares=shares,
+            grid_idx=grid_idx,
+            status=O_PENDING,
+            created_at=_parse_game_time(game_now),
+            frozen_amount=frozen,
+        )
+
+    @_ensure_ctx
+    def place_grid_order(self, round_id: int, idx: int) -> (bool, dict, str):
+        """网格行一键下单：按行出场腿自动构造限价委托（委托记 grid_idx 关联行）
+
+        仅出场腿待成交的行（已购/已售）可下：买入方向行（已购）挂卖点价卖出、
+        卖出方向行（已售）挂买点价买回，方向/价格/数量全部由网格行推导。
+        该行已有未成交委托时拒绝（前端按钮置灰）；撤单（未成交）后恢复可下。
+        """
+        grid = self.get_grid(round_id)
+        if not grid:
+            return False, None, "轮次不存在"
+        row = next((x for x in grid["rows"] if x["idx"] == int(idx)), None)
+        if row is None:
+            return False, None, f"网格行 {idx} 不存在"
+        if row["status"] not in ("buy", "sell"):
+            return False, None, "仅已购/已售（出场腿待成交）的行可一键下单"
+        if row.get("pending_order_id"):
+            return False, None, "该行已有未成交委托，请先撤单"
+        # 出场腿方向与行方向相反：买入方向行（已购）→ 卖出；卖出方向行（已售）→ 买入
+        direction = "sell" if row["direction"] == "buy" else "buy"
+        price = row["sell_price"] if direction == "sell" else row["buy_price"]
+        shares = int(row["shares"] or 0) // 100 * 100
+        if shares <= 0:
+            return False, None, "该行分摊持仓不足 100 股，无法委托"
+        return self.place_order(round_id, direction=direction, order_type="limit",
+                                price=price, shares=shares, grid_idx=int(idx))
 
     @_ensure_ctx
     def cancel_order(self, round_id: int, order_id: str) -> (bool, str):
-        """撤委托单（运行中随时可撤，仅 pending 状态）"""
+        """撤委托单（运行中随时可撤，仅 pending 状态；收盘集合竞价只挂不撤）"""
         with self._lock:
             r = GameRound.query.get(round_id)
             if not r:
@@ -1029,22 +849,20 @@ class GameEngine:
             if r.status not in (ST_RUNNING, ST_PAUSED):
                 return False, "仅运行中的轮次可撤单"
             ctx = self._rounds.get(round_id)
-            order = GameOrder.query.filter_by(round_id=round_id, order_id=order_id).first()
+            order = GameOrder.query.filter_by(round_id=round_id,
+                                              order_id=order_id).first()
             if not order:
                 return False, "委托不存在"
             if order.status != O_PENDING:
                 return False, f"仅 pending 状态可撤（当前: {order.status}）"
-            # 收盘集合竞价时段（14:57-15:00）只挂不撤（与真实收盘集合竞价规则一致）：
-            # 防止盘中挂单在收盘竞价被撤走、影响收盘集合竞价撮合成交
+            # 收盘集合竞价时段（14:57-15:00）只挂不撤（与真实收盘集合竞价
+            # 规则一致）：防止盘中挂单在收盘竞价被撤走、影响收盘竞价撮合
             if r.last_time_key and _session_of(r.last_time_key) == "closing":
                 return False, "收盘集合竞价时段（14:57-15:00）不可撤单"
 
             # 解冻
             if ctx and ctx.acct:
-                if order.direction == "buy":
-                    ctx.acct.unfreeze_buy(order.price, order.shares)
-                else:
-                    ctx.acct.unfreeze_sell(order.shares)
+                self._unfreeze_order(ctx.acct, order)
 
             order.status = O_CANCELLED
             self._attach_account_json(r, ctx)   # 解冻后的账户落库（DB 兜底）
@@ -1052,30 +870,29 @@ class GameEngine:
             if ctx:
                 ctx.pending.pop(order_id, None)
                 self._save_snapshot(ctx)
-            self.emit("game:order_update", self._order_to_dict(order),
+            self.emit("game:order_update", serializers.order_to_dict(order),
                       room=f"round_{round_id}")
             return True, ""
+
+    @staticmethod
+    def _unfreeze_order(acct, order):
+        """按委托方向解冻（撤单/结算作废共用）"""
+        if order.direction == "buy":
+            acct.unfreeze_buy(order.price, order.shares)
+        else:
+            acct.unfreeze_sell(order.shares)
 
     @_ensure_ctx
     def list_orders(self, round_id: int) -> list:
         rows = (GameOrder.query.filter_by(round_id=round_id)
                 .order_by(GameOrder.created_at.desc()).all())
-        return [self._order_to_dict(o) for o in rows]
+        return [serializers.order_to_dict(o) for o in rows]
 
     @_ensure_ctx
     def list_trades(self, round_id: int) -> list:
         rows = (GameTrade.query.filter_by(round_id=round_id)
                 .order_by(GameTrade.id.desc()).all())
-        return [{
-            "id": t.id,
-            "order_id": t.order_id,
-            "code": t.code,
-            "direction": t.direction,
-            "price": t.price,
-            "shares": t.shares,
-            "fee": t.fee,
-            "trade_time": t.trade_time,
-        } for t in rows]
+        return [serializers.trade_to_dict(t) for t in rows]
 
     # ── 时钟推进 ──
 
@@ -1092,10 +909,9 @@ class GameEngine:
 
     @_ensure_ctx
     def _advance(self, ctx: RoundContext):
-        """按速度推进轮次时钟"""
+        """按速度推进轮次时钟：每 0.1s 周期推进 speed×0.1 根 tick"""
         speed = ctx.round.speed or 1
         with ctx.lock:
-            # 每 0.1s 周期推进 speed×0.1 根 tick（_TICK_SEC=1.0，x60 每周期 6 根）
             ctx.fraction += speed * _CLOCK_INTERVAL / _TICK_SEC
             steps = int(ctx.fraction)
             if steps <= 0:
@@ -1106,193 +922,180 @@ class GameEngine:
                     break
                 self._process_tick(ctx, ctx.ticks[ctx.index])
                 ctx.index += 1
-            # 周期末统一存一次快照（最新进度/账户/行情）；循环内每 10 tick 的存储为
-            # 冗余（周期末必存最新态），高速档下会翻倍 Redis 写入，故移除
+            # 周期末统一存一次快照（最新进度/账户/行情）
             self._save_snapshot(ctx)
 
     @_ensure_ctx
     def _process_tick(self, ctx: RoundContext, tick: dict):
-        """处理一个快照点：更新行情 + 撮合"""
+        """处理一个快照点：更新行情 → 撮合 → 持久化 → 尾端结算"""
         r = ctx.round
-        acct = ctx.acct
-        acct.last_price = tick["close"]
-        r.last_price = tick["close"]
-        r.last_time_key = tick["time_key"]
+        self._apply_tick_state(ctx, tick)
+        self.emit("game:quote",
+                  serializers.quote_payload(r, tick, ctx.cum_amount,
+                                            ctx.cum_volume,
+                                            self._tick_progress(ctx)),
+                  room=f"round_{r.id}")
 
-        # 累计成交额/量（前端均价线用）
-        if not hasattr(ctx, "cum_amount"):
-            ctx.cum_amount = 0.0
-            ctx.cum_volume = 0.0
+        filled_any = self._match_pending(ctx, tick)
+
+        self._persist_tick(ctx, filled_any)
+        if ctx.index >= len(ctx.ticks) - 1:
+            self._settle(ctx.round.id, reason="收盘", auto=True)
+
+    def _apply_tick_state(self, ctx: RoundContext, tick: dict):
+        """推进最新价与当日累计量额（前端均价线用）"""
+        ctx.acct.last_price = tick["close"]
+        ctx.round.last_price = tick["close"]
+        ctx.round.last_time_key = tick["time_key"]
         ctx.cum_amount += tick.get("amount") or 0
         ctx.cum_volume += tick.get("volume") or 0
 
-        # 推送最新行情（分时图数据源）
-        self.emit("game:quote", {
-            "round_id": r.id,
-            "code": r.code,
-            "time_key": tick["time_key"],
-            "open": tick["open"],
-            "high": tick["high"],
-            "low": tick["low"],
-            "close": tick["close"],
-            "volume": tick.get("volume") or 0,
-            "amount": tick.get("amount") or 0,
-            "last_close": tick.get("last_close") or 0,
-            "cum_amount": round(ctx.cum_amount, 2),
-            "cum_volume": ctx.cum_volume,
-            "progress": round(ctx.index / len(ctx.ticks) * 100, 1) if ctx.ticks else 0,
-        }, room=f"round_{r.id}")
+    @staticmethod
+    def _tick_progress(ctx: RoundContext) -> float:
+        """当前 tick 推进进度（%）"""
+        return round(ctx.index / len(ctx.ticks) * 100, 1) if ctx.ticks else 0
 
-        # 撮合所有 pending 订单（按委托时间排序）。按交易时段分流：
-        #   - 盘中连续竞价（intraday）：每根 tick 以最新价触及即成交（默认口径）
-        #   - 开盘/收盘集合竞价点（auction）：以竞价价（=该 tick 最新价）集中撮合
-        #   - 竞价等待期（盘前 09:25 前、收盘 14:57-15:00 未到 15:00）：只挂不撮，
-        #     直接跳过（未来到竞价点再按竞价价集中处理）。
+    def _match_pending(self, ctx: RoundContext, tick: dict) -> bool:
+        """撮合所有 pending 订单（按交易时段分流），返回是否有订单被处理
+
+        - 盘中连续竞价（intraday）：每根 tick 以最新价触及即成交（默认口径）
+        - 开盘/收盘集合竞价点（auction）：以竞价价（=该 tick 最新价）集中撮合
+        - 竞价等待期（盘前 09:25 前、收盘 14:57-15:00 未到 15:00）：只挂不撮
+        """
         session = _session_of(tick["time_key"])
-        is_auction = session != "intraday" and _is_auction_point(tick["time_key"])
-        filled_any = False
-        if is_auction:
-            auction_price = tick["close"]
-            for order_id, order in list(ctx.pending.items()):
-                if order.status != O_PENDING:
-                    ctx.pending.pop(order_id, None)
-                    continue
-                if self._try_fill(ctx, order, tick, auction_price=auction_price):
-                    filled_any = True
-                    ctx.pending.pop(order_id, None)
-        elif session == "intraday":
-            auction_price = None
-            for order_id, order in list(ctx.pending.items()):
-                if order.status != O_PENDING:
-                    ctx.pending.pop(order_id, None)
-                    continue
-                if self._try_fill(ctx, order, tick):
-                    filled_any = True
-                    ctx.pending.pop(order_id, None)
-        # else: 竞价等待期（pre 未到 09:25 / closing 未到 15:00）——只挂不撮，跳过
+        if session == "intraday":
+            return self._sweep_pending(ctx, tick, auction_price=None)
+        if matching.is_auction_point(tick["time_key"]):
+            return self._sweep_pending(ctx, tick, auction_price=tick["close"])
+        return False    # 竞价等待期——只挂不撮，跳过
 
-        # 本 tick 无成交 → 周期性持久化轮次行情（last_price/last_time_key）。
-        # 高速档每 tick 都 commit 远程库开销极大（x60≈60 次/秒），改为每 10 tick 一次；
-        # 但收盘 tick 必须落库，确保随后的 _settle 读到最新 last_price 计算期末资产。
-        # 成交（_try_fill）/暂停（pause_round）/结算（_settle）路径均各自 commit，
-        # 且 Redis 快照每周期存进度，崩溃恢复优先用快照，DB 行情滞后几 tick 可接受。
+    def _sweep_pending(self, ctx: RoundContext, tick: dict,
+                       auction_price: float = None) -> bool:
+        """遍历 pending 订单逐笔尝试撮合，清理已终结订单，返回是否有成交/拒单"""
+        filled_any = False
+        for order_id, order in list(ctx.pending.items()):
+            if order.status != O_PENDING:
+                ctx.pending.pop(order_id, None)
+                continue
+            if self._try_fill(ctx, order, tick, auction_price=auction_price):
+                filled_any = True
+                ctx.pending.pop(order_id, None)
+        return filled_any
+
+    def _persist_tick(self, ctx: RoundContext, filled_any: bool):
+        """无成交 tick 的周期性持久化轮次行情（last_price/last_time_key）
+
+        高速档每 tick 都 commit 远程库开销极大（x60≈60 次/秒），改为每 10
+        tick 一次；但收盘 tick 必须落库，确保随后的 _settle 读到最新
+        last_price 计算期末资产。成交/暂停/结算路径均各自 commit，且 Redis
+        快照每周期存进度，崩溃恢复优先用快照，DB 行情滞后几 tick 可接受。
+        """
         is_last = ctx.index >= len(ctx.ticks) - 1
         if not filled_any and (ctx.index % 10 == 0 or is_last):
             db.session.add(ctx.round)
             db.session.commit()
 
-        # 最后一根 tick → 自动结算
-        if is_last:
-            self._settle(ctx.round.id, reason="收盘", auto=True)
-
     @_ensure_ctx
     def _try_fill(self, ctx: RoundContext, order: GameOrder, tick: dict,
                   auction_price: float = None) -> bool:
-        """尝试撮合一笔委托，成交返回 True；未触及返回 False
+        """尝试撮合一笔委托，订单被处理（成交或拒单）返回 True
 
-        连续竞价（auction_price=None）：快照口径下 high/low 是截至该时刻的
-        当日滚动极值，不代表本时刻可成交的价格区间，因此限价单以最新价
-        （快照 close）触发：买单价 <= 限价、卖单价 >= 限价即成交（成交价=限价），
-        市价单按最新价成交。
-
-        集合竞价（auction_price 传入竞价价）：限价单以竞价价触发——买单限价 >= 竞价价
-        成交、卖单限价 <= 竞价价成交，成交价=竞价价（集合竞价以竞价价撮合，成交
-        价恒等于竞价价，而非限价）；市价单同样按竞价价成交。
+        成交判定委托 matching.decide_fill（连续竞价以最新价触及即成交、
+        集合竞价以竞价价撮合，详见其文档）。
         """
         acct = ctx.acct
-        direction, otype, price, shares = order.direction, order.order_type, order.price, order.shares
         if order.status != O_PENDING:
             return False
-        filled = False
-        fill_price = price
 
-        if otype == "limit":
-            if auction_price is not None:   # 集合竞价：限价以竞价价为基准
-                if direction == "buy" and price >= auction_price:
-                    filled, fill_price = True, auction_price
-                elif direction == "sell" and price <= auction_price:
-                    filled, fill_price = True, auction_price
-            else:                           # 连续竞价：限价以最新价为基准
-                if direction == "buy" and tick["close"] <= price:
-                    filled = True
-                elif direction == "sell" and tick["close"] >= price:
-                    filled = True
-            if not filled:
-                return False
-        else:  # market
-            fill_price = auction_price if auction_price is not None else tick["close"]
-            filled = True
-
+        filled, fill_price = matching.decide_fill(
+            order.direction, order.order_type, order.price,
+            tick["close"], auction_price)
         if not filled:
             return False
 
-        # 成交校验（市价单成交价可能高于冻结预估）
-        if direction == "buy":
-            amount = fill_price * shares + acct.fee_for(fill_price * shares)
+        # 成交校验（市价单成交价可能高于冻结预估）→ 冻结不足则拒单
+        if order.direction == "buy":
+            amount = fill_price * order.shares + acct.fee_for(fill_price * order.shares)
             if order.frozen_amount < amount - 0.001:
-                # 本单冻结额不足 → 拒单并解冻（冻结转回可用现金）
-                acct.unfreeze_buy(order.price, shares)
-                order.status = O_REJECTED
-                order.reject_reason = f"市价成交价 {fill_price} 超出冻结额"
-                # 订单/轮次为跨 context 的 detached 实例，需重新 attach 才能持久化
-                self._attach_account_json(ctx.round, ctx)
-                db.session.add(order)
-                db.session.add(ctx.round)
-                db.session.commit()
-                self.emit("game:order_update", self._order_to_dict(order),
-                          room=f"round_{ctx.round.id}")
+                self._reject_order(ctx, order, fill_price)
                 return True
-            fee = acct.fill_buy(fill_price, shares, frozen_amount=order.frozen_amount)
+            fee = acct.fill_buy(fill_price, order.shares,
+                                frozen_amount=order.frozen_amount)
         else:
-            fee = acct.fill_sell(fill_price, shares)
+            fee = acct.fill_sell(fill_price, order.shares)
 
-        # 记录成交
-        trade = GameTrade(
-            round_id=ctx.round.id,
-            order_id=order.order_id,
-            code=order.code,
-            direction=direction,
-            price=fill_price,
-            shares=shares,
-            fee=fee,
-            trade_time=tick["time_key"],
-        )
-        db.session.add(trade)
-        order.status = O_FILLED
-        order.filled_shares = shares
-        order.filled_price = fill_price
-        order.fee = fee
-        # 成交时间记游戏时间（当前撮合快照的 time_key），与成交记录 trade_time 同源
-        order.filled_at = _parse_game_time(tick["time_key"])
+        self._record_fill(ctx, order, fill_price, fee, tick)
+        self._emit_fill(ctx, order, fill_price, fee, tick)
+        return True
 
-        # 累计已实现盈亏与手续费
-        if direction == "buy":
-            # 买入：仅手续费为已实现亏损（本金转为持仓，不产生盈亏）
-            ctx.round.realized_pnl = (ctx.round.realized_pnl or 0) - fee
-        else:
-            # 卖出：(卖出价 - 持仓成本) × 数量 - 手续费
-            ctx.round.realized_pnl = (ctx.round.realized_pnl or 0) + (fill_price - acct.avg_price) * shares - fee
-        ctx.round.fee_total = (ctx.round.fee_total or 0) + fee
+    def _reject_order(self, ctx: RoundContext, order: GameOrder,
+                      fill_price: float):
+        """拒单：冻结不足，解冻转回可用现金并落库推送"""
+        acct = ctx.acct
+        acct.unfreeze_buy(order.price, order.shares)
+        order.status = O_REJECTED
+        order.reject_reason = f"市价成交价 {fill_price} 超出冻结额"
         # 订单/轮次为跨 context 的 detached 实例，需重新 attach 才能持久化
         self._attach_account_json(ctx.round, ctx)
         db.session.add(order)
         db.session.add(ctx.round)
         db.session.commit()
-
-        self.emit("game:order_update", self._order_to_dict(order),
+        self.emit("game:order_update", serializers.order_to_dict(order),
                   room=f"round_{ctx.round.id}")
-        self.emit("game:trade", {
-            "order_id": order.order_id, "code": order.code, "direction": direction,
-            "price": fill_price, "shares": shares, "fee": fee,
-            "trade_time": tick["time_key"],
-            "realized_pnl": round(ctx.round.realized_pnl or 0, 2),
-            "fee_total": round(ctx.round.fee_total or 0, 2),
-        }, room=f"round_{ctx.round.id}")
-        acct_d = acct.to_dict()
-        acct_d["realized_pnl"] = round(ctx.round.realized_pnl or 0, 2)
-        acct_d["fee_total"] = round(ctx.round.fee_total or 0, 2)
-        self.emit("game:account", acct_d, room=f"round_{ctx.round.id}")
-        return True
+
+    def _record_fill(self, ctx: RoundContext, order: GameOrder,
+                     fill_price: float, fee: float, tick: dict):
+        """成交落库：成交记录 + 委托回填 + 轮次级盈亏/手续费累计"""
+        acct = ctx.acct
+        r = ctx.round
+        trade = GameTrade(
+            round_id=r.id,
+            order_id=order.order_id,
+            code=order.code,
+            direction=order.direction,
+            price=fill_price,
+            shares=order.shares,
+            fee=fee,
+            trade_time=tick["time_key"],
+        )
+        db.session.add(trade)
+        order.status = O_FILLED
+        order.filled_shares = order.shares
+        order.filled_price = fill_price
+        order.fee = fee
+        # 成交时间记游戏时间（当前撮合快照的 time_key），与 trade_time 同源
+        order.filled_at = _parse_game_time(tick["time_key"])
+
+        # 累计已实现盈亏与手续费：买入仅手续费为已实现亏损（本金转持仓）；
+        # 卖出为 (卖出价 - 持仓成本) × 数量 - 手续费
+        if order.direction == "buy":
+            r.realized_pnl = (r.realized_pnl or 0) - fee
+        else:
+            r.realized_pnl = ((r.realized_pnl or 0)
+                              + (fill_price - acct.avg_price) * order.shares - fee)
+        r.fee_total = (r.fee_total or 0) + fee
+        # 订单/轮次为跨 context 的 detached 实例，需重新 attach 才能持久化
+        self._attach_account_json(r, ctx)
+        db.session.add(order)
+        db.session.add(r)
+        db.session.commit()
+
+    def _emit_fill(self, ctx: RoundContext, order: GameOrder,
+                   fill_price: float, fee: float, tick: dict):
+        """成交推送：委托更新 + 成交流水 + 账户（补充轮次级盈亏/手续费）"""
+        r = ctx.round
+        room = f"round_{r.id}"
+        self.emit("game:order_update", serializers.order_to_dict(order), room=room)
+        self.emit("game:trade",
+                  serializers.trade_payload(order, fill_price, fee,
+                                            tick["time_key"],
+                                            r.realized_pnl or 0,
+                                            r.fee_total or 0),
+                  room=room)
+        acct_d = ctx.acct.to_dict()
+        acct_d["realized_pnl"] = round(r.realized_pnl or 0, 2)
+        acct_d["fee_total"] = round(r.fee_total or 0, 2)
+        self.emit("game:account", acct_d, room=room)
 
     # ── 结算 ──
 
@@ -1310,7 +1113,7 @@ class GameEngine:
     def _settle(self, round_id: int, reason: str, auto: bool = True) -> bool:
         """结算：final_assets = 现金 + 持仓×最后价；未成交委托作废
 
-        注意: 调用方（finish_round/_process_tick/start_round/resume_round）均
+        注意: 调用方（finish_round/_process_tick/_activate_round）均
         已处于 app context，此处不套 _ensure_ctx 以保证与调用方同一 session，
         query.get 能命中 identity map 返回与 ctx.round 同一实例。
         """
@@ -1320,22 +1123,7 @@ class GameEngine:
                 return False
             ctx = self._rounds.get(round_id)
             acct = ctx.acct if ctx and ctx.acct else None
-            last_price = r.last_price or 0
-            if acct:
-                final = acct.total_assets(last_price)
-                # 解冻未成交委托
-                pending = GameOrder.query.filter_by(
-                    round_id=round_id, status=O_PENDING).all()
-                for o in pending:
-                    if acct:
-                        if o.direction == "buy":
-                            acct.unfreeze_buy(o.price, o.shares)
-                        else:
-                            acct.unfreeze_sell(o.shares)
-                    o.status = O_CANCELLED
-                final = acct.total_assets(last_price)
-            else:
-                final = 0
+            final = self._cancel_pending_orders(r, acct)
             r.final_assets = round(final, 2)
             r.status = ST_FINISHED
             r.finished_at = now_cn()
@@ -1352,6 +1140,16 @@ class GameEngine:
                       room=f"round_{round_id}")
             logger.info("轮次 %s 结算完成 reason=%s final=%.2f", round_id, reason, final)
             return True
+
+    def _cancel_pending_orders(self, r, acct) -> float:
+        """作废全部未成交委托并解冻，返回解冻后期末总资产（无账户返回 0）"""
+        if not acct:
+            return 0.0
+        for o in GameOrder.query.filter_by(round_id=r.id,
+                                           status=O_PENDING).all():
+            self._unfreeze_order(acct, o)
+            o.status = O_CANCELLED
+        return acct.total_assets(r.last_price or 0)
 
     # ── 快照 ──
 
@@ -1372,33 +1170,22 @@ class GameEngine:
                 "last_close": ctx.ticks[0]["last_close"] if ctx.ticks else 0,
             })
 
-    @staticmethod
-    def _order_to_dict(o: GameOrder) -> dict:
-        return {
-            "order_id": o.order_id,
-            "round_id": o.round_id,
-            "code": o.code,
-            "direction": o.direction,
-            "order_type": o.order_type,
-            "price": o.price,
-            "shares": o.shares,
-            "status": o.status,
-            "filled_shares": o.filled_shares,
-            "filled_price": o.filled_price,
-            "fee": o.fee,
-            "created_at": o.created_at.strftime("%Y-%m-%d %H:%M:%S") if o.created_at else "",
-            "reject_reason": o.reject_reason,
-        }
+    def _order_to_dict(self, o: GameOrder) -> dict:
+        """委托序列化（serializers 委托，保留引擎侧兼容出口）"""
+        return serializers.order_to_dict(o)
 
 
 # 全局单例
 _engine = None
+_engine_lock = threading.Lock()
 
 
 def get_engine() -> GameEngine:
     global _engine
     if _engine is None:
-        _engine = GameEngine()
+        with _engine_lock:
+            if _engine is None:
+                _engine = GameEngine()
     return _engine
 
 

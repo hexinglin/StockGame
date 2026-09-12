@@ -60,11 +60,13 @@ def create_app(config_path: str = None, enable_scheduler: bool = True) -> Flask:
     from .messaging.cache import get_cache
     get_cache().connect()
 
-    # 蓝图
-    from .api.agent_routes import agent_bp
+    # 蓝图（agent 按资源拆分：行情上传 / 心跳监控 / 交易记录闭环）
+    from .api.agent_tick import tick_bp
+    from .api.agent_monitor import monitor_bp
+    from .api.agent_trade import trade_bp
     from .api.game_routes import game_bp
-    app.register_blueprint(agent_bp)
-    app.register_blueprint(game_bp)
+    for bp in (tick_bp, monitor_bp, trade_bp, game_bp):
+        app.register_blueprint(bp)
 
     # 健康检查
     @app.route("/health")

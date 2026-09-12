@@ -16,6 +16,7 @@ class GameOrder(Base):
     order_type = Column(String(10), default="limit")  # limit/market
     price = Column(Float, default=0)
     shares = Column(Integer, default=0)
+    grid_idx = Column(Integer)                 # 网格行主格号（一键下单关联网格行；普通下单为空）
     frozen_amount = Column(Float, default=0)   # 下单冻结金额（买单，含手续费）
     status = Column(String(20), default="pending")
     filled_shares = Column(Integer, default=0)

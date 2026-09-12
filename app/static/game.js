@@ -7,7 +7,8 @@
 const state = {
     roundId: null,          // 当前游戏轮次
     round: null,            // 轮次详情
-    ticks: [],              // 该日全部快照（恢复用；volume/amount 为相邻快照增量）
+    ticks: [],              // 已播出区间的 tick（接口按 last_time_key 截断，不含未来）
+    tickTotal: 0,           // 全天可播条数（进度分母）
     minutePoints: [],       // 已定格分钟点 {time, price, vol, amount}
     livePoint: null,        // 进行中分钟（跳变点）
     cumAmount: 0,           // 累计成交额（本轮）
@@ -27,11 +28,15 @@ const state = {
 const FEE_RATE = 0.0001;    // 万1
 const CODE_DEFAULT = "588000.SH";
 
-// 账户卡/五档盘口为 innerHTML 全量重建，高速档每 tick 重建（x60≈60 次/秒）开销大且
+// 账户卡/十档盘口为 innerHTML 全量重建，高速档每 tick 重建（x60≈60 次/秒）开销大且
 // 视觉抖动，按时间节流；x1（1 tick/秒，间隔 > 阈值）不受影响。成交/进入等关键场景
 // 传 force=true 立即渲染。行情数字与分时图仍每 tick 更新（textContent 轻量、需实时）。
 const RENDER_THROTTLE_MS = 500;
 let _lastAcctTs = 0, _lastLv5Ts = 0;
+
+// 委托列表数据（盘口据此标注「我的委托」量，见表头筛选与 renderLevel5）
+let ordersHideFilled = false;
+let ordersLastRows = [];
 
 // ───────────── API 封装 ─────────────
 async function api(url, method = "GET", body = null) {
@@ -53,6 +58,25 @@ function fmtVol(n) {
     if (n >= 1e8) return (n / 1e8).toFixed(2) + "亿";
     if (n >= 1e4) return (n / 1e4).toFixed(2) + "万";
     return String(n);
+}
+
+// 成交额（元）：亿元为主口径（与成交量 亿/万 一致），不足万级时回落原值
+function fmtAmt(n) {
+    if (!n) return "0";
+    if (n >= 1e8) return (n / 1e8).toFixed(2) + "亿";
+    if (n >= 1e4) return (n / 1e4).toFixed(2) + "万";
+    return fmt(n);
+}
+
+// 价格有效性：0/空/NaN 视为无值（集合竞价时段 QMT 上报的 high/low 为 0，
+// 若参与 min/max 会把今低算成 0）
+function validPrice(v) {
+    return typeof v === "number" && isFinite(v) && v > 0;
+}
+
+// 价格显示：无有效值显示 "-"，不展示 0.000 这类占位数
+function fmtPx(v, d = 3) {
+    return validPrice(v) ? fmt(v, d) : "-";
 }
 
 // 数量对外（操作/展示）统一用「万股」，计算与接口传输一律用「股」（在此集中换算）
@@ -403,6 +427,8 @@ async function enterGame(roundId) {
         // 最近 2.5 小时，图会从盘中截断开始，丢失早盘走势）
         const tk = await api(`/api/v1/game/rounds/${roundId}/ticks`);
         state.ticks = tk.data.ticks || [];
+        // 进度分母 = 全天可播条数（接口 total；未下发未来快照故不能取 ticks.length）
+        state.tickTotal = tk.data.total || state.ticks.length;
 
         document.getElementById("view-rounds").style.display = "none";
         document.getElementById("view-game").style.display = "block";
@@ -429,15 +455,18 @@ async function enterGame(roundId) {
         rebuildMinuteSeries(upto, true);
 
         // 恢复行情显示状态：昨收/今开/今高/今低均按已推进区间重算，与实时
-        // 播放保持同一当日累计口径；进入后由行情推送增量更新
+        // 播放保持同一当日累计口径；进入后由行情推送增量更新。极值只纳入
+        // 有效价格（竞价时段快照 high/low 为 0，否则今低会被算成 0）
         state.lastClose = upto.length ? (upto[upto.length - 1].last_close || 0) : 0;
         state.dayOpen = upto.length ? upto[0].open : 0;
-        state.dayHigh = upto.length ? Math.max(...upto.map(t => t.high || 0)) : 0;
-        state.dayLow = upto.length ? Math.min(...upto.map(t => t.low || 0)) : 0;
+        const highs = upto.map(t => t.high).filter(validPrice);
+        const lows = upto.map(t => t.low).filter(validPrice);
+        state.dayHigh = highs.length ? Math.max(...highs) : 0;
+        state.dayLow = lows.length ? Math.min(...lows) : 0;
         // 恢复最新价（供持仓/账户市值计算，socket 推送前避免现价显示 0）
         state.lastPrice = state.round.last_price || 0;
         // 恢复进度条（暂停/重进时不依赖行情推送也能显示正确进度）
-        const tickTotal = state.ticks.length;
+        const tickTotal = state.tickTotal;
         updateProgress(tickTotal && upto.length ? upto.length / tickTotal * 100 : 0);
 
         // 加载委托/成交/账户/网格表
@@ -543,9 +572,9 @@ function onQuote(q) {
     const lastClose = q.last_close || state.lastClose || 0;
     state.lastClose = lastClose;
     state.lastPrice = q.close;
-    if (!state.dayOpen) state.dayOpen = q.open;
-    state.dayHigh = Math.max(state.dayHigh || q.high, q.high);
-    state.dayLow = state.dayLow ? Math.min(state.dayLow, q.low) : q.low;
+    if (!state.dayOpen && validPrice(q.open)) state.dayOpen = q.open;
+    if (validPrice(q.high)) state.dayHigh = Math.max(state.dayHigh || q.high, q.high);
+    if (validPrice(q.low)) state.dayLow = state.dayLow ? Math.min(state.dayLow, q.low) : q.low;
 
     // 分钟聚合：分钟变化 → 定格上一分钟点。quote 的 volume/amount 为与上一
     // 快照的增量（差分输出），同分钟累加 = 该分钟量柱（分钟量能守恒）；
@@ -596,6 +625,7 @@ function onOrderUpdate(o) {
             o.status === "filled" ? "success" : (o.status === "rejected" ? "error" : "warn"));
     }
     loadOrders();
+    refreshGridIfVisible();   // 挂单/撤单/拒单 → 行的格号/间隔可调状态随之变化
 }
 
 function onTrade(t) {
@@ -603,7 +633,14 @@ function onTrade(t) {
     toast(`成交 ${t.direction === "buy" ? "买入" : "卖出"} ${fmt(t.shares)}股 @${t.price}`, "success");
     loadTrades();
     // 账户由随后的 game:account 推送实时刷新，无需再发 HTTP 请求（去冗余）
-    if (document.getElementById("gridBox").style.display !== "none") loadGrid();
+    refreshGridIfVisible();   // 成交会消/建梯度行
+}
+
+// 网格表可见时刷新：该表依赖委托状态（行有无挂单决定格号/间隔能否调整），
+// 故成交、下单、撤单、拒单等委托状态变化后都需同步（loadGrid 自带 500ms 节流）
+function refreshGridIfVisible() {
+    const box = document.getElementById("gridBox");
+    if (box && box.style.display !== "none") loadGrid();
 }
 
 function onAccount(acct) {
@@ -907,13 +944,13 @@ function refreshQuoteDisplay(force) {
             pctEl.className = "chg";
         }
     }
-    document.getElementById("gOpen").textContent = fmt(state.dayOpen, 3);
-    document.getElementById("gHigh").textContent = fmt(state.dayHigh, 3);
-    document.getElementById("gLow").textContent = fmt(state.dayLow, 3);
-    document.getElementById("gLastClose").textContent =
-        lastClose && lastClose > 0 ? fmt(lastClose, 3) : "--";
-    document.getElementById("gVol").textContent = fmtVol(state.cumVolume);
-    document.getElementById("gAmount").textContent = fmt(state.cumAmount);
+    document.getElementById("gOpen").textContent = fmtPx(state.dayOpen);
+    document.getElementById("gHigh").textContent = fmtPx(state.dayHigh);
+    document.getElementById("gLow").textContent = fmtPx(state.dayLow);
+    document.getElementById("gLastClose").textContent = fmtPx(lastClose);
+    // 累计量额：尚未产生成交（0/无值）时显示 "-"，不展示占位数字
+    document.getElementById("gVol").textContent = state.cumVolume ? fmtVol(state.cumVolume) : "-";
+    document.getElementById("gAmount").textContent = state.cumAmount ? fmtAmt(state.cumAmount) : "-";
     renderLevel5(price, force);
 }
 
@@ -922,7 +959,11 @@ function updateProgress(pct) {
     document.getElementById("gProgressText").textContent = (pct || 0) + "%";
 }
 
-// ───────────── 五档盘口（模拟，基于实际行情派生） ─────────────
+// ───────────── 十档盘口（模拟，基于实际行情派生；两列 = 左卖右买） ─────────────
+// 十档：买卖各 10 档，两列并列展示（列内自上而下由远及近，与单列版阅读顺序一致）。
+// 各档挂单量为模拟值；若当前有未成交委托落在该价位，在价格后标注委托量（万股）。
+const LV_LEVELS = 10;
+
 function renderLevel5(price, force) {
     if (!price) return;
     // 高速档节流：盘口为模拟跳动数据，无需每 tick 重建（x60≈60 次/秒）
@@ -933,24 +974,55 @@ function renderLevel5(price, force) {
     // 基础量 = 最近一笔 tick 成交量，乘以随机系数模拟各档挂单量
     const baseVol = state.lastTickVol || Math.max(1000, Math.round(state.cumVolume / 200));
     const box = document.getElementById("level5Rows");
-    let html = "";
+    const mine = _pendingSharesByPrice();   // 未成交委托按价位聚合（股）
     // 随机决定最新价出现在买1还是卖1（模拟主动买/主动卖）
     const atBid = Math.random() < 0.5;
-    // 卖 5→1
-    for (let i = 5; i >= 1; i--) {
+    const asks = [], bids = [];
+    for (let i = LV_LEVELS; i >= 1; i--) {   // 卖10 → 卖1
         const p = atBid ? price + step * i : price + step * (i - 1);
-        const vol = Math.round(baseVol * (1.5 + Math.random() * 3) * (1 + i * 0.15));
-        html += `<div class="lv-row ask" onclick="quickPriceByValue(${p})">
-            <span class="lv-name">卖${i}</span><span class="lv-price down">${fmt(p, 3)}</span><span class="lv-vol">${fmtVol(vol)}</span></div>`;
+        asks.push(_lvRow("卖" + i, p, "ask", "down", baseVol, i, mine));
     }
-    // 买 1→5
-    for (let i = 1; i <= 5; i++) {
+    for (let i = 1; i <= LV_LEVELS; i++) {   // 买1 → 买10
         const p = atBid ? price - step * (i - 1) : price - step * i;
-        const vol = Math.round(baseVol * (1.5 + Math.random() * 3) * (1 + i * 0.15));
-        html += `<div class="lv-row bid" onclick="quickPriceByValue(${p})">
-            <span class="lv-name">买${i}</span><span class="lv-price up">${fmt(p, 3)}</span><span class="lv-vol">${fmtVol(vol)}</span></div>`;
+        bids.push(_lvRow("买" + i, p, "bid", "up", baseVol, i, mine));
     }
-    box.innerHTML = html;
+    box.innerHTML = `<div class="lv-col">${asks.join("")}</div>`
+                  + `<div class="lv-col">${bids.join("")}</div>`;
+}
+
+function _lvRow(name, price, side, cls, baseVol, i, mine) {
+    const vol = Math.round(baseVol * (1.5 + Math.random() * 3) * (1 + i * 0.15));
+    const shares = mine[price.toFixed(3)];
+    // 委托量标记：位数占位保证无委托时各列仍对齐
+    const tag = shares
+        ? `<span class="lv-mine" title="我的委托 ${fmtWan(shares)} 万股">${_fmtWanShort(shares)}</span>`
+        : '<span class="lv-mine"></span>';
+    return `<div class="lv-row ${side}" onclick="quickPriceByValue(${price})">
+        <span class="lv-name">${name}</span><span class="lv-price ${cls}">${fmt(price, 3)}</span>${tag}<span class="lv-vol">${_fmtLvVol(vol)}</span></div>`;
+}
+
+// 盘口量显示压缩（两列并排，列宽约 143px）：模拟量取整到万/亿，委托量省去多余小数
+function _fmtLvVol(n) {
+    if (!n) return "0";
+    if (n >= 1e8) return (n / 1e8).toFixed(2) + "亿";
+    if (n >= 1e4) return Math.round(n / 1e4) + "万";
+    return String(n);
+}
+
+function _fmtWanShort(shares) {
+    // 股 → 万股短格式：1.00→1，2.50→2.5，12.34→12.34（单位固定为万股）
+    return (Number(shares) / SHARES_PER_WAN).toFixed(2).replace(/\.?0+$/, "") + "万";
+}
+
+function _pendingSharesByPrice() {
+    // 未成交委托按价位（3 位小数）聚合为股数，供盘口在价格后标注「我的委托」
+    const map = {};
+    (ordersLastRows || []).forEach(o => {
+        if (o.status !== "pending" || !o.price) return;
+        const key = Number(o.price).toFixed(3);
+        map[key] = (map[key] || 0) + Number(o.shares || 0);
+    });
+    return map;
 }
 
 // ───────────── 下单面板 ─────────────
@@ -1067,8 +1139,10 @@ let _lastGridTs = 0;
 // 网格表行级状态（保留每行各自调整后的间隔，避免全量重绘时丢失）
 let gridRows = [];
 let gridLastData = null;
+let gridHideDone = false;   // 网格表筛选：隐藏已完成行（仅影响展示）
 function switchRecTab(tab) {
     document.querySelectorAll(".rec-tab").forEach(b => b.classList.toggle("active", b.dataset.tab === tab));
+    document.getElementById("ordersToolbar").style.display = tab === "orders" ? "" : "none";
     document.getElementById("ordersTable").style.display = tab === "orders" ? "" : "none";
     document.getElementById("tradesTable").style.display = tab === "trades" ? "" : "none";
     document.getElementById("accountBox").style.display = tab === "account" ? "" : "none";
@@ -1079,27 +1153,52 @@ function switchRecTab(tab) {
 async function loadOrders() {
     try {
         const resp = await api(`/api/v1/game/rounds/${state.roundId}/orders`);
-        const rows = resp.data || [];
-        const tb = document.querySelector("#ordersTable tbody");
-        if (!rows.length) {
-            tb.innerHTML = '<tr><td colspan="8" class="empty-cell">暂无委托</td></tr>';
-            return;
-        }
-        tb.innerHTML = rows.map(o => `
-            <tr class="order-${o.status}">
-                <td>${o.created_at || ""}</td>
-                <td class="${o.direction === "buy" ? "up" : "down"}">${o.direction === "buy" ? "买入" : "卖出"}</td>
-                <td>${o.order_type === "limit" ? "限价" : "市价"}</td>
-                <td>${fmt(o.price, 3)}</td>
-                <td>${o.status === "filled" ? fmt(o.filled_price, 3) : "--"}</td>
-                <td>${fmtWan(o.shares)}</td>
-                <td>${o.status === "pending" ? '<span class="st-pending">已报</span>'
-                    : o.status === "filled" ? '<span class="st-filled">已成</span>'
-                    : o.status === "cancelled" ? '<span class="st-cancelled">已撤</span>'
-                    : `<span class="st-rejected" title="${o.reject_reason || ""}">拒单</span>`}</td>
-                <td>${o.status === "pending" ? `<button class="btn-sm btn-warn" onclick="cancelOrder('${o.order_id}')">撤单</button>` : ""}</td>
-            </tr>`).join("");
+        ordersLastRows = resp.data || [];
+        renderOrders();
+        // 盘口「我的委托」标注随委托变化即时刷新（否则暂停/无 tick 时盘口不重绘）
+        renderLevel5(state.lastPrice, true);
     } catch (e) { /* 忽略 */ }
+}
+
+// 委托列表筛选：按钮在「隐藏已成 / 显示全部」间切换（仅影响展示，不重新请求）
+function toggleHideFilled() {
+    ordersHideFilled = !ordersHideFilled;
+    renderOrders();
+}
+
+function renderOrders() {
+    const all = ordersLastRows;
+    const rows = ordersHideFilled ? all.filter(o => o.status !== "filled") : all;
+    const filledCount = all.filter(o => o.status === "filled").length;
+    const btn = document.getElementById("ordersFilterBtn");
+    const note = document.getElementById("ordersFilterNote");
+    if (btn) btn.textContent = ordersHideFilled ? "显示全部" : "隐藏已成";
+    if (note) {
+        note.textContent = ordersHideFilled && filledCount
+            ? `共 ${all.length} 笔，已隐藏 ${filledCount} 笔已成`
+            : `共 ${all.length} 笔`;
+    }
+    const tb = document.querySelector("#ordersTable tbody");
+    if (!tb) return;
+    if (!rows.length) {
+        tb.innerHTML = `<tr><td colspan="8" class="empty-cell">${
+            all.length ? `暂无未成交委托（已隐藏 ${filledCount} 笔已成）` : "暂无委托"}</td></tr>`;
+        return;
+    }
+    tb.innerHTML = rows.map(o => `
+        <tr class="order-${o.status}">
+            <td>${o.created_at || ""}</td>
+            <td class="${o.direction === "buy" ? "up" : "down"}">${o.direction === "buy" ? "买入" : "卖出"}</td>
+            <td>${o.order_type === "limit" ? "限价" : "市价"}</td>
+            <td>${fmt(o.price, 3)}</td>
+            <td>${o.status === "filled" ? fmt(o.filled_price, 3) : "--"}</td>
+            <td>${fmtWan(o.shares)}</td>
+            <td>${o.status === "pending" ? '<span class="st-pending">已报</span>'
+                : o.status === "filled" ? '<span class="st-filled">已成</span>'
+                : o.status === "cancelled" ? '<span class="st-cancelled">已撤</span>'
+                : `<span class="st-rejected" title="${o.reject_reason || ""}">拒单</span>`}</td>
+            <td>${o.status === "pending" ? `<button class="btn-sm btn-warn" onclick="cancelOrder('${o.order_id}')">撤单</button>` : ""}</td>
+        </tr>`).join("");
 }
 
 async function cancelOrder(orderId) {
@@ -1108,6 +1207,7 @@ async function cancelOrder(orderId) {
         toast("撤单成功", "success");
         loadOrders();
         loadAccount();
+        refreshGridIfVisible();   // 撤单后该行恢复可调整
     } catch (e) { toast(e.message, "error"); }
 }
 
@@ -1228,9 +1328,17 @@ function _setRowInterval(r, iv, p) {
     }
 }
 
+// 用指定格号重算某行（整行平移：买卖格号同步移动、买卖点价同步平移，
+// 成交价不动——由 _setRowInterval 按方向重算两侧格号与价格）
+function _setRowIdx(r, nv, p) {
+    r.idx = nv;
+    _setRowInterval(r, r.interval, p);
+}
+
 async function applyGridInterval(i, val) {
     const r = gridRows[i];
     if (!r || !gridLastData) return;
+    if (r.pending_order_id) { renderGrid(); return; }   // 有委托：不可调整（还原显示）
     const p = gridLastData.params || {};
     const nv = parseInt(val, 10);
     if (isNaN(nv)) return;
@@ -1238,14 +1346,62 @@ async function applyGridInterval(i, val) {
     _setRowInterval(r, nv, p);   // 乐观更新即时生效
     renderGrid();
     if (!state.roundId) return;
-    // 随轮次持久化，重进保持一致
+    // 随轮次持久化，重进保持一致；以 key_idx（行稳定标识）寻址，行位置微调后仍归属同一行
     try {
-        await api(`/api/v1/game/rounds/${state.roundId}/grid/interval`, "PUT", { idx: r.idx, interval: nv });
+        await api(`/api/v1/game/rounds/${state.roundId}/grid/interval`, "PUT",
+                  { idx: r.key_idx !== undefined ? r.key_idx : r.idx, interval: nv });
     } catch (e) {
         _setRowInterval(r, old, p);   // 失败回滚
         renderGrid();
         toast(e.message || "间隔保存失败", "error");
     }
+}
+
+// 格号微调（上/下箭头或直接改值）：整行平移，价格随格号同步；成交价不变
+async function applyGridIdx(i, val, side) {
+    const r = gridRows[i];
+    if (!r || !gridLastData) return;
+    if (r.pending_order_id) { renderGrid(); return; }   // 有委托：不可调整（还原显示）
+    const p = gridLastData.params || {};
+    const nv = parseInt(val, 10);
+    const cur = side === "buy" ? r.buy_idx : r.sell_idx;
+    if (isNaN(nv) || nv < 0 || nv === cur) { renderGrid(); return; }   // 非法/未变 → 还原显示
+    const oldIdx = r.idx;
+    const newIdx = oldIdx + (nv - cur);   // 该侧改动量 = 整行位移量
+    _setRowIdx(r, newIdx, p);             // 乐观更新即时生效
+    renderGrid();
+    if (!state.roundId) return;
+    try {
+        await api(`/api/v1/game/rounds/${state.roundId}/grid/idx`, "PUT",
+                  { idx: r.key_idx !== undefined ? r.key_idx : oldIdx, new_idx: newIdx });
+    } catch (e) {
+        _setRowIdx(r, oldIdx, p);         // 失败回滚
+        renderGrid();
+        toast(e.message || "格号保存失败", "error");
+    }
+}
+
+// 网格行一键下单：出场腿待成交（已购/已售）的行按行推导委托（已购→挂卖点卖、
+// 已售→挂买点价买回）；已有未成交委托的行按钮置灰，撤单（未成交）后恢复可下。
+async function placeGridOrder(i) {
+    const r = gridRows[i];
+    if (!r || !state.roundId) return;
+    if (r.pending_order_id) return;   // 已有挂单（按钮置灰双保险）
+    const sellSide = r.direction === "buy";   // 出场腿：已购行卖、已售行买
+    const btnText = sellSide ? "卖" : "买";
+    try {
+        await api(`/api/v1/game/rounds/${state.roundId}/grid/order`, "POST", { idx: r.idx });
+        toast(`网格行 ${r.idx} ${btnText}单委托成功`, "success");
+    } catch (e) {
+        toast(e.message || "一键下单失败", "error");
+    }
+    loadGrid();   // 刷新行状态（pending_order_id 置灰）
+}
+
+// 网格表筛选：在「隐藏已完成 / 显示全部」间切换（仅影响展示，不重新请求）
+function toggleGridHideDone() {
+    gridHideDone = !gridHideDone;
+    renderGrid();
 }
 
 function renderGrid() {
@@ -1272,7 +1428,22 @@ function renderGrid() {
     for (let i = 0; i < rows.length; i++) {
         if (last >= rows[i].buy_price) activeIdx = i;
     }
-    const trs = rows.map((r, i) => {
+    // 展示行 = [行, 原始下标]：下标必须保留（间隔调整/一键下单均按 gridRows 下标
+    // 定位），隐藏已完成仅影响展示，序号列随之保留空档（与行身份一致）
+    const doneCount = rows.filter(r => r.status === "done").length;
+    const view = rows.map((r, i) => [r, i])
+        .filter(([r]) => !gridHideDone || r.status !== "done");
+    const toolbar = `<div class="rec-toolbar">
+        <button class="btn-sm" onclick="toggleGridHideDone()">${gridHideDone ? "显示全部" : "隐藏已完成"}</button>
+        <span class="rec-toolbar-note">${gridHideDone && doneCount
+            ? `共 ${rows.length} 行，已隐藏 ${doneCount} 行已完成`
+            : `共 ${rows.length} 行`}</span>
+    </div>`;
+    if (!view.length) {
+        box.innerHTML = `${meta}${toolbar}<div class="empty-cell">暂无未完成网格（已隐藏 ${doneCount} 行已完成）</div>`;
+        return;
+    }
+    const trs = view.map(([r, i]) => {
         const st = GRID_STATUS[r.status] || GRID_STATUS.pending;
         // 买卖点是否已触发
         const buyCls = r.buy_hit ? "up" : "";
@@ -1282,14 +1453,35 @@ function renderGrid() {
         const activeCls = (i === activeIdx || inRange) ? "grid-row-active" : "";
         const dirCls = (r.direction === "sell") ? "down" : "up";
         const dirText = (r.direction === "sell") ? "卖出" : "买入";
-        const selOpts = [1, 2, 4, 6].map(v =>
+        const selOpts = [1, 2, 3, 4, 5, 6].map(v =>
             `<option value="${v}" ${v === r.interval ? "selected" : ""}>${v}</option>`).join("");
+        // 有未成交委托 → 该行价格被委托占用，格号/间隔均不可调整（后端同样校验）
+        const locked = !!r.pending_order_id;
+        const lockAttr = locked ? " disabled" : "";
+        const lockTitle = locked ? "该行已有未成交委托，撤单后可调整" : "";
+        const lockTitleAttr = locked ? ` title="${lockTitle}"` : "";
+        // 格号微调控件：数字 + 自绘上下箭头（原生 spinner 为浅色方块，与暗色主题不搭）
+        const stepper = (side, val) => `<div class="grid-idx-box"${locked ? lockTitleAttr : ' title="上下微调格号：买卖点价随格号同步，成交价不变"'}>
+            <input type="number" class="grid-idx" value="${val}"${lockAttr} onchange="applyGridIdx(${i}, this.value, '${side}')">
+            <span class="grid-idx-btns">
+                <button type="button" class="gi-btn"${lockAttr}${lockTitleAttr} onclick="applyGridIdx(${i}, ${val + 1}, '${side}')">▲</button>
+                <button type="button" class="gi-btn"${lockAttr}${lockTitleAttr} onclick="applyGridIdx(${i}, ${Math.max(val - 1, 0)}, '${side}')">▼</button>
+            </span>
+        </div>`;
+        // 一键下单：出场腿待成交（已购/已售）可下，按钮随出场腿方向显示 买/卖；
+        // 该行已有未成交委托 → 置灰（title 提示），撤单后恢复
+        const sellSide = r.direction === "buy";   // 出场腿：已购行卖、已售行买
+        const orderBtn = (r.status === "buy" || r.status === "sell")
+            ? `<button class="grid-order-btn ${sellSide ? "down" : "up"}"
+                    ${r.pending_order_id ? `disabled title="已有未成交委托 ${r.pending_order_id}，撤单后可再委托"` : `title="挂${sellSide ? "卖点" : "买点"}价 ${fmt(sellSide ? r.sell_price : r.buy_price, 3)}`}"
+                    onclick="placeGridOrder(${i})">${sellSide ? "卖" : "买"}</button>`
+            : "";
         return `
             <tr class="${activeCls}">
                 <td>${i + 1}</td>
-                <td>${r.buy_idx}</td>
-                <td>${r.sell_idx}</td>
-                <td><select class="grid-interval" onchange="applyGridInterval(${i}, this.value)">${selOpts}</select></td>
+                <td>${stepper("buy", r.buy_idx)}</td>
+                <td>${stepper("sell", r.sell_idx)}</td>
+                <td><select class="grid-interval"${lockAttr}${lockTitleAttr} onchange="applyGridInterval(${i}, this.value)">${selOpts}</select></td>
                 <td class="${dirCls}">${dirText}</td>
                 <td class="${buyCls} up">${fmt(r.buy_price, 3)}</td>
                 <td class="${sellCls} down">${fmt(r.sell_price, 3)}</td>
@@ -1297,12 +1489,14 @@ function renderGrid() {
                 <td class="${r.sell_fill_price != null ? "down" : ""}">${fmt(r.sell_fill_price, 3)}</td>
                 <td>${fmtWan(r.shares)}</td>
                 <td><span class="${st.cls}">${st.text}</span></td>
+                <td>${orderBtn}</td>
             </tr>`;
     }).join("");
     box.innerHTML = `
         ${meta}
+        ${toolbar}
         <table class="rec-table grid-table">
-            <thead><tr><th>序号</th><th>买格号</th><th>卖格号</th><th>间隔</th><th>方向</th><th>买点</th><th>卖点</th><th title="该行买入侧真实成交价（多次成交取加权均价，未成交显示 --）">买成交价</th><th title="该行卖出侧真实成交价（多次成交取加权均价，未成交显示 --）">卖成交价</th><th>配持仓(万股)</th><th>状态</th></tr></thead>
+            <thead><tr><th>序号</th><th>买格号</th><th>卖格号</th><th>间隔</th><th>方向</th><th>买点</th><th>卖点</th><th title="该行买入侧真实成交价（多次成交取加权均价，未成交显示 --）">买成交价</th><th title="该行卖出侧真实成交价（多次成交取加权均价，未成交显示 --）">卖成交价</th><th>配持仓(万股)</th><th>状态</th><th>操作</th></tr></thead>
             <tbody>${trs}</tbody>
         </table>`;
 }
@@ -1537,10 +1731,10 @@ function renderAgentLatest(el, name, d, errMsg) {
             </span>
         </div>
         <div class="latest-grid">
-            <div class="acct-item"><span>今开</span><b>${fmt(Number(d.open), 3)}</b></div>
-            <div class="acct-item"><span>最高</span><b class="up">${fmt(Number(d.high), 3)}</b></div>
-            <div class="acct-item"><span>最低</span><b class="down">${fmt(Number(d.low), 3)}</b></div>
-            <div class="acct-item"><span>昨收</span><b>${fmt(lastClose, 3)}</b></div>
+            <div class="acct-item"><span>今开</span><b>${fmtPx(Number(d.open))}</b></div>
+            <div class="acct-item"><span>最高</span><b class="up">${fmtPx(Number(d.high))}</b></div>
+            <div class="acct-item"><span>最低</span><b class="down">${fmtPx(Number(d.low))}</b></div>
+            <div class="acct-item"><span>昨收</span><b>${fmtPx(lastClose)}</b></div>
             <div class="acct-item"><span>成交量</span><b>${fmtVol(Number(d.volume))}</b></div>
             <div class="acct-item"><span>成交额</span><b>${fmtVol(Number(d.amount))}</b></div>
             <div class="acct-item"><span>上传时间</span><b class="latest-up">${d.created_at || "--"}</b></div>

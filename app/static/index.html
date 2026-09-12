@@ -125,9 +125,9 @@
 
         <!-- 右侧：盘口 + 下单 -->
         <aside class="trade-panel">
-            <!-- 五档盘口 -->
+            <!-- 十档盘口（左列卖、右列买） -->
             <div class="level5-box">
-                <div class="level5-title">模拟五档盘口 <span class="mock-tag">模拟</span></div>
+                <div class="level5-title">模拟十档盘口 <span class="mock-tag">模拟</span></div>
                 <div class="level5-rows" id="level5Rows"></div>
             </div>
 
@@ -162,10 +162,14 @@
         <nav class="records-tabs">
             <button class="rec-tab" data-tab="orders" onclick="switchRecTab('orders')">委托</button>
             <button class="rec-tab" data-tab="trades" onclick="switchRecTab('trades')">成交</button>
-            <button class="rec-tab active" data-tab="account" onclick="switchRecTab('account')">账户</button>
-            <button class="rec-tab" data-tab="grid" onclick="switchRecTab('grid')">网格表</button>
+            <button class="rec-tab" data-tab="account" onclick="switchRecTab('account')">账户</button>
+            <button class="rec-tab active" data-tab="grid" onclick="switchRecTab('grid')">网格表</button>
         </nav>
         <div class="records-body">
+            <div class="rec-toolbar" id="ordersToolbar" style="display:none">
+                <button class="btn-sm" id="ordersFilterBtn" onclick="toggleHideFilled()">隐藏已成</button>
+                <span class="rec-toolbar-note" id="ordersFilterNote"></span>
+            </div>
             <table id="ordersTable" class="rec-table" style="display:none">
                 <thead><tr><th>时间</th><th>方向</th><th>类型</th><th>委托价</th><th>成交价</th><th>数量(万股)</th><th>状态</th><th>操作</th></tr></thead>
                 <tbody></tbody>
@@ -174,8 +178,8 @@
                 <thead><tr><th>成交时间</th><th>方向</th><th>价格</th><th>数量(万股)</th><th>手续费(元)</th></tr></thead>
                 <tbody></tbody>
             </table>
-            <div id="accountBox"></div>
-            <div id="gridBox" style="display:none"></div>
+            <div id="accountBox" style="display:none"></div>
+            <div id="gridBox"></div>
         </div>
     </div>
 </div>
@@ -255,7 +259,7 @@
             <div class="config-row"><label>grid_spacing</label><input type="number" id="cfg_spacing" step="0.001"><span class="cfg-note">网格间距</span></div>
             <div class="config-row"><label>init_value</label><input type="number" id="cfg_init" step="0.001"><span class="cfg-note">买点线初始值</span></div>
             <div class="config-row"><label>offset</label><input type="number" id="cfg_offset" step="0.001"><span class="cfg-note">off 值</span></div>
-            <div class="config-row"><label>interval</label><select id="cfg_ratio"><option value="1">1</option><option value="2" selected>2</option><option value="4">4</option><option value="6">6</option></select><span class="cfg-note">间隔（买卖格号偏移+1）</span></div>
+            <div class="config-row"><label>interval</label><select id="cfg_ratio"><option value="1">1</option><option value="2" selected>2</option><option value="3">3</option><option value="4">4</option><option value="5">5</option><option value="6">6</option></select><span class="cfg-note">间隔（买卖格号偏移+1）</span></div>
             <div class="config-row"><label>grid_up</label><input type="number" id="cfg_up" step="1"><span class="cfg-note">锚点上方行数</span></div>
             <div class="config-row"><label>grid_down</label><input type="number" id="cfg_down" step="1"><span class="cfg-note">锚点下方行数</span></div>
             <div class="config-row"><label>hit_tolerance</label><input type="number" id="cfg_tol" step="0.001"><span class="cfg-note">成交命中容差</span></div>

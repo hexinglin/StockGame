@@ -264,15 +264,27 @@ body {
 }
 .level5-title { font-size: 12px; color: var(--text2); margin-bottom: 8px; display: flex; align-items: center; gap: 6px; }
 .mock-tag { background: rgba(230,162,60,.15); color: var(--warn); font-size: 10px; padding: 1px 6px; border-radius: 8px; }
+/* 十档盘口：两列并列（左卖右买），列内自上而下由远及近 */
+.level5-rows { display: grid; grid-template-columns: 1fr 1fr; column-gap: 8px; }
+.lv-col { display: flex; flex-direction: column; min-width: 0; }
 .lv-row {
-    display: grid; grid-template-columns: 34px 1fr 1fr; gap: 6px;
-    padding: 3px 6px; border-radius: 4px; cursor: pointer; font-size: 12px;
+    display: grid; grid-template-columns: 24px auto auto 1fr; gap: 3px;
+    align-items: center;
+    padding: 2px 4px; border-radius: 4px; cursor: pointer; font-size: 11px;
     font-variant-numeric: tabular-nums;
 }
 .lv-row:hover { background: rgba(59,110,246,.12); }
+/* 两列并排空间有限：单元格不换行，超出裁剪而非撑破行高 */
+.lv-name, .lv-price, .lv-mine, .lv-vol { white-space: nowrap; overflow: hidden; }
 .lv-name { color: var(--text2); }
 .lv-price { font-weight: 600; }
 .lv-vol { color: var(--text2); text-align: right; }
+/* 我的委托量标记（价格后，单位万股）：无委托时为空占位 */
+.lv-mine {
+    justify-self: start; color: var(--primary); font-weight: 600;
+    font-size: 10px; padding: 0 3px; border-radius: 3px;
+}
+.lv-mine:not(:empty) { background: rgba(59,110,246,.16); }
 
 /* 下单面板 */
 .order-box {
@@ -331,6 +343,12 @@ body {
     border-radius: 0 0 10px 10px; padding: 10px; min-height: 120px;
 }
 .rec-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+/* 记录区工具栏（如委托列表的「隐藏已成」筛选） */
+.rec-toolbar {
+    display: flex; align-items: center; gap: 10px;
+    padding: 2px 2px 10px;
+}
+.rec-toolbar-note { color: var(--text2); font-size: 12px; }
 .rec-table th {
     text-align: left; padding: 8px 10px; color: var(--text2); font-weight: 500;
     border-bottom: 1px solid var(--border); white-space: nowrap;
@@ -422,13 +440,61 @@ body {
 .grid-table td { font-variant-numeric: tabular-nums; }
 .grid-row-active td { background: rgba(59,110,246,.10); }
 .grid-table tr.grid-row-active:hover td { background: rgba(59,110,246,.14); }
+/* 间隔下拉：暗色自绘箭头，尺寸与格号微调控件一致 */
 .grid-interval {
-    min-width: 44px; padding: 2px 6px; font-size: 11px;
-    background: var(--bg2); color: var(--text);
+    min-width: 48px; height: 24px; padding: 0 19px 0 8px; font-size: 11px;
+    background-color: var(--bg2); color: var(--text);
     border: 1px solid var(--border); border-radius: 4px;
-    cursor: pointer;
+    cursor: pointer; font-variant-numeric: tabular-nums;
+    appearance: none; -webkit-appearance: none;
+    background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='8' height='5'%3E%3Cpath d='M0 0l4 5 4-5z' fill='%238b93a7'/%3E%3C/svg%3E");
+    background-repeat: no-repeat; background-position: right 6px center;
 }
-.grid-interval:hover, .grid-interval:focus { border-color: var(--up); outline: none; }
+.grid-interval:hover:not(:disabled), .grid-interval:focus { border-color: var(--primary); outline: none; }
+.grid-interval:disabled { opacity: .45; cursor: not-allowed; }
+.grid-interval option { background: var(--panel); color: var(--text); }
+/* 网格号微调：数字 + 自绘上下箭头（原生 spinner 为浅色方块，与暗色主题不搭） */
+.grid-idx-box {
+    display: inline-flex; align-items: stretch; height: 24px;
+    background: var(--bg2); border: 1px solid var(--border); border-radius: 5px;
+    overflow: hidden;
+}
+.grid-idx-box:hover, .grid-idx-box:focus-within { border-color: var(--primary); }
+.grid-idx {
+    width: 42px; padding: 0 6px; font-size: 11px; text-align: right;
+    background: transparent; color: var(--text); border: none; outline: none;
+    font-variant-numeric: tabular-nums;
+    appearance: textfield; -moz-appearance: textfield;
+}
+.grid-idx::-webkit-outer-spin-button,
+.grid-idx::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+.grid-idx:disabled { opacity: .55; cursor: not-allowed; }
+/* 该行已有未成交委托：整组控件一起压暗，锁定状态一眼可辨 */
+.grid-idx-box:has(input:disabled) { opacity: .45; }
+.grid-idx-box:has(input:disabled):hover { border-color: var(--border); }
+.grid-idx-btns { display: flex; flex-direction: column; border-left: 1px solid var(--border); }
+.gi-btn {
+    flex: 1; width: 17px; padding: 0; border: none; cursor: pointer;
+    background: rgba(255, 255, 255, .05); color: var(--text2);
+    font-size: 8px; line-height: 1;
+}
+.gi-btn:first-child { border-bottom: 1px solid var(--border); }
+.gi-btn:hover:not(:disabled) { background: var(--primary); color: #fff; }
+.gi-btn:disabled { opacity: .4; cursor: not-allowed; }
+/* 网格行一键下单按钮：up=买（出场腿买回）、down=卖（出场腿卖出），挂单后置灰 */
+.grid-order-btn {
+    min-width: 30px; padding: 2px 8px; font-size: 11px;
+    border: 1px solid; border-radius: 4px; background: transparent;
+    cursor: pointer; font-weight: 600;
+}
+.grid-order-btn.up { color: var(--up); border-color: var(--up); }
+.grid-order-btn.up:hover:not(:disabled) { background: var(--up); color: #fff; }
+.grid-order-btn.down { color: var(--down); border-color: var(--down); }
+.grid-order-btn.down:hover:not(:disabled) { background: var(--down); color: #fff; }
+.grid-order-btn:disabled {
+    border-color: var(--border); color: var(--text-dim, #888);
+    background: var(--bg2); cursor: not-allowed; opacity: .55;
+}
 
 /* ── 配置浮层 ── */
 .config-panel {

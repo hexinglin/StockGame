@@ -153,6 +153,7 @@ CREATE TABLE IF NOT EXISTS game_orders (
   code VARCHAR(20), direction VARCHAR(10),   -- buy/sell
   order_type VARCHAR(10) DEFAULT 'limit',    -- limit/market
   price REAL, shares INT,
+  grid_idx INT,                  -- 网格行主格号（网格一键下单关联网格行；普通下单为空）
   frozen_amount REAL DEFAULT 0,   -- 下单冻结金额（买单，含手续费）
   status VARCHAR(20) DEFAULT 'pending',
   filled_shares INT DEFAULT 0, filled_price REAL DEFAULT 0,
@@ -161,6 +162,8 @@ CREATE TABLE IF NOT EXISTS game_orders (
   filled_at TIMESTAMP,           -- 成交时间（游戏时间：行情 time_key）
   reject_reason TEXT DEFAULT ''
 );
+-- 存量库补列（幂等；全新建库由上方 CREATE 直接包含）
+ALTER TABLE game_orders ADD COLUMN IF NOT EXISTS grid_idx INT;
 CREATE INDEX IF NOT EXISTS ix_game_orders_round_id ON game_orders (round_id);
 CREATE INDEX IF NOT EXISTS ix_game_orders_status ON game_orders (status);
 

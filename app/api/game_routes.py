@@ -236,6 +236,42 @@ def put_grid_interval(round_id):
     return _ok(imap, "间隔已保存")
 
 
+@game_bp.route("/rounds/<int:round_id>/grid/idx", methods=["PUT"])
+def put_grid_idx(round_id):
+    """保存某行网格号（人工微调行位置，价格随格号同步；成交价不变）
+
+    body: {idx: 行稳定标识 key_idx, new_idx: 新格号}
+    有未成交委托的行不可调整（委托价挂在原网格线上，移动行会使其脱节）。
+    """
+    body = request.get_json(silent=True) or {}
+    idx = body.get("idx")
+    new_idx = body.get("new_idx")
+    if not isinstance(idx, (int, float)) or not isinstance(new_idx, (int, float)):
+        return _err("idx/new_idx 缺失或非法", 400)
+    ok, msg, imap = get_engine().save_grid_idx(round_id, int(idx), int(new_idx))
+    if not ok:
+        return _err(msg)
+    return _ok(imap, "格号已保存")
+
+
+@game_bp.route("/rounds/<int:round_id>/grid/order", methods=["POST"])
+def place_grid_order(round_id):
+    """网格行一键下单 {idx}：按行出场腿自动构造限价委托
+
+    已购行挂卖点价卖出、已售行挂买点价买回（方向/价格/数量由网格行推导）；
+    委托记 grid_idx 关联行，该行已有未成交委托时拒绝（前端按钮置灰），
+    撤单（未成交）后恢复可下单。
+    """
+    body = request.get_json(silent=True) or {}
+    idx = body.get("idx")
+    if not isinstance(idx, (int, float)):
+        return _err("idx 缺失或非法", 400)
+    ok, order, msg = get_engine().place_grid_order(round_id, int(idx))
+    if not ok:
+        return _err(msg)
+    return _ok(order, "委托成功")
+
+
 # ── 网格配置 ──
 
 @game_bp.route("/config/grid", methods=["GET"])
@@ -257,12 +293,17 @@ def put_grid_config():
 
 @game_bp.route("/rounds/<int:round_id>/ticks", methods=["GET"])
 def ticks(round_id):
-    """分时图恢复数据（该日全部快照的轻量字段，按轮次数据源读表）
+    """分时图恢复数据（该日快照的轻量字段，按轮次数据源读表）
 
     快照口径：tick 表存当日累计量额（单调不减），对外转为与上一条快照的
     差分（首条=原值）供前端分钟聚合/均价线累加；high/low 为快照滚动极值、
     close 为最新价，原样透传（今高/今低逐点刷新、价格分钟定型）；open（今开）
     由 game_days 当日常量填充（缺失以首条 close 兑底，与引擎同口径）。
+
+    只下发「已播出」区间（<= last_time_key）：未推进到的快照属未来信息，
+    与游戏「到点才可见」的口径一致，不在客户端提前暴露。全天可播条数另以
+    total 返回，供前端计算进度分母（差值须先按全天序列算好再截断，否则
+    首条差值会被算成当日累计原值）。
     """
     from ..dbdata.models import TickData, TickDataSim
     from ..engine.game_engine import _SESSION_DAY_END
@@ -278,15 +319,19 @@ def ticks(round_id):
             .filter(m.code == r.code, m.trade_date == r.trade_date,
                     m.time_key <= day_end)
             .order_by(m.time_key).all())
-    tail = request.args.get("tail", type=int, default=0)
-    data = []
+    # 全天差分序列：先算好再截断（截断必须发生在差分之后）
+    full = []
     prev_v = prev_a = 0
     for tk, h, l, c, v, a in rows:
         v = v or 0
         a = a or 0
-        data.append({"time_key": tk, "high": h, "low": l, "close": c,
+        full.append({"time_key": tk, "high": h, "low": l, "close": c,
                      "volume": max(0, v - prev_v), "amount": max(0, a - prev_a)})
         prev_v, prev_a = v, a
+    total = len(full)
+    cutoff = r.last_time_key or ""
+    data = [t for t in full if t["time_key"] <= cutoff] if cutoff else []
+    tail = request.args.get("tail", type=int, default=0)
     # 当日常量填充（昨收 + 今开，与引擎 _load_context 同口径）：两值由
     # game_days 天维度真实行情维护（入库时清洗 + stock_kline/首条 close 兑底），
     # 此处按记录值统一回填，保证前端恢复与实时推送一致且恒可解析
@@ -295,4 +340,5 @@ def ticks(round_id):
     if tail and tail > 0:
         data = data[-tail:]
     return _ok({"trade_date": r.trade_date, "code": r.code,
-                "data_source": r.data_source or "qmt", "ticks": data})
+                "data_source": r.data_source or "qmt",
+                "total": total, "ticks": data})

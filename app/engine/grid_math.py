@@ -5,7 +5,7 @@
     网格模型（每行 = 一个买点 + 一个卖点）:
       - 买点线: buy(idx) = idx × grid_spacing + init_value      （一元一次直线，idx 为买格号）
       - 卖点线: sell(sell_idx) = sell_idx × grid_spacing + init_value + offset   （sell_idx 为卖格号）
-      - 间隔（interval，下拉 1/2/4/6，默认 2）决定买卖格号的偏移：off_grid = interval - 1。
+      - 间隔（interval，下拉 1-6，默认 2）决定买卖格号的偏移：off_grid = interval - 1。
           买入方向行: 主格号=买格号，卖格号 = 买格号 + off_grid
           卖出方向行: 主格号=卖格号，买格号 = 卖格号 - off_grid
       - 方向（锚点分侧）: 主格号 < 锚点格号 → 买入（先买后卖）；> 锚点格号 → 卖出（先卖后买）。
@@ -35,7 +35,7 @@ DEFAULT_GRID_PARAMS = {
     "grid_spacing": 0.005,      # 网格间隔（绝对价格）
     "init_value": 0.003,        # 买点线初始值（x=0 时买点价）
     "offset": 0.001,            # off 值（卖点线偏移）
-    "interval": 2,              # 间隔（下拉 1/2/4/6）：买卖格号偏移 = interval - 1
+    "interval": 2,              # 间隔（下拉 1-6）：买卖格号偏移 = interval - 1
     "grid_up": 8,               # 锚点上方网格行数
     "grid_down": 8,             # 锚点下方网格行数
     "hit_tolerance": 0.001,     # 成交触发命中容差（绝对价格 ±）
@@ -45,7 +45,7 @@ _GRID_EPS = 1e-9   # 消除二进制浮点误差
 
 
 def normalize_params(raw: dict) -> dict:
-    """合并配置到默认网格参数（过滤无效键，缺失/异常值用默认）"""
+    """合并配置到默认网格参数（过滤无效键，缺失/异常值用默认；interval 收敛 1-6）"""
     p = dict(DEFAULT_GRID_PARAMS)
     if not raw:
         return p
@@ -53,6 +53,8 @@ def normalize_params(raw: dict) -> dict:
         v = raw.get(k)
         if isinstance(v, (int, float)) and not isinstance(v, bool) and v >= 0:
             p[k] = float(v) if k not in ("grid_up", "grid_down", "interval") else int(v)
+    # 间隔合法域与前端下拉一致：1-6（买卖格号偏移 = interval - 1）
+    p["interval"] = max(1, min(int(p["interval"]), 6))
     return p
 
 
@@ -365,4 +367,41 @@ def derive_gradient_rows(trades: list, params: dict, interval_map: dict = None) 
                 r[side + "_fill_price"] = round(amt / sh, 4)
 
     rows.sort(key=lambda r: r["idx"])
+    return rows
+
+
+def apply_idx_override(rows: list, overrides: dict, params: dict) -> list:
+    """应用行级格号覆盖（人工微调网格行位置）
+
+    按行「原格号」查覆盖的新格号并重算该行主格号/买卖格号与买卖点价。
+    行原格号（写入 rows[*]["key_idx"]）是由成交流水推导出的稳定标识，也是
+    覆盖表的键——连续微调时沿用同一键覆盖，不会因显示格号变化而丢失关联。
+
+    成交价（buy_fill_price / sell_fill_price）不动：那是已发生成交的事实，
+    与行位置调整无关；间隔（interval，决定 off_grid）也不动，故整行平移时
+    买卖格号同步移动、买卖点价同步平移。
+
+    纯函数，不读写 DB/Redis（调用方负责取覆盖表与持久化）。
+    """
+    spacing = float(params["grid_spacing"])
+    init_value = float(params["init_value"])
+    offset = float(params["offset"])
+    for x in rows:
+        x["key_idx"] = x["idx"]         # 稳定标识：所有行级覆盖以此为键
+    for x in rows:
+        try:
+            new_idx = int(overrides.get(str(x["key_idx"])))
+        except (TypeError, ValueError):
+            continue                     # 无覆盖 / 值非法 → 保持原格号
+        if new_idx == x["key_idx"] or new_idx < 0:
+            continue
+        off_grid = max(int(x.get("interval") or 1) - 1, 0)
+        if x["direction"] == "sell":
+            buy_idx, sell_idx = new_idx - off_grid, new_idx
+        else:
+            buy_idx, sell_idx = new_idx, new_idx + off_grid
+        x["idx"] = new_idx
+        x["buy_idx"], x["sell_idx"] = buy_idx, sell_idx
+        x["buy_price"] = buy_grid_price(buy_idx, init_value, spacing)
+        x["sell_price"] = sell_grid_price(sell_idx, init_value, spacing, offset)
     return rows
