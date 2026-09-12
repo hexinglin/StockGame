@@ -634,6 +634,7 @@ function onTrade(t) {
     loadTrades();
     // 账户由随后的 game:account 推送实时刷新，无需再发 HTTP 请求（去冗余）
     refreshGridIfVisible();   // 成交会消/建梯度行
+    refreshAnalysisIfVisible();   // 成交改变配对结果
 }
 
 // 网格表可见时刷新：该表依赖委托状态（行有无挂单决定格号/间隔能否调整），
@@ -641,6 +642,12 @@ function onTrade(t) {
 function refreshGridIfVisible() {
     const box = document.getElementById("gridBox");
     if (box && box.style.display !== "none") loadGrid();
+}
+
+// 配对收益区可见时刷新（即账户 tab 打开时；成交/结算后配对与收益随之变化）
+function refreshAnalysisIfVisible() {
+    const box = document.getElementById("analysisBox");
+    if (box && box.style.display !== "none") loadAnalysis();
 }
 
 function onAccount(acct) {
@@ -693,6 +700,7 @@ const PRE_MARKET_MINUTES = ["竞价", "09:15", "09:25"];
 
 
 let _chartResizeBound = false;
+let _chartRoPending = false;
 function initChart() {
     const el = document.getElementById("minuteChart");
     // 复用已存在实例，避免每次进入游戏重复 init（控制台警告 + 实例泄漏）
@@ -700,6 +708,19 @@ function initChart() {
     // resize 监听仅绑定一次，避免多次进入游戏叠加监听器
     if (!_chartResizeBound) {
         window.addEventListener("resize", () => state.chart && state.chart.resize());
+        // 容器尺寸随布局变化（横屏媒体查询生效、盘口高度变化等）时不会触发窗口
+        // resize，图表会保持旧高度、面板下方留白 → 用 ResizeObserver 跟随容器。
+        // 经 rAF 去抖，避免 ResizeObserver 通知循环告警。
+        if (window.ResizeObserver) {
+            new ResizeObserver(() => {
+                if (_chartRoPending) return;
+                _chartRoPending = true;
+                requestAnimationFrame(() => {
+                    _chartRoPending = false;
+                    if (state.chart) state.chart.resize();
+                });
+            }).observe(el);
+        }
         _chartResizeBound = true;
     }
 }
@@ -955,8 +976,12 @@ function refreshQuoteDisplay(force) {
 }
 
 function updateProgress(pct) {
-    document.getElementById("gProgress").style.width = (pct || 0) + "%";
-    document.getElementById("gProgressText").textContent = (pct || 0) + "%";
+    // 取整到 1 位小数（与后端 game:quote 的 progress 同口径）：进场恢复时进度由
+    // 条数相除得出，未取整会显示成 47.6485891534921% 这类长小数——既不可读，
+    // 又会溢出进度文字框把窄屏文档撑出横向滚动
+    const v = Math.round((Number(pct) || 0) * 10) / 10;
+    document.getElementById("gProgress").style.width = v + "%";
+    document.getElementById("gProgressText").textContent = v + "%";
 }
 
 // ───────────── 十档盘口（模拟，基于实际行情派生；两列 = 左卖右买） ─────────────
@@ -1062,6 +1087,24 @@ function quickPriceByValue(v) {
     recalcEstimate();
 }
 
+// 触屏用价格/数量微调（平板无物理键盘，逐格点按比调出软键盘快）
+function nudgePrice(dir) {
+    const el = document.getElementById("orderPrice");
+    const step = getStep();                       // 最小变动价位 0.001
+    const base = parseFloat(el.value) || state.lastPrice || 0;
+    if (base <= 0) { toast("暂无最新价，无法微调", "warn"); return; }
+    el.value = (base + dir * step).toFixed(3);    // 定 3 位小数，避免浮点尾差
+    recalcEstimate();
+}
+
+function nudgeShares(dir) {
+    const el = document.getElementById("orderShares");
+    const cur = parseInt(el.value, 10);
+    const base = isNaN(cur) ? 0 : cur;
+    el.value = Math.max(1, base + dir);           // 下限 1 万股
+    recalcEstimate();
+}
+
 function recalcEstimate() {
     const price = parseFloat(document.getElementById("orderPrice").value) || 0;
     const shares = toShares(document.getElementById("orderShares").value);   // 万股 → 股
@@ -1141,13 +1184,19 @@ let gridRows = [];
 let gridLastData = null;
 let gridHideDone = false;   // 网格表筛选：隐藏已完成行（仅影响展示）
 function switchRecTab(tab) {
-    document.querySelectorAll(".rec-tab").forEach(b => b.classList.toggle("active", b.dataset.tab === tab));
+    // 限本视图（游戏页）的记录 tab：交易明细是另一视图，其 tab 由 switchTrTab 管理，
+    // 用全局 .rec-tab 选择器会连带清掉那边的 active 高亮
+    document.querySelectorAll("#view-game .rec-tab").forEach(b => b.classList.toggle("active", b.dataset.tab === tab));
     document.getElementById("ordersToolbar").style.display = tab === "orders" ? "" : "none";
     document.getElementById("ordersTable").style.display = tab === "orders" ? "" : "none";
     document.getElementById("tradesTable").style.display = tab === "trades" ? "" : "none";
-    document.getElementById("accountBox").style.display = tab === "account" ? "" : "none";
+    // 账户 tab 含两段：账户卡片 + 配对收益
+    const isAcct = tab === "account";
+    document.getElementById("accountBox").style.display = isAcct ? "" : "none";
+    document.getElementById("analysisBox").style.display = isAcct ? "" : "none";
     document.getElementById("gridBox").style.display = tab === "grid" ? "" : "none";
-    if (tab === "grid") { _lastGridTs = 0; loadGrid(); }   // 切 tab 强制刷新
+    if (tab === "grid") { _lastGridTs = 0; loadGrid(); }        // 切 tab 强制刷新
+    if (isAcct) loadAnalysis();                                 // 配对收益按需拉取
 }
 
 async function loadOrders() {
@@ -1209,6 +1258,79 @@ async function cancelOrder(orderId) {
         loadAccount();
         refreshGridIfVisible();   // 撤单后该行恢复可调整
     } catch (e) { toast(e.message, "error"); }
+}
+
+// ───────────── 配对收益（并入「账户」tab 下半段） ─────────────
+// 配对：同一标的配满 min(买量, 卖量)，卖取最高价、买取最低价逐量对消（余量入
+// 「无法匹配」）。手续费取游戏记录自带值（引擎按模拟费率逐笔计费，与上方账户
+// 卡的累计手续费同源），故与真实记录的「按委托 min 5 元」口径不同。
+async function loadAnalysis() {
+    if (!state.roundId) return;
+    try {
+        const resp = await api(`/api/v1/game/rounds/${state.roundId}/analysis`);
+        renderAnalysis(resp.data || {});
+    } catch (e) { /* 忽略 */ }
+}
+
+function renderAnalysis(d) {
+    const box = document.getElementById("analysisBox");
+    if (!box) return;
+    const s = d.summary || {};
+    const rnd = d.round || {};
+    const netCls = Number(s.net_profit) >= 0 ? "up" : "down";
+    const pnlCls = Number(rnd.realized_pnl) >= 0 ? "up" : "down";
+    const rate = (rnd.return_rate === null || rnd.return_rate === undefined)
+        ? "--" : rnd.return_rate + "%";
+    const pairs = d.pairs || [];
+    const unmatched = d.unmatched || [];
+    const pairRows = pairs.length ? pairs.map(p => `
+        <tr>
+            <td>${p.buy_time || "--"}</td>
+            <td>${fmt(p.buy_price, 3)}</td>
+            <td>${p.sell_time || "--"}</td>
+            <td>${fmt(p.sell_price, 3)}</td>
+            <td>${fmtWan(p.qty)}</td>
+            <td>${fmt(p.gross_profit)}</td>
+            <td>${fmt(p.buy_fee + p.sell_fee)}</td>
+            <td class="${p.net_profit >= 0 ? "up" : "down"}">${fmt(p.net_profit)}</td>
+        </tr>`).join("")
+        : '<tr><td colspan="8" class="empty-cell">暂无配对（需同日一买一卖）</td></tr>';
+    const unRows = unmatched.length ? unmatched.map(u => `
+        <tr>
+            <td>${u.time || "--"}</td>
+            <td class="${dirCls(u.direction)}">${dirText(u.direction)}</td>
+            <td>${fmt(u.price, 3)}</td>
+            <td>${fmtWan(u.volume)}</td>
+            <td>${fmtWan(u.unmatched_volume)}</td>
+            <td class="tr-reason">${u.reason || "--"}</td>
+        </tr>`).join("")
+        : '<tr><td colspan="6" class="empty-cell">全部成交均已配对</td></tr>';
+
+    box.innerHTML = `
+        <h4 class="rc-section rc-section-top">配对收益（最大同日收益口径，与真实交易记录同一套配对规则）</h4>
+        <div class="acct-grid">
+            <div class="acct-item"><span>成交笔数</span><b>${s.count || 0}</b><i>买 ${s.buy_count || 0} / 卖 ${s.sell_count || 0}</i></div>
+            <div class="acct-item"><span>配对</span><b>${s.matched_count || 0} 组</b><i>配对量 ${fmtWan(s.matched_volume)} 万股</i></div>
+            <div class="acct-item"><span>配对毛收益(元)</span><b>${fmt(s.gross_profit)}</b><i>卖出额 − 买入额</i></div>
+            <div class="acct-item"><span>手续费(元)</span><b>${fmt(s.total_fee)}</b><i>已配对 ${fmt(s.matched_fee)} 元</i></div>
+            <div class="acct-item"><span>配对净收益(元)</span><b class="${netCls}">${fmt(s.net_profit)}</b><i>毛收益 − 已配对手续费</i></div>
+            <div class="acct-item"><span>每日收益率</span><b class="${netCls}">${rate}</b><i>净收益 ÷ 期初资产 ${fmtAmtWan(rnd.initial_assets)} 万元</i></div>
+            <div class="acct-item"><span>无法匹配</span><b>${s.unmatched_count || 0} 笔</b><i>留仓买入 / 卖出昨仓</i></div>
+            <div class="acct-item"><span>引擎已实现盈亏(元)</span><b class="${pnlCls}">${fmt(rnd.realized_pnl)}</b><i>持仓成本法口径（供对照）</i></div>
+        </div>
+        <div class="tr-fee-note">配对规则与「交易明细」完全一致：同一标的配满 min(买量, 卖量)，卖取最高价、买取最低价逐量对消（余量列入无法匹配）；
+        手续费取本轮成交记录自带值（引擎按模拟费率逐笔计费，与「账户」tab 累计手续费同源），区别于真实记录的「按委托计一次 max(金额×万分之0.85, 5元)」。
+        「配对净收益」为最大同日收益口径，「引擎已实现盈亏」为持仓成本法口径，两者存在差异属正常。</div>
+        <h4 class="rc-section">配对明细</h4>
+        <table class="rec-table">
+            <thead><tr><th>买入时间</th><th>买入价</th><th>卖出时间</th><th>卖出价</th><th>数量(万股)</th><th>毛收益(元)</th><th>手续费(元)</th><th>净收益(元)</th></tr></thead>
+            <tbody>${pairRows}</tbody>
+        </table>
+        <h4 class="rc-section">无法匹配</h4>
+        <table class="rec-table">
+            <thead><tr><th>时间</th><th>方向</th><th>成交价</th><th>数量(万股)</th><th>未匹配数量(万股)</th><th>原因</th></tr></thead>
+            <tbody>${unRows}</tbody>
+        </table>`;
 }
 
 async function loadTrades() {
@@ -1328,17 +1450,21 @@ function _setRowInterval(r, iv, p) {
     }
 }
 
-// 用指定格号重算某行（整行平移：买卖格号同步移动、买卖点价同步平移，
-// 成交价不动——由 _setRowInterval 按方向重算两侧格号与价格）
-function _setRowIdx(r, nv, p) {
-    r.idx = nv;
-    _setRowInterval(r, r.interval, p);
+// 行可调整性（与后端 save_grid_interval 的校验一致）：
+//   - 有未成交委托 → 整行锁定（委托价挂在当前网格线上，改动会使其脱节）
+//   - 已完成（双腿均已成交）→ 整行锁定（历史既成事实）
+//   - 已成交的进场腿（行方向那一侧）→ 该侧格号锁定，只有未成交的出场腿可调
+function _gridRowLock(r) {
+    if (r.pending_order_id) return { all: true, entry: true, exit: true, why: "该行已有未成交委托，撤单后可调整" };
+    if (r.status === "done") return { all: true, entry: true, exit: true, why: "该行买卖均已成交，不可调整" };
+    return { all: false, entry: true, exit: false };   // entry=已成交侧（锁），exit=可调侧
 }
 
 async function applyGridInterval(i, val) {
     const r = gridRows[i];
     if (!r || !gridLastData) return;
-    if (r.pending_order_id) { renderGrid(); return; }   // 有委托：不可调整（还原显示）
+    const lock = _gridRowLock(r);
+    if (lock.all) { renderGrid(); toast(lock.why, "warn"); return; }
     const p = gridLastData.params || {};
     const nv = parseInt(val, 10);
     if (isNaN(nv)) return;
@@ -1346,10 +1472,10 @@ async function applyGridInterval(i, val) {
     _setRowInterval(r, nv, p);   // 乐观更新即时生效
     renderGrid();
     if (!state.roundId) return;
-    // 随轮次持久化，重进保持一致；以 key_idx（行稳定标识）寻址，行位置微调后仍归属同一行
+    // 随轮次持久化，重进保持一致
     try {
         await api(`/api/v1/game/rounds/${state.roundId}/grid/interval`, "PUT",
-                  { idx: r.key_idx !== undefined ? r.key_idx : r.idx, interval: nv });
+                  { idx: r.idx, interval: nv });
     } catch (e) {
         _setRowInterval(r, old, p);   // 失败回滚
         renderGrid();
@@ -1357,28 +1483,27 @@ async function applyGridInterval(i, val) {
     }
 }
 
-// 格号微调（上/下箭头或直接改值）：整行平移，价格随格号同步；成交价不变
+// 出场腿格号微调：只移动未成交那一侧（买入行→卖出侧、卖出行→买入侧），
+// 已成交侧恒不动。该侧位置与间隔一一对应（off_grid = interval - 1），
+// 故换算成间隔后复用同一条保存/回滚链路与持久化。
 async function applyGridIdx(i, val, side) {
     const r = gridRows[i];
     if (!r || !gridLastData) return;
-    if (r.pending_order_id) { renderGrid(); return; }   // 有委托：不可调整（还原显示）
+    const lock = _gridRowLock(r);
+    if (lock.all) { renderGrid(); toast(lock.why, "warn"); return; }
+    if (side === (r.direction === "sell" ? "sell" : "buy")) {
+        renderGrid();                        // 已成交侧：不可调整，还原显示
+        toast("该侧网格已成交，只有未成交的出场腿可调整", "warn");
+        return;
+    }
     const p = gridLastData.params || {};
     const nv = parseInt(val, 10);
-    const cur = side === "buy" ? r.buy_idx : r.sell_idx;
-    if (isNaN(nv) || nv < 0 || nv === cur) { renderGrid(); return; }   // 非法/未变 → 还原显示
-    const oldIdx = r.idx;
-    const newIdx = oldIdx + (nv - cur);   // 该侧改动量 = 整行位移量
-    _setRowIdx(r, newIdx, p);             // 乐观更新即时生效
-    renderGrid();
-    if (!state.roundId) return;
-    try {
-        await api(`/api/v1/game/rounds/${state.roundId}/grid/idx`, "PUT",
-                  { idx: r.key_idx !== undefined ? r.key_idx : oldIdx, new_idx: newIdx });
-    } catch (e) {
-        _setRowIdx(r, oldIdx, p);         // 失败回滚
-        renderGrid();
-        toast(e.message || "格号保存失败", "error");
-    }
+    if (isNaN(nv)) { renderGrid(); return; }
+    // 出场格号 → 间隔：off_grid = 卖格号 - 买格号（买卖两侧格号差，与方向无关）
+    const off = side === "sell" ? nv - r.buy_idx : r.sell_idx - nv;
+    const iv = Math.min(Math.max(off + 1, 1), 6);            // 与下拉/后端同域 1-6
+    if (iv === r.interval) { renderGrid(); return; }         // 已到边界或未变化
+    await applyGridInterval(i, iv);
 }
 
 // 网格行一键下单：出场腿待成交（已购/已售）的行按行推导委托（已购→挂卖点卖、
@@ -1455,19 +1580,25 @@ function renderGrid() {
         const dirText = (r.direction === "sell") ? "卖出" : "买入";
         const selOpts = [1, 2, 3, 4, 5, 6].map(v =>
             `<option value="${v}" ${v === r.interval ? "selected" : ""}>${v}</option>`).join("");
-        // 有未成交委托 → 该行价格被委托占用，格号/间隔均不可调整（后端同样校验）
-        const locked = !!r.pending_order_id;
-        const lockAttr = locked ? " disabled" : "";
-        const lockTitle = locked ? "该行已有未成交委托，撤单后可调整" : "";
-        const lockTitleAttr = locked ? ` title="${lockTitle}"` : "";
+        // 可调整性：已成交的进场腿格号锁定（历史既成事实），只有未成交的出场腿
+        // 可微调；有未成交委托或已完成的整行锁定（与后端校验一致）
+        const lock = _gridRowLock(r);
+        const lockTitleAttr = lock.all ? ` title="${lock.why}"` : "";
         // 格号微调控件：数字 + 自绘上下箭头（原生 spinner 为浅色方块，与暗色主题不搭）
-        const stepper = (side, val) => `<div class="grid-idx-box"${locked ? lockTitleAttr : ' title="上下微调格号：买卖点价随格号同步，成交价不变"'}>
-            <input type="number" class="grid-idx" value="${val}"${lockAttr} onchange="applyGridIdx(${i}, this.value, '${side}')">
+        const entrySide = (r.direction === "sell") ? "sell" : "buy";   // 已成交的进场腿
+        const stepper = (side, val) => {
+            const dis = lock.all || side === entrySide;
+            const why = lock.all ? lock.why : "该侧网格已成交，不可调整（只能调未成交的出场腿）";
+            const attr = dis ? ` disabled title="${why}"` : ` title="微调出场腿格号：卖点价随格号同步，成交价不变"`;
+            return `<div class="grid-idx-box"${attr}>
+            <input type="number" class="grid-idx" value="${val}"${attr} onchange="applyGridIdx(${i}, this.value, '${side}')">
             <span class="grid-idx-btns">
-                <button type="button" class="gi-btn"${lockAttr}${lockTitleAttr} onclick="applyGridIdx(${i}, ${val + 1}, '${side}')">▲</button>
-                <button type="button" class="gi-btn"${lockAttr}${lockTitleAttr} onclick="applyGridIdx(${i}, ${Math.max(val - 1, 0)}, '${side}')">▼</button>
+                <button type="button" class="gi-btn"${attr} onclick="applyGridIdx(${i}, ${val + 1}, '${side}')">▲</button>
+                <button type="button" class="gi-btn"${attr} onclick="applyGridIdx(${i}, ${Math.max(val - 1, 0)}, '${side}')">▼</button>
             </span>
         </div>`;
+        };
+        const lockAttr = lock.all ? " disabled" : "";
         // 一键下单：出场腿待成交（已购/已售）可下，按钮随出场腿方向显示 买/卖；
         // 该行已有未成交委托 → 置灰（title 提示），撤单后恢复
         const sellSide = r.direction === "buy";   // 出场腿：已购行卖、已售行买

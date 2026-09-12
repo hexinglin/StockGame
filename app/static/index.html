@@ -140,11 +140,19 @@
                 <div class="order-row">
                     <div class="order-field">
                         <label>委托价格</label>
-                        <input type="number" id="orderPrice" step="0.001" min="0" oninput="recalcEstimate()">
+                        <div class="num-stepper">
+                            <button type="button" class="ns-btn" onclick="nudgePrice(-1)" title="降一个最小变动价位">−</button>
+                            <input type="number" id="orderPrice" step="0.001" min="0" oninput="recalcEstimate()">
+                            <button type="button" class="ns-btn" onclick="nudgePrice(1)" title="升一个最小变动价位">+</button>
+                        </div>
                     </div>
                     <div class="order-field">
                         <label>委托数量(万股)</label>
-                        <input type="number" id="orderShares" step="1" min="0" value="1" oninput="recalcEstimate()">
+                        <div class="num-stepper">
+                            <button type="button" class="ns-btn" onclick="nudgeShares(-1)" title="减 1 万股">−</button>
+                            <input type="number" id="orderShares" step="1" min="0" value="1" oninput="recalcEstimate()">
+                            <button type="button" class="ns-btn" onclick="nudgeShares(1)" title="加 1 万股">+</button>
+                        </div>
                     </div>
                 </div>
                 <div class="estimate-row">
@@ -178,7 +186,9 @@
                 <thead><tr><th>成交时间</th><th>方向</th><th>价格</th><th>数量(万股)</th><th>手续费(元)</th></tr></thead>
                 <tbody></tbody>
             </table>
+            <!-- 账户 tab = 账户卡片 + 配对收益（同一 tab 内上下两段） -->
             <div id="accountBox" style="display:none"></div>
+            <div id="analysisBox" style="display:none"></div>
             <div id="gridBox"></div>
         </div>
     </div>

@@ -10,6 +10,8 @@
           卖出方向行: 主格号=卖格号，买格号 = 卖格号 - off_grid
       - 方向（锚点分侧）: 主格号 < 锚点格号 → 买入（先买后卖）；> 锚点格号 → 卖出（先卖后买）。
       - 调整间隔时: 买入行重算其卖出侧（卖格号+卖点）；卖出行重算其买入侧（买格号+买点）。
+          即：可调整的恒是**尚未成交的出场腿**，已成交的进场腿（行方向对应的那一侧）
+          格号不动——这是人工微调的合法边界，故间隔（interval）就是微调出口位置的手段。
       - 锚点: 以昨收（last_close）为基准，定位其最近网格索引，向上下各展开 grid_up / grid_down 行。
       - 持仓合理化: 当前总持仓总量均分到每个网格行（向下取整到 100 股整数倍）。
 
@@ -369,39 +371,3 @@ def derive_gradient_rows(trades: list, params: dict, interval_map: dict = None) 
     rows.sort(key=lambda r: r["idx"])
     return rows
 
-
-def apply_idx_override(rows: list, overrides: dict, params: dict) -> list:
-    """应用行级格号覆盖（人工微调网格行位置）
-
-    按行「原格号」查覆盖的新格号并重算该行主格号/买卖格号与买卖点价。
-    行原格号（写入 rows[*]["key_idx"]）是由成交流水推导出的稳定标识，也是
-    覆盖表的键——连续微调时沿用同一键覆盖，不会因显示格号变化而丢失关联。
-
-    成交价（buy_fill_price / sell_fill_price）不动：那是已发生成交的事实，
-    与行位置调整无关；间隔（interval，决定 off_grid）也不动，故整行平移时
-    买卖格号同步移动、买卖点价同步平移。
-
-    纯函数，不读写 DB/Redis（调用方负责取覆盖表与持久化）。
-    """
-    spacing = float(params["grid_spacing"])
-    init_value = float(params["init_value"])
-    offset = float(params["offset"])
-    for x in rows:
-        x["key_idx"] = x["idx"]         # 稳定标识：所有行级覆盖以此为键
-    for x in rows:
-        try:
-            new_idx = int(overrides.get(str(x["key_idx"])))
-        except (TypeError, ValueError):
-            continue                     # 无覆盖 / 值非法 → 保持原格号
-        if new_idx == x["key_idx"] or new_idx < 0:
-            continue
-        off_grid = max(int(x.get("interval") or 1) - 1, 0)
-        if x["direction"] == "sell":
-            buy_idx, sell_idx = new_idx - off_grid, new_idx
-        else:
-            buy_idx, sell_idx = new_idx, new_idx + off_grid
-        x["idx"] = new_idx
-        x["buy_idx"], x["sell_idx"] = buy_idx, sell_idx
-        x["buy_price"] = buy_grid_price(buy_idx, init_value, spacing)
-        x["sell_price"] = sell_grid_price(sell_idx, init_value, spacing, offset)
-    return rows

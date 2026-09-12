@@ -24,9 +24,9 @@ from ..messaging.cache import get_cache
 from ..utils.config import Config
 from ..utils.timeutil import now_cn
 from .account import MockAccount
+from .trade_analysis import analyze_game_trades
 from . import day_meta, matching, serializers
-from .grid_math import (normalize_params, derive_gradient_rows,
-                        apply_idx_override)
+from .grid_math import normalize_params, derive_gradient_rows
 
 logger = logging.getLogger(__name__)
 
@@ -156,39 +156,30 @@ class GameEngine:
         get_cache().save_config("grid", norm)
         return norm
 
-    def save_grid_interval(self, round_id: int, idx: int, interval: int) -> dict:
-        """保存某轮次某行的行级间隔（写 Redis，随轮次持久化），返回该轮次全部间隔映射
+    @_ensure_ctx
+    def save_grid_interval(self, round_id: int, idx: int, interval: int) -> (bool, str, dict):
+        """保存某轮次某行的行级间隔，返回 (ok, msg, 间隔映射)
 
-        idx 为行稳定标识（key_idx，非显示格号），故行位置微调后间隔仍归属同一行。
+        间隔是人工微调「未成交出场腿」位置的手段：它只重算非主格号那侧（买入方向
+        行重算卖出侧、卖出方向行重算买入侧），已成交的进场腿格号恒不动，故无需额外
+        保护。以下两种行则整行不可调整，与前端置灰一致：
+          - 该行已有未成交委托：委托价挂在当前网格线上，改动会使其脱节
+          - 该行已完成（双腿均已成交）：历史既成事实
         """
+        grid = self.get_grid(round_id)
+        if grid is None:
+            return False, "轮次不存在", {}
+        row = next((x for x in grid["rows"] if x["idx"] == int(idx)), None)
+        if row is None:
+            return False, f"网格行 {idx} 不存在", {}
+        if row.get("pending_order_id"):
+            return False, "该行已有未成交委托，请先撤单再调整", {}
+        if row.get("status") == "done":
+            return False, "该行已完成（买卖均已成交），不可调整", {}
         ns = f"grid_int:{round_id}"
         imap = dict(get_cache().load_config(ns) or {})
         # 间隔合法域与前端下拉一致：1-6
         imap[str(int(idx))] = min(max(int(interval), 1), 6)
-        get_cache().save_config(ns, imap)
-        return imap
-
-    @_ensure_ctx
-    def save_grid_idx(self, round_id: int, key_idx: int, new_idx: int) -> (bool, str, dict):
-        """保存某轮次某行的格号覆盖（人工微调行位置），返回 (ok, msg, 覆盖映射)
-
-        key_idx 为行稳定标识（由成交流水推导出的原格号）：连续微调沿用同一键，
-        不会因显示格号变化而丢失关联。该行已有未成交委托时拒绝——委托价挂在
-        调整前的网格线上，移动行会让委托与实际价位脱节（前端同时置灰输入框）。
-        """
-        if int(new_idx) < 0:
-            return False, "格号不能为负", {}
-        grid = self.get_grid(round_id)
-        if grid is None:
-            return False, "轮次不存在", {}
-        row = next((x for x in grid["rows"] if x.get("key_idx") == int(key_idx)), None)
-        if row is None:
-            return False, f"网格行 {key_idx} 不存在", {}
-        if row.get("pending_order_id"):
-            return False, "该行已有未成交委托，请先撤单再调整", {}
-        ns = f"grid_idx:{round_id}"
-        imap = dict(get_cache().load_config(ns) or {})
-        imap[str(int(key_idx))] = int(new_idx)
         get_cache().save_config(ns, imap)
         return True, "", imap
 
@@ -391,10 +382,6 @@ class GameEngine:
         volume = int(acct.volume) if acct else int(r.base_shares or 0)
         interval_map = get_cache().load_config(f"grid_int:{round_id}") or {}
         rows = derive_gradient_rows(self.list_trades(round_id), params, interval_map)
-        # 行级格号覆盖（人工微调行位置）：在推导之后应用，只改显示格号与买卖点价，
-        # 成交价与间隔不动（见 grid_math.apply_idx_override）
-        rows = apply_idx_override(
-            rows, get_cache().load_config(f"grid_idx:{round_id}") or {}, params)
         # 行 ↔ 未成交委托关联（一键下单记 grid_idx）：已挂单的行前端按钮置灰，
         # 委托撤单/成交/拒单后脱离 pending，行自动恢复可下单。
         # 匹配键 (grid_idx, 出场方向)：同格号可同时存在买卖两行，方向区分归属。
@@ -893,6 +880,43 @@ class GameEngine:
         rows = (GameTrade.query.filter_by(round_id=round_id)
                 .order_by(GameTrade.id.desc()).all())
         return [serializers.trade_to_dict(t) for t in rows]
+
+    @_ensure_ctx
+    def analyze_round(self, round_id: int) -> dict:
+        """轮次成交的「同日最大收益配对」收益分析（与真实交易记录同一套配对规则）
+
+        配对规则完全复用真实记录分析（卖取最高价、买取最低价逐量对消，配满
+        min(买量, 卖量)，余量列入无法匹配）；差别仅在手续费口径——游戏由引擎按
+        模拟费率逐笔计费并落库，故直接取记录值，而非真实券商的「按委托 min 5 元」。
+
+        返回配对结果外附轮次口径对照（引擎已实现盈亏/手续费合计/期初资产）与
+        每日收益率，便于玩家比对「最大收益配对」与「持仓成本法」两种口径差异。
+        """
+        r = GameRound.query.get(round_id)
+        if not r:
+            return None
+        records = [{
+            "time": t["trade_time"], "code": t["code"], "direction": t["direction"],
+            "price": t["price"], "volume": t["shares"],
+            "amount": round((t["price"] or 0) * (t["shares"] or 0), 2),
+            "fee": t["fee"], "order_id": t["order_id"], "trade_id": str(t["id"]),
+        } for t in self.list_trades(round_id)]
+        out = analyze_game_trades(records)
+        init_assets = float(r.initial_assets or 0)
+        net = out["summary"]["net_profit"]
+        out["round"] = {
+            "round_id": round_id,
+            "trade_date": r.trade_date,
+            "code": r.code,
+            "status": r.status,
+            "initial_assets": round(init_assets, 2),
+            "realized_pnl": round(r.realized_pnl or 0, 2),   # 引擎口径（持仓成本法）
+            "fee_total": round(r.fee_total or 0, 2),
+            # 每日收益率：配对净收益 ÷ 期初资产（期初缺失时不计算）
+            "return_rate": round(net / init_assets * 100, 4) if init_assets > 0 else None,
+            "last_time_key": r.last_time_key or "",
+        }
+        return out
 
     # ── 时钟推进 ──
 

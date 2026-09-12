@@ -204,7 +204,8 @@ body {
     background: linear-gradient(90deg, var(--primary), #7ea0ff);
     transition: width .3s;
 }
-.progress-text { font-size: 11px; color: var(--text2); width: 42px; text-align: right; }
+/* 固定宽度会让超长文本溢出并撑宽文档，改为下限 + 不换行 */
+.progress-text { font-size: 11px; color: var(--text2); min-width: 42px; text-align: right; white-space: nowrap; }
 
 .speed-wrap { display: flex; align-items: center; gap: 5px; }
 .speed-label { font-size: 12px; color: var(--text2); }
@@ -306,6 +307,24 @@ body {
     color: var(--text); outline: none; font-variant-numeric: tabular-nums;
 }
 .order-field input:focus { border-color: var(--primary); }
+/* 价格/数量微调：− 输入 + （触屏可直接点按，不必调出软键盘）。
+   用网格的 minmax(0,1fr) 约束中列：number 输入自带固有宽度，flex + min-width:0
+   仍会把它撑成 200px+（实测两个字段各 287px 互相溢出、价格被截断），
+   网格轨道可以真正压到 0。 */
+.num-stepper { display: grid; grid-template-columns: 32px minmax(0, 1fr) 32px; }
+.num-stepper input {
+    width: 100%; min-width: 0;
+    border-radius: 0; text-align: center; padding-left: 4px; padding-right: 4px;
+}
+.num-stepper .ns-btn {
+    cursor: pointer;
+    background: var(--panel2); color: var(--text2);
+    border: 1px solid var(--border); font-size: 15px; font-weight: 700;
+    line-height: 1;
+}
+.num-stepper .ns-btn:first-child { border-right: none; border-radius: 6px 0 0 6px; }
+.num-stepper .ns-btn:last-child { border-left: none; border-radius: 0 6px 6px 0; }
+.num-stepper .ns-btn:hover { background: var(--primary); color: #fff; border-color: var(--primary); }
 .order-field input:disabled { opacity: .5; }
 .quick-btns { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 6px; }
 .quick-btns button {
@@ -349,6 +368,13 @@ body {
     padding: 2px 2px 10px;
 }
 .rec-toolbar-note { color: var(--text2); font-size: 12px; }
+/* 区块小标题（账户 tab 下半段的配对收益 / 其内「配对明细 · 无法匹配」分段） */
+.rc-section {
+    font-size: 12px; font-weight: 600; color: var(--text2);
+    margin: 14px 0 6px; padding-left: 8px; border-left: 3px solid var(--primary);
+}
+/* 与上方账户卡片分段：加分隔线，避免两段视觉粘连 */
+.rc-section-top { margin-top: 20px; padding-top: 14px; border-top: 1px solid var(--border); }
 .rec-table th {
     text-align: left; padding: 8px 10px; color: var(--text2); font-weight: 500;
     border-bottom: 1px solid var(--border); white-space: nowrap;
@@ -648,4 +674,103 @@ body {
 @media (max-width: 1100px) {
     .game-layout { grid-template-columns: 1fr; }
     .rounds-layout { grid-template-columns: 1fr; }
+}
+
+/* ══════════════ 平板 / 触屏兼容 ══════════════
+   目标设备：小米平板 4 Plus（10.1" 1920×1200）。安卓 Chrome 下 CSS 视口宽度
+   随系统 density 落在 ~1280×800（240dpi）或 ~960×600（320dpi），竖屏则为
+   800×1280 / 600×960。故分两类条件适配，桌面端（精确指针 + 宽视口）不受影响：
+     · pointer: coarse → 触屏专属：放大点按目标、去掉点按高亮、图表不吞滚动手势
+     · 宽度/高度断点   → 覆盖横竖屏与不同 density
+   ═══════════════════════════════════════════ */
+
+/* ── 触屏：点按目标放大与手势 ── */
+@media (pointer: coarse) {
+    button, select, input, .rec-tab, .lv-row, .grid-order-btn { -webkit-tap-highlight-color: transparent; }
+    /* 表格内微调控件：细指针下 24px 够用；触屏按手指尺寸加大（箭头各 24×18） */
+    .grid-idx-box, .grid-interval { height: 36px; }
+    .grid-idx { width: 54px; font-size: 13px; }
+    .gi-btn { width: 24px; font-size: 11px; }
+    .grid-order-btn { min-width: 40px; padding: 9px 14px; font-size: 13px; }
+    .speed-btn { padding: 8px 12px; }
+    .rec-tab { padding: 12px 18px; }
+    .btn-sm { padding: 8px 13px; font-size: 12px; }
+    .btn-pause, .btn-finish, .btn-back { padding: 9px 16px; }
+    .order-submit { padding: 14px; font-size: 15px; }
+    .order-tab { padding: 11px; }
+    .lv-row { padding: 4px 4px; }            /* 盘口行加高一档，避免误触相邻档位 */
+    /* 分时图：纵向手势交还页面滚动，否则手指在图上滑无法翻页 */
+    .minute-chart { touch-action: pan-y; }
+}
+
+/* ── 矮视口（平板横屏 1280×800 等）：压缩图表，让下方记录区可达 ── */
+@media (max-height: 880px) {
+    .chart-panel { min-height: 400px; }
+    .minute-chart { min-height: 300px; }
+}
+
+/* ── ≤1100px（平板竖屏 800×1280 / 600×960 及 320dpi 横屏）：单列 + 收紧间距 ── */
+@media (max-width: 1100px) {
+    #top-bar, #game-top-bar { gap: 10px; padding-left: 12px; padding-right: 12px; }
+    /* 顶栏整体可换行，但单行内元素默认 min-width:auto 不会收窄：标题允许
+       收窄并内部换行，避免整行宽于容器把文档撑出横向滚动（竖屏 800 宽实测
+       超出 55px）。比让标题独占一行更省纵向空间（后者顶栏高 141px）。 */
+    .game-title { min-width: 0; flex-wrap: wrap; row-gap: 4px; }
+    .progress-wrap { min-width: 120px; }
+    #top-bar h1 { font-size: 17px; }
+    #top-bar h1 .sub { display: none; }        /* 窄屏省去副标题，避免挤占右侧按钮 */
+    .rounds-layout, .game-layout { padding-left: 12px; padding-right: 12px; }
+    .records-panel { padding-left: 12px; padding-right: 12px; }
+    /* 宽表在窄屏横向滚动，而不是把列压扁（网格表 12 列） */
+    .records-body { overflow-x: auto; }
+    .rec-table { min-width: 640px; }
+    .grid-table { min-width: 880px; }
+}
+
+/* ── 横屏平板（主要使用姿态）：横向空间充足 → 图表与盘口并排、顶栏压一行 ──
+   960×600 这类矮横屏若沿用上面的单列堆叠，图表会独占整屏（实测 440px 高），
+   盘口被挤出屏幕、网格表完全看不到；横向空间却空着。故横屏且宽度足够时回到
+   两列，并把图表压低，让下方记录区露出。 */
+@media (orientation: landscape) and (min-width: 900px) {
+    .game-layout { grid-template-columns: 1fr 310px; gap: 12px; }
+    .chart-panel { min-height: 300px; }
+    .minute-chart { min-height: 240px; }
+    /* 顶栏压成一行：flex 换行优先于收缩，故必须让各行「固有宽度之和」放得下
+       （否则末尾按钮整块掉到第二行，960 宽实测顶栏高 97px 且排版难看）。
+       只收横向占用，纵向内边距不动（保持触屏点按高度） */
+    #game-top-bar { gap: 8px; }
+    .speed-label { display: none; }            /* 1x/5x/10x/60x 自解释 */
+    .progress-wrap { min-width: 80px; max-width: 170px; }
+    .g-time { font-size: 15px; letter-spacing: 0; }
+    .speed-btn, .btn-pause, .btn-finish, .btn-back { padding-left: 10px; padding-right: 10px; }
+    .btn-help { display: none; }               /* 触屏无物理键盘，快捷键说明无意义 */
+    .order-tip { display: none; }
+}
+
+/* 窄横屏 + 触屏：按钮加大后一行更紧，隐藏数据源角标（横屏窄屏下取舍，
+   实时源在轮次列表/记录区仍可见）以保住顶栏单行 */
+@media (orientation: landscape) and (min-width: 900px) and (max-width: 1100px) {
+    #gSource { display: none; }
+}
+
+/* 矮横屏（960×600 等）：图表再压一档，让网格表更早露出来 */
+@media (orientation: landscape) and (max-height: 700px) {
+    .chart-panel { min-height: 260px; }
+    .minute-chart { min-height: 200px; }
+    .big-price { font-size: 28px; }
+    .chart-head { margin-bottom: 4px; }
+}
+
+/* ── ≤760px（大屏手机 / 平板小窗）：浮层与卡片自适应 ── */
+@media (max-width: 760px) {
+    /* 浮层原为固定 min-width（最大 640px），窄屏会溢出，改为视口比例约束 */
+    .help-panel, .config-panel, .latest-panel, .agent-panel {
+        min-width: 0; width: 92vw; max-width: 92vw; padding: 18px 16px;
+    }
+    .latest-grid { grid-template-columns: repeat(2, 1fr); }
+    .config-row { grid-template-columns: 92px 1fr; }
+    .config-row .cfg-note { grid-column: 2; }   /* 说明文字换到输入框下方 */
+    .acct-grid { grid-template-columns: repeat(auto-fill, minmax(132px, 1fr)); }
+    .big-price { font-size: 28px; }
+    .chart-head { gap: 12px; }
 }

@@ -141,8 +141,6 @@ def grid_row_to_dict(x: dict) -> dict:
     """网格梯度行 → 前端「网格表」渲染字典"""
     return {
         "idx": x["idx"],
-        # 行稳定标识（成交流水推导出的原格号）：前端以它寻址行级覆盖
-        "key_idx": x.get("key_idx", x["idx"]),
         "direction": x["direction"],
         "buy_idx": x["buy_idx"],
         "sell_idx": x["sell_idx"],

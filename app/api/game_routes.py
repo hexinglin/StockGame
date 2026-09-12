@@ -202,6 +202,19 @@ def trades(round_id):
     return _ok(get_engine().list_trades(round_id))
 
 
+@game_bp.route("/rounds/<int:round_id>/analysis", methods=["GET"])
+def round_analysis(round_id):
+    """配对收益：本轮成交按「同日最大收益配对」统计（与真实交易记录同一套规则）
+
+    返回 {trades, pairs, unmatched, summary, round}；手续费取游戏记录自带值
+    （引擎按模拟费率逐笔计费），round 附引擎口径的已实现盈亏/收益率供对照。
+    """
+    data = get_engine().analyze_round(round_id)
+    if not data:
+        return _err("轮次不存在", 404)
+    return _ok(data)
+
+
 @game_bp.route("/rounds/<int:round_id>/account", methods=["GET"])
 def account(round_id):
     data = get_engine().get_round(round_id)
@@ -224,7 +237,11 @@ def grid(round_id):
 
 @game_bp.route("/rounds/<int:round_id>/grid/interval", methods=["PUT"])
 def put_grid_interval(round_id):
-    """保存某行网格的间隔（随轮次持久化，Redis 存储，重进保持一致）"""
+    """保存某行网格的间隔（随轮次持久化，Redis 存储，重进保持一致）
+
+    间隔即人工微调「未成交出场腿」位置的手段（买入行→卖出侧、卖出行→买入侧），
+    已成交的进场腿格号恒不动；该行已完成或有未成交委托时拒绝。
+    """
     body = request.get_json(silent=True) or {}
     idx = body.get("idx")
     interval = body.get("interval")
@@ -232,26 +249,10 @@ def put_grid_interval(round_id):
         return _err("idx 缺失或非法", 400)
     if not isinstance(interval, (int, float)):
         return _err("interval 缺失或非法", 400)
-    imap = get_engine().save_grid_interval(round_id, int(idx), int(interval))
-    return _ok(imap, "间隔已保存")
-
-
-@game_bp.route("/rounds/<int:round_id>/grid/idx", methods=["PUT"])
-def put_grid_idx(round_id):
-    """保存某行网格号（人工微调行位置，价格随格号同步；成交价不变）
-
-    body: {idx: 行稳定标识 key_idx, new_idx: 新格号}
-    有未成交委托的行不可调整（委托价挂在原网格线上，移动行会使其脱节）。
-    """
-    body = request.get_json(silent=True) or {}
-    idx = body.get("idx")
-    new_idx = body.get("new_idx")
-    if not isinstance(idx, (int, float)) or not isinstance(new_idx, (int, float)):
-        return _err("idx/new_idx 缺失或非法", 400)
-    ok, msg, imap = get_engine().save_grid_idx(round_id, int(idx), int(new_idx))
+    ok, msg, imap = get_engine().save_grid_interval(round_id, int(idx), int(interval))
     if not ok:
         return _err(msg)
-    return _ok(imap, "格号已保存")
+    return _ok(imap, "间隔已保存")
 
 
 @game_bp.route("/rounds/<int:round_id>/grid/order", methods=["POST"])
