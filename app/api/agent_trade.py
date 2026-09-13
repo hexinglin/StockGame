@@ -2,7 +2,9 @@
 模块名称: api/agent_trade.py
 说明:    QMT 交易记录闭环 — 页面下发命令/每日自动采集 → Agent 轮询领取 →
          执行上报 → 落库 PostgreSQL（trade_records 整日替换）+ FIFO 配对分析；
-         导入通道 — QMT 客户端导出成交文本解析入库（补齐历史日期）。
+         导入通道 — 客户端导出成交明细文件直传（券商历史成交 xlsx / CSV，
+         多日按记录自带日期逐日入库，补齐历史日期）；
+         删除通道 — 按天物理删除记录与状态（含导入数据）。
          原 agent_routes.py 按资源拆分之一。
 """
 import logging
@@ -13,7 +15,8 @@ from flask import Blueprint, jsonify, request
 from ..engine import trade_store
 from ..engine.trade_analysis import analyze_trades
 from ..engine.trade_collector import issue_fetch_command
-from ..engine.trade_import import parse_export_text
+from ..engine.trade_import import (group_by_date, parse_export_text,
+                                   parse_export_workbook)
 from ..messaging.cache import TRADE_CMD_TTL_SEC, get_cache
 from ..utils.timeutil import now_str_cn
 
@@ -164,33 +167,64 @@ def upload_trade_records():
 
 # ── 导入通道（补齐历史日期） ──
 
+def _decode_upload(f) -> str:
+    """上传文本文件解码：UTF-8（含 BOM）优先，券商 GBK 兜底，残缺字节替换"""
+    raw = f.read()
+    for enc in ("utf-8-sig", "gbk"):
+        try:
+            return raw.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", errors="replace")
+
+
 @trade_bp.route("/trade_records/import", methods=["POST"])
 def import_trade_records():
-    """页面导入：QMT 客户端导出的成交文本（补齐历史日期）
+    """页面导入：券商导出的成交明细文件（.xlsx / .csv / .txt）
 
-    body: {date: 'YYYY-MM-DD', text: '客户端表格复制/CSV 导出的文本'}
-    解析为与 Agent 上报同构的记录后，整日替换落库（source=import）。
-    返回解析统计（导入笔数、跳过行及原因），供页面提示。
+    multipart: file=<文件>；date 可选，CSV/TXT 无日期列的行回退该日期。
+    .xlsx 走工作簿解析（自动跳过营业部/账号等元信息头，多日按「日期」列
+    分组）；其余按文本解析（Tab/逗号分隔自动识别）。解析为与 Agent 上报
+    同构的记录后，按记录自带交易日分组逐日整日替换落库（source=import，
+    复用 replace_day，幂等）。返回解析统计（总笔数、各日笔数、跳过行及
+    原因），供页面提示。
     """
-    body = request.get_json(silent=True) or {}
-    date = str(body.get("date") or "").strip()
-    if msg := _valid_date(date):
+    f = request.files.get("file")
+    if f is None:
+        return jsonify({"code": 400, "message": "缺少上传文件（字段名 file）"}), 400
+    date = str(request.form.get("date") or "").strip()
+    if date and (msg := _valid_date(date)):
         return jsonify({"code": 400, "message": msg}), 400
-    text = str(body.get("text") or "")
-    if not text.strip():
-        return jsonify({"code": 400, "message": "导入文本为空"}), 400
+    name = (f.filename or "").lower()
+    if name.endswith(".xls"):
+        return jsonify({"code": 400,
+                        "message": "暂不支持老版 .xls，请另存/导出为 .xlsx 后重试"}), 400
     try:
-        records, meta = parse_export_text(text, date)
+        if name.endswith((".xlsx", ".xlsm")):
+            records, meta = parse_export_workbook(f.stream)
+        else:
+            records, meta = parse_export_text(_decode_upload(f), date)
     except ValueError as e:
         return jsonify({"code": 400, "message": str(e)}), 400
+
     if not records:
         return _empty_import_reply(meta)
-    count = trade_store.replace_day(date, records, source="import")
-    logger.info("成交记录导入 date=%s 解析 %d 笔（跳过 %d 行）",
-                date, count, len(meta["skipped"]))
-    return jsonify({"code": 0,
-                    "message": "导入成功：%d 笔（跳过 %d 行）"
-                               % (count, len(meta["skipped"])),
+    days = group_by_date(records)
+    day_counts = {}
+    for d in sorted(days):
+        day_counts[d] = trade_store.replace_day(d, days[d], source="import")
+    count = sum(day_counts.values())
+    meta["days"] = day_counts
+    if len(day_counts) == 1:
+        msg = "导入成功：%d 笔（跳过 %d 行）" % (count, len(meta["skipped"]))
+    else:
+        msg = "导入成功：%d 笔，覆盖 %d 个交易日（%s ~ %s，跳过 %d 行）" % (
+            count, len(day_counts), min(day_counts), max(day_counts),
+            len(meta["skipped"]))
+    logger.info("成交记录导入 %d 日 %s 共 %d 笔（跳过 %d 行）",
+                len(day_counts), ",".join(sorted(day_counts)), count,
+                len(meta["skipped"]))
+    return jsonify({"code": 0, "message": msg,
                     "count": count, "data": meta})
 
 
@@ -201,3 +235,21 @@ def _empty_import_reply(meta) -> tuple:
         msg += "（跳过 %d 行，如：%s）" % (
             len(meta["skipped"]), meta["skipped"][0]["reason"])
     return jsonify({"code": 400, "message": msg, "data": meta}), 400
+
+
+# ── 删除通道（按天清理，含导入数据） ──
+
+@trade_bp.route("/trade_records/<date>", methods=["DELETE"])
+def delete_trade_day(date):
+    """页面删除：物理删除某日交易记录与采集状态
+
+    整日删除不区分来源（agent 采集 / import 导入一并清除），不可恢复；
+    无记录的日子幂等执行（顺带清理残留失败状态）。
+    """
+    if msg := _valid_date(date):
+        return jsonify({"code": 400, "message": msg}), 400
+    n = trade_store.delete_day(date)
+    msg = ("已删除 %s 的 %d 笔记录" % (date, n)) if n \
+        else "%s 无记录（残留状态已清理）" % date
+    logger.info("交易记录删除 date=%s count=%s", date, n)
+    return jsonify({"code": 0, "message": msg, "count": n})

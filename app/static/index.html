@@ -207,22 +207,22 @@
             <input type="date" id="trDate" class="tr-date">
             <button class="btn-primary" id="btnFetchTr" onclick="fetchTradeRecords()">获取交易记录</button>
             <button class="btn-back" id="btnTrImportToggle" onclick="toggleTrImport()">📥 导入历史</button>
+            <button class="btn-back btn-danger" id="btnTrDelete" onclick="deleteTrDay()" title="物理删除所选日期的交易记录与状态（含导入数据），不可恢复">🗑 删除当日</button>
         </div>
         <span class="tr-status" id="trStatus">选择日期后点击"获取交易记录"（命令 2 分钟内有效）</span>
     </header>
 
-    <!-- 导入面板：QMT 客户端导出成交文本 → 粘贴/选文件 → 解析入库（补齐历史日期） -->
+    <!-- 导入面板：券商导出成交明细文件直传 → 解析入库（补齐历史日期） -->
     <div class="tr-import" id="trImportPanel" style="display:none;">
         <div class="tr-import-head">
-            <b>导入所选日期的成交记录（日期取上方选择器）</b>
-            <span class="tr-import-tip">QMT 客户端：交易 → 历史成交 → 选中数据右键复制后粘贴；或导出 CSV 选择文件</span>
+            <b>导入成交记录（券商导出文件直接上传）</b>
+            <span class="tr-import-tip">选券商「历史成交查询」导出的 .xlsx（多日按「日期」列逐日入库，自动跳过表头前元信息）或 CSV/TXT（无日期列时取上方选择器日期）</span>
         </div>
         <div class="tr-import-row">
-            <input type="file" id="trImportFile" class="tr-file" accept=".csv,.txt" onchange="onTrImportFile(this)">
+            <input type="file" id="trImportFile" class="tr-file" accept=".xlsx,.xlsm,.csv,.txt" onchange="onTrImportFile(this)">
         </div>
-        <textarea id="trImportText" class="tr-import-text" rows="6" placeholder="在此粘贴成交明细（自动识别表头：成交时间/证券代码/买卖/成交价格/成交数量/成交金额…）"></textarea>
         <div class="tr-import-actions">
-            <span class="tr-import-note">导入将整日覆盖所选日期的数据（来源=导入）</span>
+            <span class="tr-import-note">导入将整日覆盖所涉各交易日的数据（来源=导入，幂等可重复）</span>
             <button class="btn-primary" id="btnTrImport" onclick="submitTrImport()">解析并导入</button>
             <button class="btn-back" onclick="toggleTrImport(false)">取消</button>
         </div>

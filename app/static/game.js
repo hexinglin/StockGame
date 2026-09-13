@@ -1945,43 +1945,84 @@ async function fetchTradeRecords() {
     } catch (e) { toast(e.message, "error"); }
 }
 
-// ── 导入通道：QMT 客户端导出成交文本 → 解析入库（补齐历史日期） ──
+// ── 导入通道：券商导出成交明细文件直传 → 解析入库（补齐历史日期） ──
+let trImportFile = null;   // 待上传文件（.xlsx 工作簿 / .csv、.txt 文本）
+
 function toggleTrImport(show) {
     const p = document.getElementById("trImportPanel");
     if (!p) return;
     const open = show !== undefined ? show : p.style.display === "none";
     p.style.display = open ? "block" : "none";
-    if (open) {
-        const t = document.getElementById("trImportText");
-        if (t) t.focus();
-    }
+    if (!open) _resetTrImportFile();
+}
+
+function _resetTrImportFile() {
+    trImportFile = null;
+    const input = document.getElementById("trImportFile");
+    if (input) input.value = "";
 }
 
 function onTrImportFile(input) {
     const f = input.files && input.files[0];
-    if (!f) return;
-    const reader = new FileReader();
-    reader.onload = () => {
-        const t = document.getElementById("trImportText");
-        if (t) t.value = String(reader.result || "");
-        toast(`已读取文件 ${f.name}，点击"解析并导入"入库`, "success");
-    };
-    reader.readAsText(f, "utf-8");
+    if (!f) { trImportFile = null; return; }
+    if (/\.xls$/i.test(f.name)) {   // 老版 .xls（非 xlsx）快速失败
+        trImportFile = null;
+        input.value = "";
+        toast("暂不支持老版 .xls，请在客户端导出/另存为 .xlsx", "warn");
+        return;
+    }
+    trImportFile = f;
+    toast(`已选择 ${f.name}，点击"解析并导入"上传入库`, "success");
 }
 
 async function submitTrImport() {
+    if (!trImportFile) { toast("请选择券商导出的成交文件（.xlsx / .csv / .txt）", "warn"); return; }
     const date = document.getElementById("trDate").value;
-    if (!date) { toast("请先选择日期", "warn"); return; }
-    const textEl = document.getElementById("trImportText");
-    const text = ((textEl && textEl.value) || "").trim();
-    if (!text) { toast("请粘贴成交记录文本或选择导出文件", "warn"); return; }
     const btn = document.getElementById("btnTrImport");
     if (btn) btn.disabled = true;
     try {
-        const resp = await api("/api/v1/agent/trade_records/import", "POST", { date, text });
+        const fd = new FormData();
+        fd.append("file", trImportFile);
+        if (date) fd.append("date", date);
+        const r = await fetch("/api/v1/agent/trade_records/import", { method: "POST", body: fd });
+        const resp = await r.json().catch(() => ({}));
+        if (resp.code !== 0) throw new Error(resp.message || "导入失败");
         toast(resp.message || "导入成功", "success");
+        const days = (resp.data && resp.data.days) || {};
+        const dayKeys = Object.keys(days).sort();
+        const scope = dayKeys.length > 1
+            ? `${dayKeys.length} 个交易日（${dayKeys[0]} ~ ${dayKeys[dayKeys.length - 1]}）`
+            : (dayKeys[0] || date);
         toggleTrImport(false);
-        setTrStatus("done", `✅ ${date} 导入成功：${resp.count} 笔（来源：导入）`);
+        setTrStatus("done", `✅ ${scope} 导入成功：${resp.count} 笔（来源：导入）`);
+        stopTrPoll();
+        await loadTradeRecords();
+    } catch (e) {
+        toast(e.message, "error");
+    } finally {
+        if (btn) btn.disabled = false;
+    }
+}
+
+// 删除当日交易记录（含采集/导入来源，物理删除不可恢复；确认前带出笔数与来源）
+async function deleteTrDay() {
+    const date = document.getElementById("trDate").value;
+    if (!date) { toast("请先选择日期", "warn"); return; }
+    let count = 0, source = "";
+    try {
+        const resp = await api(`/api/v1/agent/trade_fetch?date=${encodeURIComponent(date)}`);
+        const r = (resp.data || {}).result;
+        if (r && r.success) { count = r.count || 0; source = r.source || ""; }
+    } catch (e) { /* 现状查询失败不阻断删除，确认框按未知笔数提示 */ }
+    if (!count) { toast(`${date}：当日无记录，无需删除`, "warn"); return; }
+    const tip = `确认删除 ${date} 的交易记录？\n\n共 ${count} 笔（${trSourceText(source)}），` +
+        `将整日物理删除记录与采集状态，不可恢复。`;
+    if (!window.confirm(tip)) return;
+    const btn = document.getElementById("btnTrDelete");
+    if (btn) btn.disabled = true;
+    try {
+        const resp = await api(`/api/v1/agent/trade_records/${encodeURIComponent(date)}`, "DELETE");
+        toast(resp.message || "删除成功", "success");
         stopTrPoll();
         await loadTradeRecords();
     } catch (e) {
@@ -2116,11 +2157,18 @@ function renderTradeResult(r) {
 }
 
 // 交易明细「按委托聚合」开关：同委托编号（order_id）的拆分成交合并为一行；
-// 明细模式末列=成交编号，聚合模式末列=委托编号（列头随模式切换）
+// 明细模式末列=成交编号，聚合模式末列=委托编号（列头随模式切换）。
+// 按钮文案显示点击后将切换到的视图：明细态→「按委托聚合」，聚合态→「按成交明细」
 function toggleTrAgg() {
     TR_AGG = !TR_AGG;
     const btn = document.getElementById("btnTrAgg");
-    if (btn) btn.classList.toggle("active", TR_AGG);
+    if (btn) {
+        btn.classList.toggle("active", TR_AGG);
+        btn.textContent = TR_AGG ? "按成交明细" : "按委托聚合";
+        btn.title = TR_AGG
+            ? "当前为按委托聚合视图（同一委托的拆分成交已合并为一行），点击切回逐笔成交明细"
+            : "按委托编号合并同一笔委托的拆分成交：成交价取数量加权均价，数量/成交金额/手续费逐笔合计";
+    }
     const th = document.querySelector("#trTradesTable thead tr th:last-child");
     if (th) th.textContent = TR_AGG ? "委托编号" : "成交编号";
     if (TR_LAST_TRADES.length) renderTrTrades(TR_LAST_TRADES);
@@ -2282,6 +2330,9 @@ function switchTrTab(tab) {
     document.getElementById("trTradesTable").style.display = tab === "trades" ? "" : "none";
     document.getElementById("trPairsTable").style.display = tab === "pairs" ? "" : "none";
     document.getElementById("trUnmatchedTable").style.display = tab === "unmatched" ? "" : "none";
+    // 「按委托聚合」仅作用于交易明细，其他 tab 隐藏
+    const aggBtn = document.getElementById("btnTrAgg");
+    if (aggBtn) aggBtn.style.display = tab === "trades" ? "" : "none";
 }
 
 // 切换日期后自动加载该日结果/命令进度
