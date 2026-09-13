@@ -1,13 +1,20 @@
 # ============================================================
-# QMT Agent - StockGame 行情采集代理
-# 功能:
-#   subscribe_quote 事件驱动: 订阅标的每笔分笔推送即回调上传，
-#     替代原 handlebar 3s 轮询（无行情不触发，不空转）
-#   run_time 心跳任务: 每 60s POST 一次心跳，与行情上传解耦
+# QMT Agent (行情) - StockGame 行情信息维护脚本
+# 定位:
+#   QMT 侧常驻脚本：维护 StockGame 的实时行情数据源；与维护/工具脚本
+#   （qmt_agent/maintenance_agent.py，成交采集+交易日历）并行运行，
+#   独立策略互不影响。
+# 维护任务:
+#   1) 实时行情上传: subscribe_quote 事件驱动，订阅标的每笔分笔推送
+#      即回调上传（替代原 handlebar 3s 轮询，无行情不触发，不空转）；
+#   2) 失败归档: tick 上传失败时按交易日落盘本地目录（jsonl 追加，
+#      附失败原因，便于事后回溯/补传）；
+#   3) 心跳: run_time 每 60s 上报一次，与行情上传解耦。
 # 说明:
 #   仅上传当日行情（非当日推送直接过滤）；
 #   同一秒内多次推送只上报一次（秒级节流），重复上报由后端按
-#   (code, time_key) 幂等去重。
+#   (code, time_key) 幂等去重；
+#   volume 推送单位「手」→ ×100 换算「股」后上报（与模拟源口径统一）。
 # NOTE: QMT built-in functions are provided by QMT runtime.
 #       - timetag_to_datetime()
 #       - ContextInfo.run_time()
@@ -39,7 +46,7 @@ _stock_code = "588000.SH"
 _QUOTE_PERIOD = "tick"                  # 订阅周期：tick=分笔（快照变化即推送）
 BACKEND_URL = "http://192.168.1.5:16000"   # StockGame 后端地址（部署后按实际修改）
 AGENT_NAME = "qmt_live"
-AGENT_ROLE = "行情采集"                    # 角色（心跳上报，监控面板展示）
+AGENT_ROLE = "行情信息维护"                # 角色（心跳上报，监控面板展示）
 HEARTBEAT_INTERVAL = 60                   # 心跳周期（秒）
 SYNC_TIMEOUT = 10
 
@@ -48,6 +55,8 @@ _FAIL_TICK_DIR = r"D:\StockGame\TickFailed"
 
 _last_sent_time = None   # 上次已上报的 time_key（秒级节流，防同秒重复推送）
 
+
+# ────────────── 基础工具函数（日志 / HTTP / 失败归档） ──────────────
 
 def _log(msg):
     t = time.time()
@@ -102,6 +111,8 @@ def _save_failed_tick(payload, error=""):
         _log("tick 上传失败已落盘: %s" % path)
     except Exception as e:
         _log("tick 失败数据落盘异常: %s" % e)
+
+# ────────────── 行情维护任务（订阅推送驱动） ──────────────
 
 def _quote_time_key(bar):
     """从订阅推送行情提取秒级 time_key（'%Y-%m-%d %H:%M:%S'）
@@ -211,6 +222,8 @@ def _on_quote(ContextInfo, data):
             _save_failed_tick(payload, error=str(e))
 
 
+# ────────────── 定期维护任务（心跳，run_time 驱动） ──────────────
+
 def heartbeat(ContextInfo):
     """run_time 定时回调 — 每 60s 上报一次心跳，与行情上传解耦"""
     _http_post("/api/v1/agent/heartbeat", {
@@ -222,7 +235,7 @@ def heartbeat(ContextInfo):
 
 def init(ContextInfo):
     """QMT 初始化回调：注册心跳定时任务 + 订阅行情（事件驱动，替代 handlebar）"""
-    _log("StockGame Agent 初始化完成 code=%s period=%s backend=%s" % (
+    _log("StockGame 行情信息维护 Agent 初始化完成 code=%s period=%s backend=%s" % (
         _stock_code, _QUOTE_PERIOD, BACKEND_URL))
     # 注册定时心跳任务（run_time 机制替代独立线程）：
     # startTime 设为历史时间使定时器立即启动，之后每 60s 触发一次 heartbeat

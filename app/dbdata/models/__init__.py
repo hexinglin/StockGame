@@ -7,9 +7,10 @@ from .game_round import GameRound
 from .game_order import GameOrder
 from .game_trade import GameTrade
 from .trade_record import TradeRecord, TradeFetchDay
+from .trading_day import TradingDay
 
 __all__ = [
     "TickData", "TickDataSim", "GameDay",
     "AgentStatus", "GameRound", "GameOrder", "GameTrade",
-    "TradeRecord", "TradeFetchDay",
+    "TradeRecord", "TradeFetchDay", "TradingDay",
 ]

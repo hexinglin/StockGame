@@ -1,25 +1,32 @@
 # ============================================================
-# QMT Agent (交易记录) - StockGame 历史成交明细采集代理
-# 功能:
-#   run_time 定时任务（10s）: 轮询后端命令接口，领取"获取某日历史
-#     成交明细"命令 → 调用 QMT 成交查询接口（历史优先，缺省回退当日）→
-#     上报结果到后端（服务器收到后删除命令并落库 PostgreSQL，永久保留）；
-#     心跳并入同一周期（每 60s 附带一次），启动时立即上报一次心跳
+# QMT Agent (维护/工具) - StockGame 定期维护与工具查询脚本
+# 定位:
+#   QMT 侧常驻脚本：承接服务端的"定期维护任务"与"工具查询函数"，
+#   与行情信息维护脚本 qmt_agent/quote_agent.py（qmt_live）并行运行（独立策略互不影响）。
+# 定期维护任务（单定时器 10s 驱动）:
+#   1) 每日成交采集: 轮询后端命令接口，领取"获取某日历史成交明细"命令
+#      → 调用 QMT 成交查询接口（历史优先，缺省回退当日）→ 上报结果
+#      （服务器删除命令并落库 PostgreSQL，永久保留）；
+#   2) 交易日历同步: 每日首次轮询经 get_trading_dates 拉取近 5 年交易日
+#      上报（POST /api/v1/agent/trading_days，幂等 upsert，失败下轮重试）；
+#   3) 心跳: 每 60s 附带一次，启动时立即上报一次（监控面板可见）。
+# 工具查询函数:
+#   - fetch_trade_records: 某日全账户成交明细（DEAL），方向统一 buy/sell；
+#   扩展新工具: 实现 fn(ContextInfo, cmd) → records，并在 _TOOL_DISPATCH
+#   注册命令类型即可；未知类型按失败上报（服务器记录错误原因后消除命令）。
 # 说明:
 #   命令为 Redis 单键（TTL 2 分钟，到期自动消失），Agent 轮询直读即可；
 #   同一 cmd_id 只执行一次（服务端删命令前接口会重复返回同一命令）；
 #   上报失败自动在下一个 10s 周期重试（先补报，再领新命令）；
-#   查询为账户全量成交明细（DEAL），记录方向统一为 buy/sell；
 #   兼容性：部分券商 QMT 未注入历史接口（get_history_trade_detail_data），
 #   此时改走当日接口（get_trade_detail_data）全量读取并按成交日期过滤：
 #   客户端缓存多日则历史可命中；仅缓存当日时给出明确提示（当日功能不受影响）。
 # 部署:
 #   1. 修改下方 BACKEND_URL 为 StockGame 后端地址；
-#   2. 将本文件追加为 QMT 策略运行（周期任意，主要靠 run_time 驱动）；
-#   3. 与行情采集 agent.py 可并行运行（独立策略互不影响）。
+#   2. 将本文件追加为 QMT 策略运行（周期任意，主要靠 run_time 驱动）。
 # NOTE: QMT built-in functions are provided by QMT runtime.
 #       - ContextInfo.run_time()
-#       - get_history_trade_detail_data()
+#       - get_history_trade_detail_data() / get_trading_dates()
 # ============================================================
 import sys
 import os
@@ -44,8 +51,8 @@ except ImportError:
 
 # ---- 配置 ----
 BACKEND_URL = "http://192.168.1.5:16000"    # StockGame 后端地址（部署后按实际修改）
-AGENT_NAME = "qmt_trade"                    # 与行情 Agent（qmt_live）区分
-AGENT_ROLE = "交易记录"                      # 角色（心跳上报，监控面板展示）
+AGENT_NAME = "qmt_trade"                    # 命令通道身份（服务端采集器按此名下发，勿改）
+AGENT_ROLE = "维护/工具查询"                  # 角色（心跳上报，监控面板展示）
 _account_id = "60011302"                    # 资金账号（与 AutoTrade 实盘共用）
 _ACCOUNT_TYPE = "CREDIT"                    # 账号类型：CREDIT=信用 STOCK=普通
 POLL_INTERVAL = 10                          # 命令轮询周期（秒）
@@ -58,6 +65,9 @@ _handled_cmds = []
 _pending_report = None
 # 轮询计数（每 N 次轮询附带上报一次心跳）
 _poll_ticks = 0
+# 交易日历：当日已成功上报标记（每天首次轮询时同步一次，失败下轮/次日重试）
+_cal_synced_date = None
+_CAL_LOOKBACK_DAYS = 5 * 365          # 日历回看范围（约 5 年，覆盖回测需求）
 
 
 def _log(msg):
@@ -101,7 +111,7 @@ def _http_post(endpoint, data, timeout=SYNC_TIMEOUT):
         return None
 
 
-# ────────────── 历史成交明细解析 ──────────────
+# ────────────── 工具查询函数（成交明细解析与查询） ──────────────
 
 def _is_deal_obj(x):
     """判定是否为 QMT 成交对象（按特征字段探测）"""
@@ -263,14 +273,15 @@ def _records_from_objects(result, date_str):
     return records
 
 
-def _fetch_trade_records(date_str):
-    """查询某日成交明细（全账户，DEAL），返回记录列表
+def fetch_trade_records(ContextInfo, cmd):
+    """工具查询: 某日成交明细（cmd: {date: 'YYYY-MM-DD'}）→ 记录列表
 
     优先历史接口（get_history_trade_detail_data，按日期区间查询）；
     未注入时（部分券商版本）改走当日接口（get_trade_detail_data）全量读取
     后按成交日期过滤：客户端缓存多日则历史日期可命中；仅缓存当日时给出
     明确提示（消息里附返回记录的实际日期，便于确认环境行为）。
     """
+    date_str = str(cmd.get("date") or "")
     history_fn = globals().get("get_history_trade_detail_data")
     if callable(history_fn):
         ymd = date_str.replace("-", "")
@@ -317,7 +328,14 @@ def _fetch_trade_records(date_str):
     return records
 
 
-# ────────────── 命令轮询与上报 ──────────────
+# 工具查询注册表: 命令 type → 执行函数 fn(ContextInfo, cmd) → records
+# （新增查询工具时在此注册；未知 type 按失败上报，服务器记录原因后消除命令）
+_TOOL_DISPATCH = {
+    "fetch_trade_records": fetch_trade_records,
+}
+
+
+# ────────────── 定期维护任务（轮询周期驱动） ──────────────
 
 def heartbeat(ContextInfo):
     """心跳上报（启动时调用一次 + 并入轮询周期每 60s 一次）"""
@@ -326,6 +344,51 @@ def heartbeat(ContextInfo):
         "role": AGENT_ROLE,
         "timestamp": time.time(),
     })
+
+
+def _sync_trading_calendar(ContextInfo):
+    """每日一次：拉取近 5 年交易日历上报后端（幂等 upsert，失败次日重试）
+
+    ContextInfo.get_trading_dates 只能在 QMT 内运行（after_init/handlebar/
+    run_time 回调中），返回 ['20260101', ...] 紧凑日期列表；stockcode 取
+    主标的（沪市 ETF）即可，交易日历与具体标的无关（全市场统一）。
+    """
+    global _cal_synced_date
+    today = time.strftime("%Y-%m-%d")
+    if _cal_synced_date == today:
+        return
+    fn = getattr(ContextInfo, "get_trading_dates", None)
+    if not callable(fn):
+        # 部分环境以全局函数注入
+        fn = globals().get("get_trading_dates")
+    if not callable(fn):
+        _log("交易日历同步跳过：该 QMT 环境未注入 get_trading_dates")
+        _cal_synced_date = today          # 环境不支持，当日不再重试
+        return
+    try:
+        fmt = "%Y%m%d"
+        start = time.strftime(fmt, time.localtime(
+            time.time() - _CAL_LOOKBACK_DAYS * 86400))
+        end = time.strftime(fmt)
+        dates = fn("588000.SH", start, end, -1)
+        dates = [str(d) for d in (dates or [])]
+    except Exception as e:
+        _log("交易日历拉取失败（下轮重试）: %s" % e)
+        return
+    if not dates:
+        _log("交易日历拉取为空（下轮重试）")
+        return
+    resp = _http_post("/api/v1/agent/trading_days", {
+        "agent_name": AGENT_NAME,
+        "dates": dates,
+        "start": start,
+    })
+    if resp and resp.get("code") == 0:
+        _cal_synced_date = today
+        _log("交易日历上报成功：%d 个日期（新增 %d）"
+             % (len(dates), resp.get("count", 0)))
+    else:
+        _log("交易日历上报失败（下轮重试）")
 
 
 def _report(payload):
@@ -345,6 +408,8 @@ def poll_command(ContextInfo):
     # 心跳并入轮询周期：每 HEARTBEAT_INTERVAL/POLL_INTERVAL 次上报一次
     if _poll_ticks % max(1, HEARTBEAT_INTERVAL // POLL_INTERVAL) == 0:
         heartbeat(ContextInfo)
+    # 交易日历：每日首次轮询同步一次（成功置标记，失败下轮重试）
+    _sync_trading_calendar(ContextInfo)
 
     if _pending_report is not None:
         if _report(_pending_report):
@@ -366,19 +431,8 @@ def poll_command(ContextInfo):
 
     _log("领取命令 cmd_id=%s type=%s date=%s"
          % (cmd_id, cmd.get("type"), date_str))
-    try:
-        records = _fetch_trade_records(date_str)
-        payload = {
-            "agent_name": AGENT_NAME,
-            "cmd_id": cmd_id,
-            "date": date_str,
-            "success": True,
-            "account": _account_id,
-            "account_type": _ACCOUNT_TYPE,
-            "records": records,
-        }
-        _log("查询完成 date=%s 成交 %d 笔" % (date_str, len(records)))
-    except Exception as e:
+    tool = _TOOL_DISPATCH.get(str(cmd.get("type") or ""))
+    if tool is None:
         payload = {
             "agent_name": AGENT_NAME,
             "cmd_id": cmd_id,
@@ -386,10 +440,35 @@ def poll_command(ContextInfo):
             "success": False,
             "account": _account_id,
             "account_type": _ACCOUNT_TYPE,
-            "error": str(e),
+            "error": "未知命令类型: %s" % cmd.get("type"),
             "records": [],
         }
-        _log("查询失败 date=%s: %s" % (date_str, e))
+        _log(payload["error"])
+    else:
+        try:
+            records = tool(ContextInfo, cmd)
+            payload = {
+                "agent_name": AGENT_NAME,
+                "cmd_id": cmd_id,
+                "date": date_str,
+                "success": True,
+                "account": _account_id,
+                "account_type": _ACCOUNT_TYPE,
+                "records": records,
+            }
+            _log("查询完成 date=%s 成交 %d 笔" % (date_str, len(records)))
+        except Exception as e:
+            payload = {
+                "agent_name": AGENT_NAME,
+                "cmd_id": cmd_id,
+                "date": date_str,
+                "success": False,
+                "account": _account_id,
+                "account_type": _ACCOUNT_TYPE,
+                "error": str(e),
+                "records": [],
+            }
+            _log("查询失败 date=%s: %s" % (date_str, e))
 
     # 记录已处理（无论上报成败，避免重复执行）
     _handled_cmds.append(cmd_id)
@@ -402,15 +481,15 @@ def poll_command(ContextInfo):
 
 
 def init(ContextInfo):
-    """QMT 初始化回调：注册命令轮询定时任务"""
-    _log("StockGame 交易记录 Agent 初始化完成 account=%s type=%s backend=%s"
+    """QMT 初始化回调：注册定期维护轮询（命令工具执行 / 日历同步 / 心跳）"""
+    _log("StockGame 维护/工具 Agent 初始化完成 account=%s type=%s backend=%s"
          % (_account_id, _ACCOUNT_TYPE, BACKEND_URL))
     try:
         # 单定时器：startTime 设为历史时间 → 立即启动，每 10s 触发 poll_command
         ContextInfo.run_time(
             "poll_command", "%dnSecond" % POLL_INTERVAL, "2000-01-01 00:00:00")
-        _log("定时任务已注册：命令轮询 %ds（每 %ds 附带一次心跳上报）"
-             % (POLL_INTERVAL, HEARTBEAT_INTERVAL))
+        _log("定时任务已注册：命令轮询 %ds（每 %ds 附带一次心跳上报，"
+             "每日首次轮询同步交易日历）" % (POLL_INTERVAL, HEARTBEAT_INTERVAL))
     except Exception as e:
         _log("run_time 注册失败: %s" % e)
     # 启动即上报一次心跳：监控面板立即可见

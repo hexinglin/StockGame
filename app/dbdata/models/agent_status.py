@@ -11,7 +11,7 @@ class AgentStatus(Base):
     __tablename__ = "agent_status"
     id = Column(Integer, primary_key=True, autoincrement=True)
     agent_name = Column(String(50), unique=True, nullable=False, index=True)
-    role = Column(String(50), default="")     # 角色/职责（心跳自报：行情采集/交易记录…）
+    role = Column(String(50), default="")     # 角色/职责（心跳自报：行情信息维护/维护·工具查询…）
     last_heartbeat_at = Column(DateTime)
     last_tick_at = Column(DateTime)
     is_alive = Column(Boolean, default=True)

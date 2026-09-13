@@ -122,6 +122,13 @@ CREATE TABLE IF NOT EXISTS trade_fetch_days (
   updated_at TIMESTAMP DEFAULT now()
 );
 
+-- 交易日历（QMT get_trading_dates 拉取，Agent 每日自动上报，只增不改幂等）
+CREATE TABLE IF NOT EXISTS trading_days (
+  trade_date VARCHAR(10) PRIMARY KEY,  -- 'YYYY-MM-DD'
+  source VARCHAR(20) DEFAULT 'qmt',
+  synced_at TIMESTAMP DEFAULT now()
+);
+
 -- 游戏轮次（一个轮次 = 一个交易日的完整游戏周期）
 CREATE TABLE IF NOT EXISTS game_rounds (
   id SERIAL PRIMARY KEY,

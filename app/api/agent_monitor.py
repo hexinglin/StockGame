@@ -25,7 +25,7 @@ def heartbeat():
     """心跳上报 — 更新 agent_status（含角色）+ Redis 时间戳
 
     body: {agent_name, timestamp?, role?}
-    role 为 Agent 自报角色/职责（如 行情采集/交易记录），随心跳维护，
+    role 为 Agent 自报角色/职责（如 行情信息维护/维护·工具查询），随心跳维护，
     供监控面板展示；幂等同步，值一致时不触发推送。
     """
     data = request.get_json(silent=True) or {}
