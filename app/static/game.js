@@ -2139,9 +2139,18 @@ function renderTradeResult(r) {
     }
     const s = r.summary || {};
     const netCls = Number(s.net_profit) >= 0 ? "up" : "down";
+    // 总数量：优先取后端 total_volume；旧后端未重启时用买+卖现算兜底
+    const totalVolume = (s.total_volume !== undefined && s.total_volume !== null)
+        ? s.total_volume : (Number(s.buy_volume) || 0) + (Number(s.sell_volume) || 0);
+    // 完成匹配数量 = matched_volume（逐标的配满 min(买量, 卖量)，买卖同量时即该量）；
+    // 未匹配数量由 unmatched 明细现算（不依赖后端版本）
+    const unmatchedVol = (r.unmatched || []).reduce(
+        (a, u) => a + (Number(u.unmatched_volume) || 0), 0);
     box.innerHTML = `
         <div class="acct-grid">
             <div class="acct-item"><span>成交笔数</span><b>${s.count || 0}</b><i>买 ${s.buy_count || 0} / 卖 ${s.sell_count || 0}</i></div>
+            <div class="acct-item"><span>股票总数量(万股)</span><b>${fmtWan(totalVolume)}</b><i>买 ${fmtWan(s.buy_volume)} / 卖 ${fmtWan(s.sell_volume)}</i></div>
+            <div class="acct-item"><span>完成匹配数量(万股)</span><b>${fmtWan(s.matched_volume)}</b><i>未匹配 ${fmtWan(unmatchedVol)} 万股</i></div>
             <div class="acct-item"><span>买入金额(万元)</span><b>${fmtAmtWan(s.buy_amount)}</b><i>买手续费 ${fmt(s.buy_fee)}元</i></div>
             <div class="acct-item"><span>卖出金额(万元)</span><b>${fmtAmtWan(s.sell_amount)}</b><i>卖手续费 ${fmt(s.sell_fee)}元</i></div>
             <div class="acct-item"><span>配对毛收益(元)</span><b>${fmt(s.gross_profit)}</b><i>配对数 ${s.matched_count || 0}</i></div>
@@ -2295,6 +2304,7 @@ function renderTrUnmatched(items) {
     const tb = document.querySelector("#trUnmatchedTable tbody");
     if (!items.length) {
         tb.innerHTML = '<tr><td colspan="6" class="empty-cell">全部成交均已配对</td></tr>';
+        renderTrUnmatchedSummary([]);
         return;
     }
     tb.innerHTML = items.map(u => `
@@ -2306,6 +2316,42 @@ function renderTrUnmatched(items) {
             <td>${fmtWan(u.unmatched_volume)}</td>
             <td class="tr-reason">${u.reason || "--"}</td>
         </tr>`).join("");
+    renderTrUnmatchedSummary(items);
+}
+
+// 无法匹配汇总（表格下方）：按方向合计未匹配数量，平均价格 = 总价 ÷ 数量
+// （总价 = Σ(成交价 × 未匹配数量)，即按未匹配数量加权的均价；部分未匹配的
+// 记录只计入未匹配部分，与明细行的「未匹配数量」列口径一致）
+function renderTrUnmatchedSummary(items) {
+    const box = document.getElementById("trUnmatchedSummary");
+    if (!box) return;
+    if (!items.length) { box.innerHTML = ""; return; }
+    const groups = {};
+    items.forEach(u => {
+        const vol = Number(u.unmatched_volume) || 0;
+        const g = groups[u.direction] || (groups[u.direction] = { volume: 0, amount: 0 });
+        g.volume += vol;
+        g.amount += (Number(u.price) || 0) * vol;
+    });
+    // 行序固定 买 → 卖，其余方向（未知）排在最后
+    const dirs = ["buy", "sell"].filter(d => groups[d]);
+    Object.keys(groups).forEach(d => { if (!dirs.includes(d)) dirs.push(d); });
+    const rows = dirs.map(d => {
+        const g = groups[d];
+        const avg = g.volume > 0 ? g.amount / g.volume : 0;
+        return `
+        <tr>
+            <td class="${dirCls(d)}">${dirText(d)}</td>
+            <td>${fmtWan(g.volume)}</td>
+            <td>${fmt(avg, 3)}</td>
+        </tr>`;
+    }).join("");
+    box.innerHTML = `
+        <table class="rec-table unmatched-sum-table">
+            <thead><tr><th>方向</th><th>数量(万股)</th><th>平均价格(元)</th></tr></thead>
+            <tbody>${rows}</tbody>
+        </table>
+        <div class="tr-fee-note">汇总口径：数量为「未匹配数量」合计（部分未匹配的成交只计入未匹配部分）；平均价格 = 总价 ÷ 数量（按未匹配数量加权）。</div>`;
 }
 
 function renderTrEmpty(date, text) {
@@ -2322,6 +2368,8 @@ function clearTrTables() {
         '<tr><td colspan="8" class="empty-cell">暂无数据</td></tr>';
     document.querySelector("#trUnmatchedTable tbody").innerHTML =
         '<tr><td colspan="6" class="empty-cell">暂无数据</td></tr>';
+    const umSum = document.getElementById("trUnmatchedSummary");
+    if (umSum) umSum.innerHTML = "";
 }
 
 function switchTrTab(tab) {
@@ -2330,6 +2378,7 @@ function switchTrTab(tab) {
     document.getElementById("trTradesTable").style.display = tab === "trades" ? "" : "none";
     document.getElementById("trPairsTable").style.display = tab === "pairs" ? "" : "none";
     document.getElementById("trUnmatchedTable").style.display = tab === "unmatched" ? "" : "none";
+    document.getElementById("trUnmatchedSummary").style.display = tab === "unmatched" ? "" : "none";
     // 「按委托聚合」仅作用于交易明细，其他 tab 隐藏
     const aggBtn = document.getElementById("btnTrAgg");
     if (aggBtn) aggBtn.style.display = tab === "trades" ? "" : "none";

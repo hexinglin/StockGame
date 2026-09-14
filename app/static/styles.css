@@ -383,6 +383,8 @@ body {
 }
 .rec-table td { padding: 7px 10px; border-bottom: 1px solid rgba(42,52,84,.5); font-variant-numeric: tabular-nums; }
 .rec-table tr:hover td { background: rgba(59,110,246,.05); }
+/* 无法匹配表格下方的按方向汇总表：留出间距，三列收窄避免拉伸稀疏 */
+.unmatched-sum-table { margin-top: 8px; max-width: 460px; }
 .empty-cell { text-align: center; color: var(--text2); padding: 24px !important; }
 
 .st-pending { color: var(--gold); }
