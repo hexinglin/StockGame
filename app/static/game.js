@@ -2215,12 +2215,12 @@ function renderTrTrades(trades) {
     TR_LAST_TRADES = trades;
     const tb = document.querySelector("#trTradesTable tbody");
     if (!trades.length) {
-        tb.innerHTML = '<tr><td colspan="7" class="empty-cell">当日无成交记录</td></tr>';
+        tb.innerHTML = '<tr><td colspan="8" class="empty-cell">当日无成交记录</td></tr>';
         return;
     }
     const rows = (TR_AGG ? aggTradesByOrder(trades) : trades.slice())
         .sort((a, b) => (Number(b.price) || 0) - (Number(a.price) || 0));
-    tb.innerHTML = rows.map(t => {
+    tb.innerHTML = rows.map((t, idx) => {
         // 聚合行时间：首笔~末笔（同日省略重复日期）；编号列=委托编号（多笔附笔数）
         const timeTxt = (TR_AGG && t.endTime && t.endTime !== t.time)
             ? `${t.time} ~ ${t.endTime.slice(11)}` : (t.time || "--");
@@ -2228,6 +2228,7 @@ function renderTrTrades(trades) {
             ? `${t.order_id}${t.count > 1 ? ` (${t.count}笔)` : ""}` : (t.trade_id || "--");
         return `
         <tr>
+            <td>${idx + 1}</td>
             <td>${timeTxt}</td>
             <td class="${dirCls(t.direction)}">${dirText(t.direction)}</td>
             <td>${fmt(t.price, 3)}</td>
@@ -2283,12 +2284,13 @@ function pairTimeTxt(t, end) {
 function renderTrPairs(pairs) {
     const tb = document.querySelector("#trPairsTable tbody");
     if (!pairs.length) {
-        tb.innerHTML = '<tr><td colspan="8" class="empty-cell">无配对记录</td></tr>';
+        tb.innerHTML = '<tr><td colspan="9" class="empty-cell">无配对记录</td></tr>';
         return;
     }
     const rows = aggPairsByOrder(pairs);
-    tb.innerHTML = rows.map(p => `
+    tb.innerHTML = rows.map((p, idx) => `
         <tr>
+            <td>${idx + 1}</td>
             <td>${pairTimeTxt(p.buy_time, p.buy_end)}${p.buy_order_id ? `<br><span class="pair-oid" title="买入委托编号">${p.buy_order_id}</span>` : ""}</td>
             <td>${fmt(p.buy_price, 3)}</td>
             <td>${pairTimeTxt(p.sell_time, p.sell_end)}${p.sell_order_id ? `<br><span class="pair-oid" title="卖出委托编号">${p.sell_order_id}</span>` : ""}</td>
@@ -2303,12 +2305,13 @@ function renderTrPairs(pairs) {
 function renderTrUnmatched(items) {
     const tb = document.querySelector("#trUnmatchedTable tbody");
     if (!items.length) {
-        tb.innerHTML = '<tr><td colspan="6" class="empty-cell">全部成交均已配对</td></tr>';
+        tb.innerHTML = '<tr><td colspan="7" class="empty-cell">全部成交均已配对</td></tr>';
         renderTrUnmatchedSummary([]);
         return;
     }
-    tb.innerHTML = items.map(u => `
+    tb.innerHTML = items.map((u, idx) => `
         <tr>
+            <td>${idx + 1}</td>
             <td>${u.time || "--"}</td>
             <td class="${dirCls(u.direction)}">${dirText(u.direction)}</td>
             <td>${fmt(u.price, 3)}</td>
@@ -2363,11 +2366,11 @@ function renderTrEmpty(date, text) {
 function clearTrTables() {
     TR_LAST_TRADES = [];
     document.querySelector("#trTradesTable tbody").innerHTML =
-        '<tr><td colspan="7" class="empty-cell">暂无数据</td></tr>';
-    document.querySelector("#trPairsTable tbody").innerHTML =
         '<tr><td colspan="8" class="empty-cell">暂无数据</td></tr>';
+    document.querySelector("#trPairsTable tbody").innerHTML =
+        '<tr><td colspan="9" class="empty-cell">暂无数据</td></tr>';
     document.querySelector("#trUnmatchedTable tbody").innerHTML =
-        '<tr><td colspan="6" class="empty-cell">暂无数据</td></tr>';
+        '<tr><td colspan="7" class="empty-cell">暂无数据</td></tr>';
     const umSum = document.getElementById("trUnmatchedSummary");
     if (umSum) umSum.innerHTML = "";
 }
