@@ -70,7 +70,6 @@
         <button class="btn-back" onclick="backToRounds()">← 返回</button>
         <div class="game-title">
             <span id="gCode" class="g-code">--</span>
-            <span id="gDate" class="g-date">----</span>
             <span id="gTime" class="g-time" title="当前行情时间（精确到秒）">--:--:--</span>
             <span id="gSource" class="src-tag qmt">QMT</span>
             <span id="gStatus" class="status-badge">--</span>
@@ -90,6 +89,7 @@
             <button class="btn-help" onclick="toggleHelp()" title="快捷键说明">?</button>
             <button class="btn-pause" id="btnPause" onclick="togglePause()">⏸ 暂停</button>
             <button class="btn-finish" onclick="finishRound()">⏹ 提前结束</button>
+            <button class="btn-adjust" onclick="openAdjustPage()" title="调整 · 信息辅助查询（最近250根日K线，支持缩放，后续逐步新增功能）">📊 调整</button>
         </div>
     </header>
 
@@ -255,6 +255,33 @@
                 <div id="trUnmatchedSummary" style="display:none"></div>
             </div>
         </div>
+    </div>
+</div>
+
+<!-- ═══════════ 视图四：调整 · 信息辅助查询 ═══════════ -->
+<div id="view-adjust" class="view" style="display:none;">
+    <header id="adj-top-bar">
+        <button class="btn-back" onclick="backToGame()">← 返回</button>
+        <div class="adj-title">
+            <span class="g-code">调整 · 信息辅助查询</span>
+            <span class="adj-code" id="adjCode">--</span>
+        </div>
+        <span class="adj-range" id="adjRange"></span>
+        <span class="adj-status" id="adjStatus"></span>
+    </header>
+
+    <div class="adj-layout">
+        <!-- 功能一：最近 250 根日K线（后续功能块在此纵向追加） -->
+        <section class="panel adj-kline-panel">
+            <div class="panel-header">
+                <h3>日K线 · 最近 250 根</h3>
+                <div class="adj-head-right">
+                    <span class="adj-note" id="adjKlineNote"></span>
+                    <button class="refresh-btn" onclick="loadDailyKline(true)" title="刷新">⟳</button>
+                </div>
+            </div>
+            <div id="dailyChart" class="daily-chart"></div>
+        </section>
     </div>
 </div>
 

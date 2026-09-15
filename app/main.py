@@ -66,7 +66,8 @@ def create_app(config_path: str = None, enable_scheduler: bool = True) -> Flask:
     from .api.agent_trade import trade_bp
     from .api.agent_calendar import calendar_bp
     from .api.game_routes import game_bp
-    for bp in (tick_bp, monitor_bp, trade_bp, calendar_bp, game_bp):
+    from .api.analysis_routes import analysis_bp
+    for bp in (tick_bp, monitor_bp, trade_bp, calendar_bp, game_bp, analysis_bp):
         app.register_blueprint(bp)
 
     # 健康检查

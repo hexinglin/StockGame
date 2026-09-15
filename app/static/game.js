@@ -501,7 +501,6 @@ function backToRounds() {
 function renderGameHeader() {
     const r = state.round;
     document.getElementById("gCode").textContent = r.code;
-    document.getElementById("gDate").textContent = r.trade_date;
     const srcEl = document.getElementById("gSource");
     const isSim = r.data_source === "sim";
     srcEl.textContent = isSim ? "模拟" : "QMT";
@@ -2435,6 +2434,200 @@ document.addEventListener("keydown", (e) => {
             e.preventDefault(); setSpeed(60); break;
     }
 });
+
+// ───────────── 调整页（信息辅助查询） ─────────────
+// 独立视图，从游戏顶栏进入；游戏引擎在服务端继续运行，socket 常驻，
+// 返回游戏视图即恢复，无需重进。后续功能块在 adj-layout 中纵向追加。
+
+const DAILY_KLINE_LIMIT = 250;
+let adjustChart = null;
+let _dailyKlineKey = "";      // code|end_date 已加载标记，未变化不重复拉取
+let _dailyRoBound = false;
+let _dailyRoPending = false;
+
+function openAdjustPage() {
+    if (!state.round) { toast("请先进入一局游戏", "error"); return; }
+    document.getElementById("view-game").style.display = "none";
+    document.getElementById("view-adjust").style.display = "block";
+    document.title = `StockGame 调整 ${state.round.code}`;
+    document.getElementById("adjCode").textContent = state.round.code;
+    // 隐藏期间容器尺寸失效，显示后先重算一次再拉数据
+    if (adjustChart) adjustChart.resize();
+    loadDailyKline();
+}
+
+function backToGame() {
+    document.getElementById("view-adjust").style.display = "none";
+    document.getElementById("view-game").style.display = "block";
+    document.title = `StockGame ${state.round ? state.round.code : ""} ${state.round ? state.round.trade_date : ""}`;
+    if (state.chart) state.chart.resize();   // 隐藏期间尺寸失效，回游戏重算分时图
+}
+
+function initDailyChart() {
+    const el = document.getElementById("dailyChart");
+    adjustChart = echarts.getInstanceByDom(el) || echarts.init(el);
+    if (!_dailyRoBound) {
+        if (window.ResizeObserver) {
+            new ResizeObserver(() => {
+                if (!el.clientWidth) return;   // 视图隐藏时容器为 0，跳过
+                if (_dailyRoPending) return;
+                _dailyRoPending = true;
+                requestAnimationFrame(() => {
+                    _dailyRoPending = false;
+                    if (adjustChart) adjustChart.resize();
+                });
+            }).observe(el);
+        }
+        _dailyRoBound = true;
+    }
+    return adjustChart;
+}
+
+// 简单移动平均：前 n-1 个点无值（null 断开连线）
+function calcMA(closes, n) {
+    const out = [];
+    let sum = 0;
+    for (let i = 0; i < closes.length; i++) {
+        sum += closes[i];
+        if (i >= n) sum -= closes[i - n];
+        out.push(i >= n - 1 ? +(sum / n).toFixed(4) : null);
+    }
+    return out;
+}
+
+async function loadDailyKline(force = false) {
+    if (!state.round) return;
+    const code = state.round.code;
+    const endDate = state.round.trade_date;   // 截止回合交易日（含当日），不透出未来数据
+    const key = `${code}|${endDate}`;
+    if (!force && _dailyKlineKey === key) return;
+    _dailyKlineKey = key;
+    const st = document.getElementById("adjStatus");
+    try {
+        st.textContent = "加载中…"; st.className = "adj-status pending";
+        const resp = await api(`/api/v1/analysis/daily_kline?code=${encodeURIComponent(code)}`
+            + `&end_date=${encodeURIComponent(endDate)}&limit=${DAILY_KLINE_LIMIT}`);
+        const bars = resp.data.bars || [];
+        document.getElementById("adjRange").textContent =
+            bars.length ? `${bars[0].date} ~ ${bars[bars.length - 1].date}` : "";
+        document.getElementById("adjKlineNote").textContent =
+            bars.length ? `共 ${bars.length} 根（截止 ${endDate}）` : `截止 ${endDate} 无日K数据`;
+        if (!bars.length) { st.textContent = ""; st.className = "adj-status"; return; }
+        renderDailyChart(bars);
+        st.textContent = ""; st.className = "adj-status";
+    } catch (e) {
+        _dailyKlineKey = "";
+        st.textContent = e.message; st.className = "adj-status failed";
+        toast(e.message, "error");
+    }
+}
+
+function renderDailyChart(bars) {
+    const chart = initDailyChart();
+    const dates = bars.map(b => b.date);
+    // ECharts candlestick 数据格式: [open, close, low, high]
+    const kdata = bars.map(b => [b.open, b.close, b.low, b.high]);
+    const closes = bars.map(b => b.close);
+    const upColor = "#e64545", downColor = "#1a9e5c";
+    // 成交量柱按当日涨跌着色（红涨绿跌，与蜡烛同色系）
+    const volData = bars.map(b => ({
+        value: b.volume || 0,
+        itemStyle: { color: b.close >= b.open ? upColor : downColor },
+    }));
+    const mas = [
+        { name: "MA5",  data: calcMA(closes, 5),  color: "#f5c542" },
+        { name: "MA10", data: calcMA(closes, 10), color: "#3b6ef6" },
+        { name: "MA20", data: calcMA(closes, 20), color: "#b45be0" },
+        { name: "MA60", data: calcMA(closes, 60), color: "#2ec3c3" },
+    ];
+
+    chart.setOption({
+        animation: false,
+        axisPointer: { link: [{ xAxisIndex: "all" }] },
+        grid: [
+            { left: 62, right: 20, top: 14, height: "62%" },    // 主图：蜡烛 + MA
+            { left: 62, right: 20, top: "77%", height: "13%" }, // 副图：成交量
+        ],
+        tooltip: {
+            trigger: "axis",
+            axisPointer: { type: "cross", label: { backgroundColor: "#2a3454" } },
+            formatter: (params) => {
+                const i = params[0].dataIndex;
+                const b = bars[i];
+                if (!b) return "";
+                // 涨跌幅基准：前一交易日收盘，首日回落到自带 last_close
+                const prev = i > 0 ? bars[i - 1].close : (b.last_close || b.open);
+                const pct = prev > 0 ? (b.close - prev) / prev * 100 : 0;
+                const pctColor = pct > 0 ? upColor : pct < 0 ? downColor : "#999";
+                const sign = pct > 0 ? "+" : "";
+                const maLine = mas.map(m => {
+                    const v = m.data[i];
+                    return v === null ? "" : `${m.name}: <span style="color:${m.color}">${v}</span>`;
+                }).filter(Boolean).join("&nbsp;&nbsp;");
+                return `<b>${b.date}</b><br/>`
+                    + `开: ${fmt(b.open, 3)}&nbsp;&nbsp;高: ${fmt(b.high, 3)}`
+                    + `&nbsp;&nbsp;低: ${fmt(b.low, 3)}&nbsp;&nbsp;收: <b style="color:${pctColor}">${fmt(b.close, 3)}</b>`
+                    + `&nbsp;&nbsp;<span style="color:${pctColor}">${sign}${pct.toFixed(2)}%</span><br/>`
+                    + `成交量: ${fmtVol(b.volume)}<br/>${maLine}`;
+            },
+        },
+        xAxis: [
+            {
+                type: "category", data: dates,
+                axisLine: { lineStyle: { color: "#666" } },
+                axisLabel: { color: "#999", fontSize: 10 },
+            },
+            { type: "category", data: dates, gridIndex: 1, axisLabel: { show: false }, axisTick: { show: false } },
+        ],
+        yAxis: [
+            {
+                type: "value", scale: true,
+                splitLine: { lineStyle: { color: "rgba(255,255,255,0.08)" } },
+                axisLabel: { color: "#999", fontSize: 10, formatter: v => fmt(v, 2) },
+            },
+            {
+                type: "value", gridIndex: 1,
+                splitLine: { show: false },
+                // 刻度去尾零（30.00亿 → 30亿），与真实行情软件一致
+                axisLabel: {
+                    color: "#999", fontSize: 9,
+                    formatter: v => {
+                        const yi = v / 1e8;
+                        return Math.abs(yi) >= 1 ? parseFloat(yi.toFixed(2)) + "亿" : fmtVol(v);
+                    },
+                },
+            },
+        ],
+        // 缩放：inside（滚轮/捏合缩放、拖拽平移）+ 底部 slider 拖动条，双图联动
+        dataZoom: [
+            { type: "inside", xAxisIndex: [0, 1], start: 0, end: 100 },
+            {
+                type: "slider", xAxisIndex: [0, 1],
+                left: 62, right: 20, bottom: 2, height: 16,
+                start: 0, end: 100,
+                borderColor: "#2a3454", fillerColor: "rgba(59,110,246,0.15)",
+                handleStyle: { color: "#3b6ef6" }, textStyle: { color: "#8b93ab", fontSize: 10 },
+            },
+        ],
+        series: [
+            {
+                name: "日K", type: "candlestick", data: kdata,
+                itemStyle: {
+                    color: upColor, color0: downColor,
+                    borderColor: upColor, borderColor0: downColor,
+                },
+            },
+            ...mas.map(m => ({
+                name: m.name, type: "line", data: m.data, showSymbol: false,
+                lineStyle: { width: 1, color: m.color },
+                itemStyle: { color: m.color },
+            })),
+            {
+                name: "成交量", type: "bar", xAxisIndex: 1, yAxisIndex: 1, data: volData,
+            },
+        ],
+    });
+}
 
 // ───────────── 时钟 ─────────────
 setInterval(() => {

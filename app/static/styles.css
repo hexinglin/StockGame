@@ -185,7 +185,6 @@ body {
 .btn-back.btn-danger:hover { background: rgba(212,61,61,.25); }
 .game-title { display: flex; align-items: center; gap: 10px; }
 .g-code { font-size: 17px; font-weight: 700; color: #fff; }
-.g-date { color: var(--text2); font-size: 13px; }
 /* 行情时间（秒级大号钟表） */
 .g-time {
     font-size: 21px; font-weight: 700; line-height: 1;
@@ -217,10 +216,21 @@ body {
 }
 .speed-btn.active { background: var(--primary); color: #fff; border-color: var(--primary); }
 
-.game-actions { display: flex; gap: 8px; }
+.game-actions { display: flex; gap: 8px; align-items: center; }
 .btn-pause { background: rgba(230,162,60,.15); color: var(--warn); border: 1px solid rgba(230,162,60,.4); padding: 6px 14px; border-radius: 6px; cursor: pointer; }
 .btn-finish { background: rgba(212,61,61,.15); color: var(--danger); border: 1px solid rgba(212,61,61,.4); padding: 6px 14px; border-radius: 6px; cursor: pointer; }
 .btn-pause:disabled { opacity: .4; cursor: not-allowed; }
+/* 调整页入口：金色实心，与暂停(橙)/结束(红)拉开辨识度；固定末位、触屏点按高度 */
+.btn-adjust {
+    background: linear-gradient(180deg, #f7cf5e, #e6b93c);
+    color: #221a06; font-weight: 700; font-size: 13px;
+    border: 1px solid #c99a2a; border-radius: 6px;
+    padding: 7px 16px; min-height: 36px;
+    cursor: pointer; white-space: nowrap; flex: none;
+    box-shadow: 0 0 10px rgba(245, 197, 66, .25);
+}
+.btn-adjust:hover { filter: brightness(1.1); }
+.btn-adjust:active { filter: brightness(.95); }
 
 /* ── 游戏布局 ── */
 .game-layout {
@@ -693,6 +703,7 @@ body {
     .rec-tab { padding: 12px 18px; }
     .btn-sm { padding: 8px 13px; font-size: 12px; }
     .btn-pause, .btn-finish, .btn-back { padding: 9px 16px; }
+    .btn-adjust { padding: 9px 16px; min-height: 40px; }   /* 与相邻按钮同档点按高度 */
     .order-submit { padding: 14px; font-size: 15px; }
     .order-tab { padding: 11px; }
     .lv-row { padding: 4px 4px; }            /* 盘口行加高一档，避免误触相邻档位 */
@@ -740,6 +751,7 @@ body {
     .progress-wrap { min-width: 80px; max-width: 170px; }
     .g-time { font-size: 15px; letter-spacing: 0; }
     .speed-btn, .btn-pause, .btn-finish, .btn-back { padding-left: 10px; padding-right: 10px; }
+    .btn-adjust { padding-left: 10px; padding-right: 10px; min-height: 30px; }
     .btn-help { display: none; }               /* 触屏无物理键盘，快捷键说明无意义 */
     .order-tip { display: none; }
 }
@@ -770,4 +782,43 @@ body {
     .acct-grid { grid-template-columns: repeat(auto-fill, minmax(132px, 1fr)); }
     .big-price { font-size: 28px; }
     .chart-head { gap: 12px; }
+}
+
+/* ═══════════ 调整页（信息辅助查询） ═══════════ */
+#adj-top-bar {
+    display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+    padding: 10px 18px;
+    background: linear-gradient(180deg, #161d33, #101527);
+    border-bottom: 1px solid var(--border);
+    position: sticky; top: 0; z-index: 50;
+}
+.adj-title { display: flex; align-items: center; gap: 10px; }
+.adj-code { font-size: 13px; color: var(--gold); font-weight: 600; }
+.adj-range { font-size: 12px; color: var(--text2); font-variant-numeric: tabular-nums; }
+.adj-status { font-size: 12px; color: var(--text2); margin-left: auto; }
+.adj-status.pending { color: var(--warn); }
+.adj-status.failed { color: var(--danger); }
+.adj-layout {
+    max-width: 1500px; margin: 0 auto; padding: 14px 18px;
+    display: flex; flex-direction: column; gap: 14px;
+}
+.adj-kline-panel { display: flex; flex-direction: column; }
+.adj-kline-panel .panel-header { margin-bottom: 8px; }
+.adj-head-right { display: flex; align-items: center; gap: 10px; }
+.adj-note { font-size: 11px; color: var(--text2); font-variant-numeric: tabular-nums; }
+/* 主功能区撑满视口剩余高度（顶栏+面板边距 ≈180px），窄屏回落固定高度 */
+.daily-chart { height: calc(100vh - 180px); min-height: 460px; }
+@media (max-width: 760px) {
+    .daily-chart { height: 62vh; min-height: 380px; }
+    .adj-layout { padding: 10px 12px; }
+    /* 窄屏：标题独占一行（「最近 250 根」不拆行），计数与刷新键另起一行 */
+    .adj-kline-panel .panel-header { flex-wrap: wrap; row-gap: 3px; }
+    .adj-kline-panel .panel-header h3 { white-space: nowrap; }
+    .adj-head-right { width: 100%; margin-left: 0; }
+    .adj-head-right .refresh-btn { margin-left: auto; }
+    .adj-note { font-size: 10px; }
+}
+/* 矮横屏（手机横放）：图表吃掉顶栏之外的整屏，避免只露一条 */
+@media (orientation: landscape) and (max-height: 700px) {
+    .daily-chart { height: calc(100vh - 110px); min-height: 240px; }
 }
